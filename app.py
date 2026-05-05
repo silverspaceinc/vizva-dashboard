@@ -57,7 +57,7 @@ def fetch_all_data():
 
 def normalize(df):
     # --- ADD THIS LINE TO REMOVE PHONE AND EMAIL ---
-    cols_to_drop = ["case_candidate_phone", "case_candidate_email","candidate_phone"]
+    cols_to_drop = ["case_candidate_phone", "case_candidate_email","candidate_phone","candidate_email"]
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
