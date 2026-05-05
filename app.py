@@ -657,6 +657,30 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.caption("Vizva Dashboard v7.0 | API-powered | Active Experts Only")
 
+# ════════════════════════════════════════════════════════════
+# AUTHENTICATION LAYER
+# ════════════════════════════════════════════════════════════
+
+def login():
+    st.title("Vizva Secure Access")
+    with st.container():
+        user = st.text_input("Username")
+        pw = st.text_input("Password", type="password")
+        if st.button("Login"):
+            if user == "ukteamwork" and pw == "5ilv3rSpac3!":
+                st.session_state["authenticated"] = True
+                st.session_state["login_time"] = datetime.now()
+                st.rerun()
+            else:
+                st.error("Invalid Username or Password")
+
+def check_timeout():
+    if "login_time" in st.session_state:
+        delta = datetime.now() - st.session_state["login_time"]
+        if delta.total_seconds() > 3600:
+            st.session_state["authenticated"] = False
+            st.warning("Session expired. Please log in again.")
+            st.rerun()
 
 if __name__ == "__main__":
     main()
