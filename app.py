@@ -683,4 +683,14 @@ def check_timeout():
             st.rerun()
 
 if __name__ == "__main__":
-    main()
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if not st.session_state["authenticated"]:
+        login()
+    else:
+        check_timeout()
+        if st.sidebar.button("Logout"):
+            st.session_state["authenticated"] = False
+            st.rerun()
+        main()
