@@ -17,17 +17,21 @@ TASK_LABEL = {"completed": "Completed", "rescheduled": "Rescheduled",
 CLR = {"completed": "#2ecc71", "rescheduled": "#f39c12",
        "cancelled": "#e74c3c", "pending": "#3498db"}
 
+SUPPORT_TYPES = ["Interview Support", "Assessment Support", "Mock Interview", "Resume Understanding"]
+
 HIST = {
-    "2025-07": {"completed": 54, "rescheduled": 14, "cancelled": 11, "candidates": 17},
-    "2025-08": {"completed": 56, "rescheduled": 5,  "cancelled": 17, "candidates": 26},
-    "2025-09": {"completed": 50, "rescheduled": 2,  "cancelled": 24, "candidates": 35},
-    "2025-10": {"completed": 37, "rescheduled": 10, "cancelled": 19, "candidates": 24},
-    "2025-11": {"completed": 32, "rescheduled": 2,  "cancelled": 9,  "candidates": 19},
-    "2025-12": {"completed": 37, "rescheduled": 1,  "cancelled": 19, "candidates": 29},
-    "2026-01": {"completed": 49, "rescheduled": 3,  "cancelled": 17, "candidates": 29},
-    "2026-02": {"completed": 66, "rescheduled": 6,  "cancelled": 11, "candidates": 28},
-    "2026-03": {"completed": 81, "rescheduled": 6,  "cancelled": 21, "candidates": 37},
-    "2026-04": {"completed": 71, "rescheduled": 9,  "cancelled": 24, "candidates": 52},
+    "Interview Support": {
+        "2025-07": {"completed": 54, "rescheduled": 14, "cancelled": 11, "candidates": 17},
+        "2025-08": {"completed": 56, "rescheduled": 5,  "cancelled": 17, "candidates": 26},
+        "2025-09": {"completed": 50, "rescheduled": 2,  "cancelled": 24, "candidates": 35},
+        "2025-10": {"completed": 37, "rescheduled": 10, "cancelled": 19, "candidates": 24},
+        "2025-11": {"completed": 32, "rescheduled": 2,  "cancelled": 9,  "candidates": 19},
+        "2025-12": {"completed": 37, "rescheduled": 1,  "cancelled": 19, "candidates": 29},
+        "2026-01": {"completed": 49, "rescheduled": 3,  "cancelled": 17, "candidates": 29},
+        "2026-02": {"completed": 66, "rescheduled": 6,  "cancelled": 11, "candidates": 28},
+        "2026-03": {"completed": 81, "rescheduled": 6,  "cancelled": 21, "candidates": 37},
+        "2026-04": {"completed": 71, "rescheduled": 9,  "cancelled": 24, "candidates": 52},
+    },
 }
 
 
@@ -60,8 +64,6 @@ def normalize(df):
     id_cols = [c for c in df.columns if c.endswith("_id") or c == "id"]
     cols_to_drop = cols_to_drop + id_cols
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
-
-    df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
     if "task_status" in df.columns:
@@ -93,9 +95,11 @@ def get_by_support(df, support_type):
     return df[df["support_name"].str.lower() == support_type.lower()].copy()
 
 
-def hist_monthly_df():
+def hist_monthly_df(support_type):
+    if support_type not in HIST:
+        return pd.DataFrame()
     rows = []
-    for m, d in HIST.items():
+    for m, d in HIST[support_type].items():
         total = d["completed"] + d["rescheduled"] + d["cancelled"]
         rows.append({"month": m, "completed": d["completed"], "rescheduled": d["rescheduled"],
                       "cancelled": d["cancelled"], "pending": 0,
@@ -147,12 +151,13 @@ def candidate_monthly_support(df):
     d["month"] = d["date"].dt.to_period("M").astype(str)
     rows = []
     for (month, cand), g in d.groupby(["month", "candidate_name"]):
-        interview_count = len(g[g["support_name"].str.lower() == "interview support"])
-        assessment_count = len(g[g["support_name"].str.lower() == "assessment support"])
-        rows.append({"month": month, "candidate_name": cand,
-                      "interview_count": interview_count,
-                      "assessment_count": assessment_count,
-                      "total": interview_count + assessment_count})
+        counts = {}
+        for st_name in SUPPORT_TYPES:
+            counts[st_name] = len(g[g["support_name"].str.lower() == st_name.lower()])
+        row = {"month": month, "candidate_name": cand}
+        row.update(counts)
+        row["total"] = sum(counts.values())
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -182,7 +187,7 @@ def kpi_row(data):
     c[4].metric("Candidates", int(data.get("candidates", 0)))
 
 
-def stacked_bar(df, x="month", title="Monthly Interview Counts"):
+def stacked_bar(df, x="month", title="Monthly Counts"):
     fig = go.Figure()
     for s in TASK_ORDER:
         if s in df.columns:
@@ -277,12 +282,12 @@ def day_of_week_chart(idf):
     c = idf["date"].dt.day_name().value_counts().reindex(order, fill_value=0)
     fig = go.Figure(go.Bar(x=c.index, y=c.values, marker_color="#9b59b6",
                            text=c.values, textposition="outside"))
-    fig.update_layout(title="Interviews by Day of Week", height=400)
+    fig.update_layout(title="By Day of Week", height=400)
     return fig
 
 
 def main():
-    st.title("Vizva Interview Support Dashboard")
+    st.title("Vizva Support Dashboard")
 
     try:
         with st.spinner("Fetching latest data from API..."):
@@ -299,17 +304,20 @@ def main():
 
     all_case_df = raw.copy()
     active_expert_df = filter_active_experts(raw)
-    interview_df = get_by_support(active_expert_df, "interview support")
-    assessment_df = get_by_support(active_expert_df, "assessment support")
 
-    if interview_df.empty:
-        st.error("No Interview Support rows found for active experts.")
-        st.stop()
+    # --- SUPPORT TYPE SELECTOR ---
+    st.sidebar.header("Support Type")
+    selected_support = st.sidebar.selectbox("Select Support Type", SUPPORT_TYPES, index=0)
+    support_label = selected_support
 
-    st.sidebar.success("Loaded " + str(len(interview_df)) + " interview rows")
+    support_df = get_by_support(active_expert_df, selected_support)
+
+    # Sidebar counts for all types
+    st.sidebar.markdown("---")
     st.sidebar.metric("Total Cases (This Year)", len(all_case_df))
-    st.sidebar.metric("Interview Support", len(interview_df))
-    st.sidebar.metric("Assessment Support", len(assessment_df))
+    for stype in SUPPORT_TYPES:
+        count = len(get_by_support(active_expert_df, stype))
+        st.sidebar.metric(stype, count)
     st.sidebar.caption("Only active experts shown")
     st.sidebar.caption("Data refreshes every 10 minutes")
 
@@ -317,9 +325,22 @@ def main():
         st.cache_data.clear()
         st.rerun()
 
-    hist = hist_monthly_df()
-    live = live_monthly(interview_df)
-    monthly = pd.concat([hist, live], ignore_index=True).drop_duplicates("month", keep="last")
+    if support_df.empty:
+        st.warning("No " + support_label + " rows found for active experts.")
+        st.stop()
+
+    st.sidebar.success("Showing " + str(len(support_df)) + " " + support_label + " rows")
+
+    hist = hist_monthly_df(selected_support)
+    live = live_monthly(support_df)
+    if not hist.empty and not live.empty:
+        monthly = pd.concat([hist, live], ignore_index=True).drop_duplicates("month", keep="last")
+    elif not hist.empty:
+        monthly = hist
+    elif not live.empty:
+        monthly = live
+    else:
+        monthly = pd.DataFrame()
 
     st.sidebar.markdown("---")
     st.sidebar.header("View")
@@ -328,14 +349,14 @@ def main():
 
     # ======= TODAY =======
     if view == "Todays Snapshot":
-        st.header("Todays Snapshot")
+        st.header("Todays Snapshot - " + support_label)
         today = date.today()
-        today_df = interview_df[interview_df["date"].dt.date == today]
+        today_df = support_df[support_df["date"].dt.date == today]
 
         st.caption(today.strftime("%A, %B %d, %Y"))
 
         if today_df.empty:
-            st.info("No interviews scheduled for today.")
+            st.info("No " + support_label + " scheduled for today.")
             kd = {"completed": 0, "rescheduled": 0, "cancelled": 0, "pending": 0, "candidates": 0}
         else:
             tc = today_df["task_status"].value_counts()
@@ -368,7 +389,13 @@ def main():
 
     # ======= MONTHLY =======
     elif view == "Monthly Overview":
-        st.header("Monthly Overview (Jul 2025 - Present)")
+        if monthly.empty:
+            st.warning("No monthly data available for " + support_label)
+            st.stop()
+
+        has_hist = selected_support in HIST
+        title_range = "(Jul 2025 - Present)" if has_hist else "(2026 - Present)"
+        st.header("Monthly Overview - " + support_label + " " + title_range)
         latest = monthly.iloc[-1]
 
         c = st.columns(6)
@@ -379,7 +406,7 @@ def main():
         c[4].metric("Pending", int(latest["pending"]))
         c[5].metric("Candidates", int(latest["candidates"]))
 
-        st.plotly_chart(stacked_bar(monthly), use_container_width=True)
+        st.plotly_chart(stacked_bar(monthly, title="Monthly " + support_label + " Counts"), use_container_width=True)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -393,7 +420,7 @@ def main():
         with c4:
             st.plotly_chart(donut(latest.to_dict(), "Task Split - " + str(latest["month"])), use_container_width=True)
 
-        st.plotly_chart(trend_line(monthly, "total", "Total Interviews per Month", "#8e44ad"), use_container_width=True)
+        st.plotly_chart(trend_line(monthly, "total", "Total " + support_label + " per Month", "#8e44ad"), use_container_width=True)
 
         with st.expander("Monthly Data Table"):
             st.dataframe(monthly, use_container_width=True)
@@ -402,7 +429,7 @@ def main():
         st.markdown("---")
         st.subheader("Expert-wise Monthly Breakdown")
 
-        exp_monthly = expert_monthly(interview_df)
+        exp_monthly = expert_monthly(support_df)
         if not exp_monthly.empty:
             months_available = sorted(exp_monthly["month"].unique())
             selected_month = st.selectbox("Select Month", months_available, index=len(months_available) - 1)
@@ -440,7 +467,7 @@ def main():
 
         # -- CANDIDATE WISE MONTHLY --
         st.markdown("---")
-        st.subheader("Candidate-wise Monthly Counts (Interview + Assessment)")
+        st.subheader("Candidate-wise Monthly Counts (All Support Types)")
 
         cand_monthly = candidate_monthly_support(active_expert_df)
         if not cand_monthly.empty:
@@ -450,15 +477,15 @@ def main():
             cand_month_data = cand_monthly[cand_monthly["month"] == sel_cand_month].sort_values("total", ascending=False)
 
             if not cand_month_data.empty:
+                support_colors = {"Interview Support": "#3498db", "Assessment Support": "#e67e22",
+                                  "Mock Interview": "#9b59b6", "Resume Understanding": "#1abc9c"}
                 fig = go.Figure()
-                fig.add_trace(go.Bar(x=cand_month_data["candidate_name"],
-                                     y=cand_month_data["interview_count"],
-                                     name="Interview Support", marker_color="#3498db",
-                                     text=cand_month_data["interview_count"], textposition="inside"))
-                fig.add_trace(go.Bar(x=cand_month_data["candidate_name"],
-                                     y=cand_month_data["assessment_count"],
-                                     name="Assessment Support", marker_color="#e67e22",
-                                     text=cand_month_data["assessment_count"], textposition="inside"))
+                for stype in SUPPORT_TYPES:
+                    if stype in cand_month_data.columns:
+                        fig.add_trace(go.Bar(x=cand_month_data["candidate_name"],
+                                             y=cand_month_data[stype],
+                                             name=stype, marker_color=support_colors.get(stype, "#95a5a6"),
+                                             text=cand_month_data[stype], textposition="inside"))
                 fig.update_layout(barmode="stack",
                                   title="Candidate Counts - " + sel_cand_month,
                                   height=500, xaxis_tickangle=-45)
@@ -468,17 +495,17 @@ def main():
 
     # ======= DAILY =======
     elif view == "Daily Drill-Down":
-        st.header("Daily Drill-Down")
-        min_d = interview_df["date"].dt.date.min()
-        max_d = interview_df["date"].dt.date.max()
+        st.header("Daily Drill-Down - " + support_label)
+        min_d = support_df["date"].dt.date.min()
+        max_d = support_df["date"].dt.date.max()
 
         ca, cb = st.sidebar.columns(2)
         start = ca.date_input("From", value=max(min_d, date(2026, 5, 1)),
                               min_value=min_d, max_value=max_d)
         end = cb.date_input("To", value=max_d, min_value=min_d, max_value=max_d)
 
-        mask = (interview_df["date"].dt.date >= start) & (interview_df["date"].dt.date <= end)
-        period = interview_df[mask]
+        mask = (support_df["date"].dt.date >= start) & (support_df["date"].dt.date <= end)
+        period = support_df[mask]
         dd = daily_agg(period)
 
         if dd.empty:
@@ -507,7 +534,7 @@ def main():
         st.sidebar.markdown("---")
         single = st.sidebar.date_input("Inspect single day", value=max_d,
                                        min_value=min_d, max_value=max_d, key="single")
-        sdf = interview_df[interview_df["date"].dt.date == single]
+        sdf = support_df[support_df["date"].dt.date == single]
         if not sdf.empty:
             st.subheader("Details - " + str(single))
             tc = sdf["task_status"].value_counts()
@@ -535,22 +562,22 @@ def main():
 
             st.dataframe(sdf, use_container_width=True)
         elif single:
-            st.info("No interviews on " + str(single))
+            st.info("No " + support_label + " on " + str(single))
 
     # ======= DEEP DIVE =======
     elif view == "Deep-Dive Analytics":
-        st.header("Deep-Dive Analytics")
+        st.header("Deep-Dive Analytics - " + support_label)
 
         tabs = st.tabs(["Experts", "Companies", "Rounds",
-                         "Day of Week", "Support Types",
+                         "Day of Week", "All Support Types",
                          "Candidates", "Technology", "Status"])
 
         with tabs[0]:
-            fig = expert_stack(interview_df)
+            fig = expert_stack(support_df)
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
-            if "expert_name" in interview_df.columns:
-                ea = interview_df.groupby("expert_name").agg(
+            if "expert_name" in support_df.columns:
+                ea = support_df.groupby("expert_name").agg(
                     Total=("task_status", "size"),
                     Completed=("task_status", lambda x: (x == "completed").sum()),
                     Rescheduled=("task_status", lambda x: (x == "rescheduled").sum()),
@@ -563,12 +590,12 @@ def main():
                 st.dataframe(ea.sort_values("Total", ascending=False), use_container_width=True)
 
         with tabs[1]:
-            fig = h_bar_by_task(interview_df, "company_name", 20, "Top 20 Companies by Volume")
+            fig = h_bar_by_task(support_df, "company_name", 20, "Top 20 Companies by Volume")
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
-            if "company_name" in interview_df.columns:
-                top = interview_df["company_name"].value_counts().head(15).index
-                ct = interview_df[interview_df["company_name"].isin(top)]
+            if "company_name" in support_df.columns:
+                top = support_df["company_name"].value_counts().head(15).index
+                ct = support_df[support_df["company_name"].isin(top)]
                 pv = ct.groupby(["company_name", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
                                 color_continuous_scale="Blues", title="Company x Task Heatmap")
@@ -576,26 +603,26 @@ def main():
                 st.plotly_chart(fig2, use_container_width=True)
 
         with tabs[2]:
-            if "round_name" in interview_df.columns:
-                rc = interview_df["round_name"].value_counts()
+            if "round_name" in support_df.columns:
+                rc = support_df["round_name"].value_counts()
                 fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
                                       textinfo="label+value+percent"))
                 fig.update_layout(title="Round Distribution", height=420)
                 st.plotly_chart(fig, use_container_width=True)
 
-                rt = interview_df.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
+                rt = support_df.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(rt, text_auto=True, aspect="auto",
                                 color_continuous_scale="Oranges", title="Round x Task Heatmap")
                 fig2.update_layout(height=400)
                 st.plotly_chart(fig2, use_container_width=True)
 
         with tabs[3]:
-            fig = day_of_week_chart(interview_df)
+            fig = day_of_week_chart(support_df)
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
-            if "date" in interview_df.columns:
+            if "date" in support_df.columns:
                 order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-                tmp = interview_df.copy()
+                tmp = support_df.copy()
                 tmp["dow"] = tmp["date"].dt.day_name()
                 pv = tmp.groupby(["dow", "task_status"]).size().unstack(fill_value=0).reindex(order)
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
@@ -618,9 +645,9 @@ def main():
                 st.plotly_chart(fig2, use_container_width=True)
 
         with tabs[5]:
-            if "candidate_name" in interview_df.columns:
-                ca_agg = interview_df.groupby("candidate_name").agg(
-                    Interviews=("task_status", "size"),
+            if "candidate_name" in support_df.columns:
+                ca_agg = support_df.groupby("candidate_name").agg(
+                    Total=("task_status", "size"),
                     Completed=("task_status", lambda x: (x == "completed").sum()),
                     Rescheduled=("task_status", lambda x: (x == "rescheduled").sum()),
                     Cancelled=("task_status", lambda x: (x == "cancelled").sum()),
@@ -628,15 +655,17 @@ def main():
                     Companies=("company_name", "nunique"),
                     Experts=("expert_name", "nunique"),
                 ).reset_index()
-                ca_agg["Completion_Pct"] = (ca_agg["Completed"] / ca_agg["Interviews"] * 100).round(1)
-                ca_agg = ca_agg.sort_values("Interviews", ascending=False)
+                ca_agg["Completion_Pct"] = (ca_agg["Completed"] / ca_agg["Total"] * 100).round(1)
+                ca_agg = ca_agg.sort_values("Total", ascending=False)
                 st.subheader("Candidate Performance Table")
                 st.dataframe(ca_agg, use_container_width=True)
 
-                top30 = ca_agg.head(20).sort_values("Interviews")
+                top30 = ca_agg.head(20).sort_values("Total")
                 fig = go.Figure()
                 fig.add_trace(go.Bar(y=top30["candidate_name"], x=top30["Completed"],
                                      name="Completed", orientation="h", marker_color="#2ecc71"))
+                fig.add_trace(go.Bar(y=top30["candidate_name"], x=top30["Rescheduled"],
+                                     name="Rescheduled", orientation="h", marker_color="#f39c12"))
                 fig.add_trace(go.Bar(y=top30["candidate_name"], x=top30["Cancelled"],
                                      name="Cancelled", orientation="h", marker_color="#e74c3c"))
                 fig.add_trace(go.Bar(y=top30["candidate_name"], x=top30["Pending"],
@@ -646,12 +675,12 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
 
         with tabs[6]:
-            if "candidate_technology" in interview_df.columns:
-                fig = h_bar_by_task(interview_df, "candidate_technology", 20, "Top 20 Technologies")
+            if "candidate_technology" in support_df.columns:
+                fig = h_bar_by_task(support_df, "candidate_technology", 20, "Top 20 Technologies")
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
-                top_tech = interview_df["candidate_technology"].value_counts().head(15).index
-                tt = interview_df[interview_df["candidate_technology"].isin(top_tech)]
+                top_tech = support_df["candidate_technology"].value_counts().head(15).index
+                tt = support_df[support_df["candidate_technology"].isin(top_tech)]
                 pv = tt.groupby(["candidate_technology", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
                                 color_continuous_scale="Greens", title="Technology x Task Heatmap")
@@ -661,15 +690,15 @@ def main():
                 st.info("No technology column found.")
 
         with tabs[7]:
-            if "status" in interview_df.columns:
-                sc = interview_df["status"].value_counts()
+            if "status" in support_df.columns:
+                sc = support_df["status"].value_counts()
                 fig = go.Figure(go.Bar(x=sc.index, y=sc.values, marker_color="#e67e22",
                                        text=sc.values, textposition="outside"))
                 fig.update_layout(title="Case Status Distribution", height=400)
                 st.plotly_chart(fig, use_container_width=True)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v8.0 | API-powered | Active Experts Only")
+    st.sidebar.caption("Vizva Dashboard v9.0 | API-powered | Active Experts Only")
 
 
 # ================================================================
