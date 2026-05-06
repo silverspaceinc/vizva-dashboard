@@ -3,3 +3,4 @@ __pycache__/
 .streamlit/
 *.pyc
 create_app.py
+.streamlit/secrets.toml
