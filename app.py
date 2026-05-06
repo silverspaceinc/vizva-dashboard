@@ -8,8 +8,8 @@ import requests
 st.set_page_config(page_title="Vizva Interview Dashboard", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
-API_KEY = "9c7f3b1d9a8e4c6f1b2a0e7d5f9c3b8a9e1d2f4c6b8a0e3d7f9a1b2c4d6e8f0a"
-BASE_URL = "http://69.62.76.34"
+API_KEY = st.secrets["API_KEY"]
+BASE_URL = st.secrets["BASE_URL"]
 
 TASK_ORDER = ["completed", "rescheduled", "cancelled"]
 TASK_LABEL = {"completed": "Completed", "rescheduled": "Rescheduled",
