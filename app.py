@@ -667,7 +667,7 @@ def login():
         user = st.text_input("Username")
         pw = st.text_input("Password", type="password")
         if st.button("Login"):
-            if user == "ukteamwork" and pw == "5ilv3rSpac3!":
+            if user == st.secrets["VIZVA_USERNAME"] and pw == st.secrets["VIZVA_PASSWORD"]:
                 st.session_state["authenticated"] = True
                 st.session_state["login_time"] = datetime.now()
                 st.rerun()
