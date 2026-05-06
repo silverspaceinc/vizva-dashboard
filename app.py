@@ -63,6 +63,7 @@ def normalize(df):
     if "task_status" in df.columns:
         df["task_status"] = df["task_status"].astype(str).str.strip().str.lower()
         df["task_status"] = df["task_status"].replace("not done", "pending")
+        df["task_status"] = df["task_status"].replace({"": "pending", "-": "pending", "none": "pending", "nan": "pending"})
     if "support_name" in df.columns:
         df["support_name"] = df["support_name"].astype(str).str.strip()
     return df
