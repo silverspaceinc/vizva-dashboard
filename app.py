@@ -11,11 +11,11 @@ st.set_page_config(page_title="Vizva Interview Dashboard", page_icon="chart_with
 API_KEY = st.secrets["API_KEY"]
 BASE_URL = st.secrets["BASE_URL"]
 
-TASK_ORDER = ["completed", "rescheduled", "cancelled"]
+TASK_ORDER = ["completed", "rescheduled", "cancelled", "pending"]
 TASK_LABEL = {"completed": "Completed", "rescheduled": "Rescheduled",
-              "cancelled": "Cancelled"}
+              "cancelled": "Cancelled", "pending": "Pending"}
 CLR = {"completed": "#2ecc71", "rescheduled": "#f39c12",
-       "cancelled": "#e74c3c"}
+       "cancelled": "#e74c3c", "pending": "#3498db"}
 
 HIST = {
     "2025-07": {"completed": 54, "rescheduled": 14, "cancelled": 11, "candidates": 17},
@@ -56,15 +56,13 @@ def fetch_all_data():
 
 
 def normalize(df):
-    # --- ADD THIS LINE TO REMOVE PHONE AND EMAIL ---
-    cols_to_drop = ["case_candidate_phone", "case_candidate_email","candidate_phone","candidate_email"]
+    cols_to_drop = ["case_candidate_phone", "case_candidate_email", "candidate_phone", "candidate_email"]
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
     if "task_status" in df.columns:
         df["task_status"] = df["task_status"].astype(str).str.strip().str.lower()
-        df["task_status"] = df["task_status"].replace("pending", "cancelled")
-        df["task_status"] = df["task_status"].replace("not done", "cancelled")
+        df["task_status"] = df["task_status"].replace("not done", "pending")
     if "support_name" in df.columns:
         df["support_name"] = df["support_name"].astype(str).str.strip()
     return df
@@ -94,7 +92,7 @@ def hist_monthly_df():
     for m, d in HIST.items():
         total = d["completed"] + d["rescheduled"] + d["cancelled"]
         rows.append({"month": m, "completed": d["completed"], "rescheduled": d["rescheduled"],
-                      "cancelled": d["cancelled"],
+                      "cancelled": d["cancelled"], "pending": 0,
                       "total": total, "candidates": d["candidates"]})
     return pd.DataFrame(rows)
 
@@ -112,6 +110,7 @@ def live_monthly(idf, from_date="2026-05-01"):
         rows.append({"month": m, "completed": int(tc.get("completed", 0)),
                       "rescheduled": int(tc.get("rescheduled", 0)),
                       "cancelled": int(tc.get("cancelled", 0)),
+                      "pending": int(tc.get("pending", 0)),
                       "total": len(g),
                       "candidates": g["candidate_name"].nunique() if "candidate_name" in g.columns else 0})
     return pd.DataFrame(rows)
@@ -129,6 +128,7 @@ def expert_monthly(idf):
                       "completed": int(tc.get("completed", 0)),
                       "rescheduled": int(tc.get("rescheduled", 0)),
                       "cancelled": int(tc.get("cancelled", 0)),
+                      "pending": int(tc.get("pending", 0)),
                       "total": len(g),
                       "candidates": g["candidate_name"].nunique() if "candidate_name" in g.columns else 0})
     return pd.DataFrame(rows)
@@ -161,17 +161,19 @@ def daily_agg(idf):
         rows.append({"day": day_val, "completed": int(tc.get("completed", 0)),
                       "rescheduled": int(tc.get("rescheduled", 0)),
                       "cancelled": int(tc.get("cancelled", 0)),
+                      "pending": int(tc.get("pending", 0)),
                       "total": len(g),
                       "candidates": g["candidate_name"].nunique() if "candidate_name" in g.columns else 0})
     return pd.DataFrame(rows)
 
 
 def kpi_row(data):
-    c = st.columns(4)
+    c = st.columns(5)
     c[0].metric("Completed", int(data.get("completed", 0)))
     c[1].metric("Rescheduled", int(data.get("rescheduled", 0)))
     c[2].metric("Cancelled", int(data.get("cancelled", 0)))
-    c[3].metric("Candidates", int(data.get("candidates", 0)))
+    c[3].metric("Pending", int(data.get("pending", 0)))
+    c[4].metric("Candidates", int(data.get("candidates", 0)))
 
 
 def stacked_bar(df, x="month", title="Monthly Interview Counts"):
@@ -318,7 +320,7 @@ def main():
     view = st.sidebar.radio("", ["Todays Snapshot", "Monthly Overview",
                                   "Daily Drill-Down", "Deep-Dive Analytics"])
 
-    # ═══════ TODAY ═══════
+    # ======= TODAY =======
     if view == "Todays Snapshot":
         st.header("Todays Snapshot")
         today = date.today()
@@ -328,7 +330,7 @@ def main():
 
         if today_df.empty:
             st.info("No interviews scheduled for today.")
-            kd = {"completed": 0, "rescheduled": 0, "cancelled": 0, "candidates": 0}
+            kd = {"completed": 0, "rescheduled": 0, "cancelled": 0, "pending": 0, "candidates": 0}
         else:
             tc = today_df["task_status"].value_counts()
             kd = {s: int(tc.get(s, 0)) for s in TASK_ORDER}
@@ -358,17 +360,18 @@ def main():
             with st.expander("Raw Data"):
                 st.dataframe(today_df, use_container_width=True, height=400)
 
-    # ═══════ MONTHLY ═══════
+    # ======= MONTHLY =======
     elif view == "Monthly Overview":
         st.header("Monthly Overview (Jul 2025 - Present)")
         latest = monthly.iloc[-1]
 
-        c = st.columns(5)
+        c = st.columns(6)
         c[0].metric("Month", latest["month"])
         c[1].metric("Completed", int(latest["completed"]))
         c[2].metric("Rescheduled", int(latest["rescheduled"]))
         c[3].metric("Cancelled", int(latest["cancelled"]))
-        c[4].metric("Candidates", int(latest["candidates"]))
+        c[4].metric("Pending", int(latest["pending"]))
+        c[5].metric("Candidates", int(latest["candidates"]))
 
         st.plotly_chart(stacked_bar(monthly), use_container_width=True)
 
@@ -389,7 +392,7 @@ def main():
         with st.expander("Monthly Data Table"):
             st.dataframe(monthly, use_container_width=True)
 
-        # ── EXPERT WISE MONTHLY ──
+        # -- EXPERT WISE MONTHLY --
         st.markdown("---")
         st.subheader("Expert-wise Monthly Breakdown")
 
@@ -411,7 +414,7 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
 
                 st.dataframe(month_exp[["expert_name", "completed", "rescheduled", "cancelled",
-                                        "total", "candidates"]],
+                                        "pending", "total", "candidates"]],
                              use_container_width=True)
 
             st.subheader("Expert Trend Across Months")
@@ -429,7 +432,7 @@ def main():
                 fig.update_layout(title=selected_expert + " - Monthly Trend", height=400)
                 st.plotly_chart(fig, use_container_width=True)
 
-        # ── CANDIDATE WISE MONTHLY ──
+        # -- CANDIDATE WISE MONTHLY --
         st.markdown("---")
         st.subheader("Candidate-wise Monthly Counts (Interview + Assessment)")
 
@@ -457,7 +460,7 @@ def main():
 
                 st.dataframe(cand_month_data, use_container_width=True)
 
-    # ═══════ DAILY ═══════
+    # ======= DAILY =======
     elif view == "Daily Drill-Down":
         st.header("Daily Drill-Down")
         min_d = interview_df["date"].dt.date.min()
@@ -528,7 +531,7 @@ def main():
         elif single:
             st.info("No interviews on " + str(single))
 
-    # ═══════ DEEP DIVE ═══════
+    # ======= DEEP DIVE =======
     elif view == "Deep-Dive Analytics":
         st.header("Deep-Dive Analytics")
 
@@ -546,6 +549,7 @@ def main():
                     Completed=("task_status", lambda x: (x == "completed").sum()),
                     Rescheduled=("task_status", lambda x: (x == "rescheduled").sum()),
                     Cancelled=("task_status", lambda x: (x == "cancelled").sum()),
+                    Pending=("task_status", lambda x: (x == "pending").sum()),
                     Candidates=("candidate_name", "nunique"),
                     Companies=("company_name", "nunique"),
                 ).reset_index()
@@ -612,7 +616,9 @@ def main():
                 ca_agg = interview_df.groupby("candidate_name").agg(
                     Interviews=("task_status", "size"),
                     Completed=("task_status", lambda x: (x == "completed").sum()),
+                    Rescheduled=("task_status", lambda x: (x == "rescheduled").sum()),
                     Cancelled=("task_status", lambda x: (x == "cancelled").sum()),
+                    Pending=("task_status", lambda x: (x == "pending").sum()),
                     Companies=("company_name", "nunique"),
                     Experts=("expert_name", "nunique"),
                 ).reset_index()
@@ -627,6 +633,8 @@ def main():
                                      name="Completed", orientation="h", marker_color="#2ecc71"))
                 fig.add_trace(go.Bar(y=top30["candidate_name"], x=top30["Cancelled"],
                                      name="Cancelled", orientation="h", marker_color="#e74c3c"))
+                fig.add_trace(go.Bar(y=top30["candidate_name"], x=top30["Pending"],
+                                     name="Pending", orientation="h", marker_color="#3498db"))
                 fig.update_layout(barmode="stack", title="Top 20 Candidates", height=600,
                                   yaxis=dict(autorange="reversed"))
                 st.plotly_chart(fig, use_container_width=True)
@@ -655,11 +663,12 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v7.0 | API-powered | Active Experts Only")
+    st.sidebar.caption("Vizva Dashboard v8.0 | API-powered | Active Experts Only")
 
-# ════════════════════════════════════════════════════════════
+
+# ================================================================
 # AUTHENTICATION LAYER
-# ════════════════════════════════════════════════════════════
+# ================================================================
 
 def login():
     st.title("Vizva Secure Access")
@@ -674,6 +683,7 @@ def login():
             else:
                 st.error("Invalid Username or Password")
 
+
 def check_timeout():
     if "login_time" in st.session_state:
         delta = datetime.now() - st.session_state["login_time"]
@@ -681,6 +691,7 @@ def check_timeout():
             st.session_state["authenticated"] = False
             st.warning("Session expired. Please log in again.")
             st.rerun()
+
 
 if __name__ == "__main__":
     if "authenticated" not in st.session_state:
