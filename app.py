@@ -60,9 +60,9 @@ def fetch_all_data():
 
 
 def normalize(df):
-    cols_to_drop = ["case_candidate_phone", "case_candidate_email", "candidate_phone", "candidate_email","candidate_status_flag",
-                    "expert_is_team_lead","expert_date_of_joining","expert_status_flag","filled_by_first_name","filled_by_last_name",
-                   "filled_by_email"]
+    cols_to_drop = ["case_candidate_phone", "case_candidate_email", "candidate_phone", "candidate_email", "candidate_status_flag",
+                    "expert_is_team_lead", "expert_date_of_joining", "filled_by_first_name", "filled_by_last_name",
+                    "filled_by_email"]
     id_cols = [c for c in df.columns if c.endswith("_id") or c == "id"]
     cols_to_drop = cols_to_drop + id_cols
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
@@ -88,7 +88,9 @@ def filter_current_year(df):
 def filter_active_experts(df):
     if "expert_status_flag" not in df.columns:
         return df
-    return df[df["expert_status_flag"] == True].copy()
+    filtered = df[df["expert_status_flag"] == True].copy()
+    filtered = filtered.drop(columns=["expert_status_flag"], errors="ignore")
+    return filtered
 
 
 def get_by_support(df, support_type):
@@ -288,6 +290,27 @@ def day_of_week_chart(idf):
     return fig
 
 
+def round_charts(df, title_suffix=""):
+    if "round_name" not in df.columns or df.empty:
+        return
+    rc = df["round_name"].value_counts()
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
+                              textinfo="label+value+percent"))
+        fig.update_layout(title="Round Distribution" + title_suffix, height=420)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        rt = df.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
+        fig2 = go.Figure()
+        for s in TASK_ORDER:
+            if s in rt.columns:
+                fig2.add_trace(go.Bar(x=rt.index, y=rt[s], name=TASK_LABEL[s],
+                                      marker_color=CLR[s], text=rt[s], textposition="inside"))
+        fig2.update_layout(barmode="stack", title="Round x Task" + title_suffix, height=420)
+        st.plotly_chart(fig2, use_container_width=True)
+
+
 def main():
     st.title("Vizva Support Dashboard")
 
@@ -386,6 +409,12 @@ def main():
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
 
+            # -- ROUND WISE TODAY (Interview Support Only) --
+            if selected_support == "Interview Support":
+                st.markdown("---")
+                st.subheader("Round Breakdown - " + str(today))
+                round_charts(today_df, " - " + str(today))
+
             with st.expander("Raw Data"):
                 st.dataframe(today_df, use_container_width=True, height=400)
 
@@ -426,6 +455,24 @@ def main():
 
         with st.expander("Monthly Data Table"):
             st.dataframe(monthly, use_container_width=True)
+
+        # -- ROUND WISE MONTHLY (Interview Support Only) --
+        if selected_support == "Interview Support" and "round_name" in support_df.columns:
+            st.markdown("---")
+            st.subheader("Round-wise Monthly Breakdown")
+
+            month_round_df = support_df.copy()
+            month_round_df["month"] = month_round_df["date"].dt.to_period("M").astype(str)
+
+            round_months = sorted(month_round_df["month"].unique())
+            sel_round_month = st.selectbox("Select Month  ", round_months, index=len(round_months) - 1, key="round_month")
+
+            round_month_data = month_round_df[month_round_df["month"] == sel_round_month]
+
+            if not round_month_data.empty:
+                round_charts(round_month_data, " - " + sel_round_month)
+            else:
+                st.info("No data for " + sel_round_month)
 
         # -- EXPERT WISE MONTHLY --
         st.markdown("---")
@@ -533,6 +580,12 @@ def main():
                 disp["day"] = pd.to_datetime(disp["day"]).dt.strftime("%Y-%m-%d")
                 st.dataframe(disp, use_container_width=True)
 
+            # -- ROUND WISE FOR DATE RANGE (Interview Support Only) --
+            if selected_support == "Interview Support" and "round_name" in period.columns and not period.empty:
+                st.markdown("---")
+                st.subheader("Round Breakdown (" + str(start) + " to " + str(end) + ")")
+                round_charts(period, " (" + str(start) + " to " + str(end) + ")")
+
         st.sidebar.markdown("---")
         single = st.sidebar.date_input("Inspect single day", value=max_d,
                                        min_value=min_d, max_value=max_d, key="single")
@@ -561,6 +614,12 @@ def main():
                 fig = h_bar_by_task(sdf, "expert_name", 10, "Experts - " + str(single))
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
+
+            # -- ROUND WISE FOR SINGLE DAY (Interview Support Only) --
+            if selected_support == "Interview Support" and "round_name" in sdf.columns:
+                st.markdown("---")
+                st.subheader("Round Breakdown - " + str(single))
+                round_charts(sdf, " - " + str(single))
 
             st.dataframe(sdf, use_container_width=True)
         elif single:
@@ -700,7 +759,7 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v9.0 | API-powered | Active Experts Only")
+    st.sidebar.caption("Vizva Dashboard v10.0 | API-powered | Active Experts Only")
 
 
 # ================================================================
