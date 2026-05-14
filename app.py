@@ -60,7 +60,7 @@ def fetch_all_data():
 
 
 def normalize(df):
-    cols_to_drop = ["case_candidate_phone", "case_candidate_email", "candidate_phone", "candidate_email", "candidate_status_flag",
+    cols_to_drop = ["case_candidate_phone", "candidate_resume", "case_candidate_email", "candidate_phone", "candidate_email", "candidate_status_flag",
                     "expert_is_team_lead", "expert_date_of_joining", "filled_by_first_name", "filled_by_last_name",
                     "filled_by_email"]
     id_cols = [c for c in df.columns if c.endswith("_id") or c == "id"]
