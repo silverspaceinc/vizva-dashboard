@@ -191,11 +191,26 @@ def to_excel_bytes(df):
     clean = df.copy()
     for col in clean.columns:
         if clean[col].dtype == object:
-            clean[col] = clean[col].astype(str).apply(lambda x: ILLEGAL_CHARACTERS_RE.sub("", x))
+            clean[col] = clean[col].astype(str).apply(
+                lambda x: re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufeff\ufffe\uffff]', '', x)
+            )
+        elif str(clean[col].dtype) == "string":
+            clean[col] = clean[col].astype(str).apply(
+                lambda x: re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufeff\ufffe\uffff]', '', x)
+            )
+    # Also clean any mixed-type columns
+    for col in clean.columns:
+        try:
+            clean[col] = clean[col].apply(
+                lambda x: re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufeff\ufffe\uffff]', '', str(x)) if isinstance(x, str) else x
+            )
+        except Exception:
+            pass
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         clean.to_excel(writer, index=False, sheet_name="Data")
     return output.getvalue()
+
 
 
 def kpi_row(data):
