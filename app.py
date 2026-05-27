@@ -357,9 +357,10 @@ def main():
         st.download_button(
             label="Download Raw Data",
             data=excel_data,
-            file_name="vizva_raw_data_" + date.today().strftime("%Y%m%d") + ".xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            file_name="vizva_raw_data_" + date.today().strftime("%Y%m%d") + ".csv",
+            mime="text/csv"
         )
+
 
     # --- SUPPORT TYPE SELECTOR ---
     st.sidebar.header("Support Type")
