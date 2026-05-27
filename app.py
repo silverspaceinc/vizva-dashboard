@@ -4,6 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import date, datetime
 import requests
+import io
 
 st.set_page_config(page_title="Vizva Interview Dashboard", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
@@ -114,7 +115,8 @@ def hist_monthly_df(support_type):
 def live_monthly(idf, from_date="2026-05-01"):
     if idf.empty or "date" not in idf.columns:
         return pd.DataFrame()
-    f = idf[idf["date"] >= pd.Timestamp(from_date)].copy()
+    today = date.today()
+    f = idf[(idf["date"] >= pd.Timestamp(from_date)) & (idf["date"].dt.date <= today)].copy()
     if f.empty:
         return pd.DataFrame()
     f["month"] = f["date"].dt.to_period("M").astype(str)
@@ -180,6 +182,13 @@ def daily_agg(idf):
                       "total": len(g),
                       "candidates": g["candidate_name"].nunique() if "candidate_name" in g.columns else 0})
     return pd.DataFrame(rows)
+
+
+def to_excel_bytes(df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Data")
+    return output.getvalue()
 
 
 def kpi_row(data):
@@ -312,7 +321,10 @@ def round_charts(df, title_suffix=""):
 
 
 def main():
-    st.title("Vizva Support Dashboard")
+    # --- TITLE ROW WITH DOWNLOAD BUTTON ---
+    title_col, dl_col = st.columns([4, 1])
+    with title_col:
+        st.title("Vizva Support Dashboard")
 
     try:
         with st.spinner("Fetching latest data from API..."):
@@ -329,6 +341,18 @@ def main():
 
     all_case_df = raw.copy()
     active_expert_df = filter_active_experts(raw)
+
+    # --- DOWNLOAD BUTTON TOP RIGHT ---
+    with dl_col:
+        st.write("")
+        st.write("")
+        excel_data = to_excel_bytes(all_case_df)
+        st.download_button(
+            label="Download Raw Data",
+            data=excel_data,
+            file_name="vizva_raw_data_" + date.today().strftime("%Y%m%d") + ".xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     # --- SUPPORT TYPE SELECTOR ---
     st.sidebar.header("Support Type")
@@ -427,7 +451,14 @@ def main():
         has_hist = selected_support in HIST
         title_range = "(Jul 2025 - Present)" if has_hist else "(2026 - Present)"
         st.header("Monthly Overview - " + support_label + " " + title_range)
-        latest = monthly.iloc[-1]
+
+        # Show current month stats, not latest data month
+        current_month_str = date.today().strftime("%Y-%m")
+        current_month_row = monthly[monthly["month"] == current_month_str]
+        if not current_month_row.empty:
+            latest = current_month_row.iloc[0]
+        else:
+            latest = monthly.iloc[-1]
 
         c = st.columns(6)
         c[0].metric("Month", latest["month"])
@@ -631,7 +662,7 @@ def main():
 
         tabs = st.tabs(["Experts", "Companies", "Rounds",
                          "Day of Week", "All Support Types",
-                         "Candidates", "Technology", "Status"])
+                         "Candidates", "Technology"])
 
         with tabs[0]:
             fig = expert_stack(support_df)
@@ -750,16 +781,8 @@ def main():
             else:
                 st.info("No technology column found.")
 
-        with tabs[7]:
-            if "status" in support_df.columns:
-                sc = support_df["status"].value_counts()
-                fig = go.Figure(go.Bar(x=sc.index, y=sc.values, marker_color="#e67e22",
-                                       text=sc.values, textposition="outside"))
-                fig.update_layout(title="Case Status Distribution", height=400)
-                st.plotly_chart(fig, use_container_width=True)
-
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v10.0 | API-powered | Active Experts Only")
+    st.sidebar.caption("Vizva Dashboard v11.0 | API-powered | Active Experts Only")
 
 
 # ================================================================
