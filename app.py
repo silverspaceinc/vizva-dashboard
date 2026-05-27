@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from datetime import date, datetime
 import requests
 import io
+import re
 
 st.set_page_config(page_title="Vizva Interview Dashboard", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
@@ -19,6 +20,8 @@ CLR = {"completed": "#2ecc71", "rescheduled": "#f39c12",
        "cancelled": "#e74c3c", "pending": "#3498db"}
 
 SUPPORT_TYPES = ["Interview Support", "Assessment Support", "Mock Interview", "Resume Understanding"]
+
+ILLEGAL_CHARACTERS_RE = re.compile(r'[\000-\010]|[\013-\014]|[\016-\037]')
 
 HIST = {
     "Interview Support": {
@@ -185,9 +188,13 @@ def daily_agg(idf):
 
 
 def to_excel_bytes(df):
+    clean = df.copy()
+    for col in clean.columns:
+        if clean[col].dtype == object:
+            clean[col] = clean[col].astype(str).apply(lambda x: ILLEGAL_CHARACTERS_RE.sub("", x))
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Data")
+        clean.to_excel(writer, index=False, sheet_name="Data")
     return output.getvalue()
 
 
