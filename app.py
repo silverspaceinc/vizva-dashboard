@@ -64,9 +64,10 @@ def fetch_all_data():
 
 
 def normalize(df):
-    cols_to_drop = ["case_candidate_phone", "status", "filled_by_username", "candidate_resume", "case_candidate_email", "candidate_phone", "candidate_email", "candidate_status_flag",
-                    "expert_is_team_lead", "expert_date_of_joining", "filled_by_first_name", "filled_by_last_name",
-                    "filled_by_email"]
+    cols_to_drop = ["case_candidate_phone", "status", "filled_by_username", "candidate_resume",
+                    "case_candidate_email", "candidate_phone", "candidate_email", "candidate_status_flag",
+                    "expert_is_team_lead", "expert_date_of_joining", "filled_by_first_name",
+                    "filled_by_last_name", "filled_by_email"]
     id_cols = [c for c in df.columns if c.endswith("_id") or c == "id"]
     cols_to_drop = cols_to_drop + id_cols
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
@@ -198,6 +199,7 @@ def to_excel_bytes(df):
             pass
     return clean.to_csv(index=False).encode("utf-8")
 
+
 def kpi_row(data):
     c = st.columns(5)
     c[0].metric("Completed", int(data.get("completed", 0)))
@@ -315,7 +317,7 @@ def round_charts(df, title_suffix=""):
         fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
                               textinfo="label+value+percent"))
         fig.update_layout(title="Round Distribution" + title_suffix, height=420)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     with c2:
         rt = df.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
         fig2 = go.Figure()
@@ -324,7 +326,7 @@ def round_charts(df, title_suffix=""):
                 fig2.add_trace(go.Bar(x=rt.index, y=rt[s], name=TASK_LABEL[s],
                                       marker_color=CLR[s], text=rt[s], textposition="inside"))
         fig2.update_layout(barmode="stack", title="Round x Task" + title_suffix, height=420)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
 
 def main():
@@ -360,7 +362,6 @@ def main():
             file_name="vizva_raw_data_" + date.today().strftime("%Y%m%d") + ".csv",
             mime="text/csv"
         )
-
 
     # --- SUPPORT TYPE SELECTOR ---
     st.sidebar.header("Support Type")
@@ -401,8 +402,9 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.header("View")
-    view = st.sidebar.radio("", ["Todays Snapshot", "Monthly Overview",
-                                  "Daily Drill-Down", "Deep-Dive Analytics"])
+    view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
+                                  "Daily Drill-Down", "Deep-Dive Analytics"],
+                            label_visibility="collapsed")
 
     # ======= TODAY =======
     if view == "Todays Snapshot":
@@ -425,21 +427,21 @@ def main():
         if not today_df.empty:
             c1, c2 = st.columns(2)
             with c1:
-                st.plotly_chart(donut(kd, "Task Split - " + str(today)), use_container_width=True)
+                st.plotly_chart(donut(kd, "Task Split - " + str(today)), width="stretch")
             with c2:
                 fig = h_bar_by_task(today_df, "company_name", 10, "Companies - " + str(today))
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
             c3, c4 = st.columns(2)
             with c3:
                 fig = h_bar_by_task(today_df, "candidate_name", 10, "Candidates - " + str(today))
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
             with c4:
                 fig = h_bar_by_task(today_df, "expert_name", 10, "Experts - " + str(today))
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
             # -- ROUND WISE TODAY (Interview Support Only) --
             if selected_support == "Interview Support":
@@ -448,7 +450,7 @@ def main():
                 round_charts(today_df, " - " + str(today))
 
             with st.expander("Raw Data"):
-                st.dataframe(today_df, use_container_width=True, height=400)
+                st.dataframe(today_df, width="stretch", height=400)
 
     # ======= MONTHLY =======
     elif view == "Monthly Overview":
@@ -476,24 +478,24 @@ def main():
         c[4].metric("Pending", int(latest["pending"]))
         c[5].metric("Candidates", int(latest["candidates"]))
 
-        st.plotly_chart(stacked_bar(monthly, title="Monthly " + support_label + " Counts"), use_container_width=True)
+        st.plotly_chart(stacked_bar(monthly, title="Monthly " + support_label + " Counts"), width="stretch")
 
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(trend_line(monthly, "candidates", "Unique Candidates per Month"), use_container_width=True)
+            st.plotly_chart(trend_line(monthly, "candidates", "Unique Candidates per Month"), width="stretch")
         with c2:
-            st.plotly_chart(pct_line(monthly, "completed", "Completion Rate %", "#2ecc71"), use_container_width=True)
+            st.plotly_chart(pct_line(monthly, "completed", "Completion Rate %", "#2ecc71"), width="stretch")
 
         c3, c4 = st.columns(2)
         with c3:
-            st.plotly_chart(pct_line(monthly, "cancelled", "Cancellation Rate %", "#e74c3c"), use_container_width=True)
+            st.plotly_chart(pct_line(monthly, "cancelled", "Cancellation Rate %", "#e74c3c"), width="stretch")
         with c4:
-            st.plotly_chart(donut(latest.to_dict(), "Task Split - " + str(latest["month"])), use_container_width=True)
+            st.plotly_chart(donut(latest.to_dict(), "Task Split - " + str(latest["month"])), width="stretch")
 
-        st.plotly_chart(trend_line(monthly, "total", "Total " + support_label + " per Month", "#8e44ad"), use_container_width=True)
+        st.plotly_chart(trend_line(monthly, "total", "Total " + support_label + " per Month", "#8e44ad"), width="stretch")
 
         with st.expander("Monthly Data Table"):
-            st.dataframe(monthly, use_container_width=True)
+            st.dataframe(monthly, width="stretch")
 
         # -- ROUND WISE MONTHLY (Interview Support Only) --
         if selected_support == "Interview Support" and "round_name" in support_df.columns:
@@ -532,11 +534,11 @@ def main():
                                              name=TASK_LABEL[s], marker_color=CLR[s],
                                              text=month_exp[s], textposition="inside"))
                 fig.update_layout(barmode="stack", title="Expert Counts - " + selected_month, height=500)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 st.dataframe(month_exp[["expert_name", "completed", "rescheduled", "cancelled",
                                         "pending", "total", "candidates"]],
-                             use_container_width=True)
+                             width="stretch")
 
             st.subheader("Expert Trend Across Months")
             experts_list = sorted(exp_monthly["expert_name"].unique())
@@ -551,7 +553,7 @@ def main():
                                                  mode="lines+markers", name=TASK_LABEL[s],
                                                  line=dict(color=CLR[s])))
                 fig.update_layout(title=selected_expert + " - Monthly Trend", height=400)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
         # -- CANDIDATE WISE MONTHLY --
         st.markdown("---")
@@ -577,9 +579,9 @@ def main():
                 fig.update_layout(barmode="stack",
                                   title="Candidate Counts - " + sel_cand_month,
                                   height=500, xaxis_tickangle=-45)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
-                st.dataframe(cand_month_data, use_container_width=True)
+                st.dataframe(cand_month_data, width="stretch")
 
     # ======= DAILY =======
     elif view == "Daily Drill-Down":
@@ -610,14 +612,14 @@ def main():
                 fig.add_trace(go.Scatter(x=dd_plot["day"], y=dd_plot[s], mode="lines+markers",
                                          name=TASK_LABEL[s], line=dict(color=CLR[s])))
             fig.update_layout(title="Daily Trend (" + str(start) + " to " + str(end) + ")", height=450)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
-            st.plotly_chart(stacked_bar(dd_plot, x="day", title="Daily Stacked View"), use_container_width=True)
+            st.plotly_chart(stacked_bar(dd_plot, x="day", title="Daily Stacked View"), width="stretch")
 
             with st.expander("Daily Table"):
                 disp = dd.copy()
                 disp["day"] = pd.to_datetime(disp["day"]).dt.strftime("%Y-%m-%d")
-                st.dataframe(disp, use_container_width=True)
+                st.dataframe(disp, width="stretch")
 
             # -- ROUND WISE FOR DATE RANGE (Interview Support Only) --
             if selected_support == "Interview Support" and "round_name" in period.columns and not period.empty:
@@ -638,21 +640,21 @@ def main():
 
             c1, c2 = st.columns(2)
             with c1:
-                st.plotly_chart(donut(kd2, "Split - " + str(single)), use_container_width=True)
+                st.plotly_chart(donut(kd2, "Split - " + str(single)), width="stretch")
             with c2:
                 fig = h_bar_by_task(sdf, "company_name", 10, "Companies - " + str(single))
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
             c3, c4 = st.columns(2)
             with c3:
                 fig = h_bar_by_task(sdf, "candidate_name", 10, "Candidates - " + str(single))
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
             with c4:
                 fig = h_bar_by_task(sdf, "expert_name", 10, "Experts - " + str(single))
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
             # -- ROUND WISE FOR SINGLE DAY (Interview Support Only) --
             if selected_support == "Interview Support" and "round_name" in sdf.columns:
@@ -660,7 +662,7 @@ def main():
                 st.subheader("Round Breakdown - " + str(single))
                 round_charts(sdf, " - " + str(single))
 
-            st.dataframe(sdf, use_container_width=True)
+            st.dataframe(sdf, width="stretch")
         elif single:
             st.info("No " + support_label + " on " + str(single))
 
@@ -675,7 +677,7 @@ def main():
         with tabs[0]:
             fig = expert_stack(support_df)
             if fig:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             if "expert_name" in support_df.columns:
                 ea = support_df.groupby("expert_name").agg(
                     Total=("task_status", "size"),
@@ -687,12 +689,12 @@ def main():
                     Companies=("company_name", "nunique"),
                 ).reset_index()
                 ea["Completion_Pct"] = (ea["Completed"] / ea["Total"] * 100).round(1)
-                st.dataframe(ea.sort_values("Total", ascending=False), use_container_width=True)
+                st.dataframe(ea.sort_values("Total", ascending=False), width="stretch")
 
         with tabs[1]:
             fig = h_bar_by_task(support_df, "company_name", 20, "Top 20 Companies by Volume")
             if fig:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             if "company_name" in support_df.columns:
                 top = support_df["company_name"].value_counts().head(15).index
                 ct = support_df[support_df["company_name"].isin(top)]
@@ -700,7 +702,7 @@ def main():
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
                                 color_continuous_scale="Blues", title="Company x Task Heatmap")
                 fig2.update_layout(height=500)
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch")
 
         with tabs[2]:
             if "round_name" in support_df.columns:
@@ -708,18 +710,18 @@ def main():
                 fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
                                       textinfo="label+value+percent"))
                 fig.update_layout(title="Round Distribution", height=420)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 rt = support_df.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(rt, text_auto=True, aspect="auto",
                                 color_continuous_scale="Oranges", title="Round x Task Heatmap")
                 fig2.update_layout(height=400)
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch")
 
         with tabs[3]:
             fig = day_of_week_chart(support_df)
             if fig:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             if "date" in support_df.columns:
                 order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
                 tmp = support_df.copy()
@@ -728,7 +730,7 @@ def main():
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
                                 color_continuous_scale="Purples", title="Day x Task Heatmap")
                 fig2.update_layout(height=400)
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch")
 
         with tabs[4]:
             if "support_name" in all_case_df.columns:
@@ -736,13 +738,13 @@ def main():
                 fig = go.Figure(go.Bar(x=sc.index, y=sc.values, marker_color="#1abc9c",
                                        text=sc.values, textposition="outside"))
                 fig.update_layout(title="All Support Types (Current Year)", height=400)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 st_task = all_case_df.groupby(["support_name", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(st_task, text_auto=True, aspect="auto",
                                 color_continuous_scale="Teal", title="Support Type x Task")
                 fig2.update_layout(height=350)
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch")
 
         with tabs[5]:
             if "candidate_name" in support_df.columns:
@@ -758,7 +760,7 @@ def main():
                 ca_agg["Completion_Pct"] = (ca_agg["Completed"] / ca_agg["Total"] * 100).round(1)
                 ca_agg = ca_agg.sort_values("Total", ascending=False)
                 st.subheader("Candidate Performance Table")
-                st.dataframe(ca_agg, use_container_width=True)
+                st.dataframe(ca_agg, width="stretch")
 
                 top30 = ca_agg.head(20).sort_values("Total")
                 fig = go.Figure()
@@ -772,25 +774,25 @@ def main():
                                      name="Pending", orientation="h", marker_color="#3498db"))
                 fig.update_layout(barmode="stack", title="Top 20 Candidates", height=600,
                                   yaxis=dict(autorange="reversed"))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
         with tabs[6]:
             if "candidate_technology" in support_df.columns:
                 fig = h_bar_by_task(support_df, "candidate_technology", 20, "Top 20 Technologies")
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
                 top_tech = support_df["candidate_technology"].value_counts().head(15).index
                 tt = support_df[support_df["candidate_technology"].isin(top_tech)]
                 pv = tt.groupby(["candidate_technology", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
                                 color_continuous_scale="Greens", title="Technology x Task Heatmap")
                 fig2.update_layout(height=500)
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch")
             else:
                 st.info("No technology column found.")
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v11.0 | API-powered | Active Experts Only")
+    st.sidebar.caption("Vizva Dashboard v12.0 | API-powered | Active Experts Only")
 
 
 # ================================================================
