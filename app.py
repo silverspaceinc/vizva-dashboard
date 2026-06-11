@@ -22,6 +22,7 @@ def _download_nltk():
     nltk.download("punkt_tab", quiet=True)
     nltk.download("averaged_perceptron_tagger", quiet=True)
     nltk.download("averaged_perceptron_tagger_eng", quiet=True)
+    nltk.download("vader_lexicon", quiet=True)
 
 _download_nltk()
 
@@ -29,6 +30,7 @@ from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from nltk.tokenize import word_tokenize
 from nltk import pos_tag
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
 st.set_page_config(page_title="Vizva Interview Dashboard", page_icon="chart_with_upwards_trend",
@@ -64,10 +66,8 @@ HIST = {
 
 # ── Domain-specific stopwords to exclude from analysis ───────────
 DOMAIN_STOPWORDS = {
-    # support-type subject words
     "interview", "assessment", "mock", "resume", "understanding",
     "support", "interviewer", "interviews", "assessments",
-    # generic filler words common in feedback
     "candidate", "candidates", "expert", "experts",
     "also", "would", "could", "get", "got", "go", "went",
     "one", "two", "good", "well", "done", "like", "need",
@@ -78,13 +78,284 @@ DOMAIN_STOPWORDS = {
     "time", "day", "date", "month", "yes", "no",
 }
 
+# ── Sentiment colour helpers ─────────────────────────────────────
+SENT_CLR = {"Positive": "#2ecc71", "Neutral": "#f39c12", "Negative": "#e74c3c"}
+
+
+def sentiment_color(score):
+    """Return hex color for a -100..100 sentiment score."""
+    if score >= 20:
+        return "#2ecc71"
+    elif score <= -20:
+        return "#e74c3c"
+    return "#f39c12"
+
+
+def sentiment_label(score):
+    """Return human label for a -100..100 sentiment score."""
+    if score >= 20:
+        return "Positive"
+    elif score <= -20:
+        return "Negative"
+    return "Neutral"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  VADER SENTIMENT UTILITIES
+# ═══════════════════════════════════════════════════════════════════
+
+@st.cache_resource
+def _get_vader():
+    return SentimentIntensityAnalyzer()
+
+
+def compute_sentiment_score(text):
+    """
+    Compute VADER compound score for a single text string.
+    Returns score scaled to -100 … +100 (percentage scale).
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    sia = _get_vader()
+    compound = sia.polarity_scores(text)["compound"]
+    return round(compound * 100, 1)
+
+
+def add_sentiment_column(df, feedback_col="feedback"):
+    """
+    Add 'sentiment_score' (-100..100) and 'sentiment_label' columns
+    to the dataframe based on the feedback column.
+    Returns the dataframe (modified in place) and the feedback column name found.
+    """
+    candidates = [feedback_col, "feedback", "Feedback", "feedback_text",
+                  "case_feedback", "expert_feedback", "comments", "remark", "remarks"]
+    found_col = None
+    for c in candidates:
+        if c in df.columns:
+            found_col = c
+            break
+    if found_col is None:
+        df["sentiment_score"] = None
+        df["sentiment_label"] = None
+        return df, None
+
+    df["sentiment_score"] = df[found_col].apply(compute_sentiment_score)
+    df["sentiment_label"] = df["sentiment_score"].apply(
+        lambda x: sentiment_label(x) if pd.notna(x) else None
+    )
+    return df, found_col
+
+
+def get_sentiment_stats(df):
+    """
+    Return dict with avg, min, max, count, and label distribution
+    from a dataframe that already has 'sentiment_score' column.
+    """
+    valid = df["sentiment_score"].dropna()
+    if valid.empty:
+        return None
+    stats = {
+        "avg": round(valid.mean(), 1),
+        "min": round(valid.min(), 1),
+        "max": round(valid.max(), 1),
+        "count": len(valid),
+        "positive": int((valid >= 20).sum()),
+        "neutral": int(((valid > -20) & (valid < 20)).sum()),
+        "negative": int((valid <= -20).sum()),
+    }
+    return stats
+
+
+def render_sentiment_kpi(stats, title="Feedback Sentiment"):
+    """Render a row of sentiment KPI metrics."""
+    if stats is None:
+        st.info("No feedback available for sentiment analysis.")
+        return
+
+    st.subheader(title)
+
+    avg = stats["avg"]
+    clr = sentiment_color(avg)
+    lbl = sentiment_label(avg)
+
+    c = st.columns(6)
+    c[0].metric("Avg Sentiment", f"{avg:+.1f}%",
+                delta=lbl, delta_color="normal" if avg >= 0 else "inverse")
+    c[1].metric("Feedbacks Analyzed", stats["count"])
+    c[2].metric("Positive (≥20%)", stats["positive"])
+    c[3].metric("Neutral (-20% to 20%)", stats["neutral"])
+    c[4].metric("Negative (≤-20%)", stats["negative"])
+    c[5].metric("Range", f"{stats['min']:+.0f}% to {stats['max']:+.0f}%")
+
+
+def render_sentiment_donut(stats, title="Sentiment Split"):
+    """Render a donut chart of Positive / Neutral / Negative counts."""
+    if stats is None:
+        return None
+    labels = ["Positive", "Neutral", "Negative"]
+    values = [stats["positive"], stats["neutral"], stats["negative"]]
+    colors = [SENT_CLR[l] for l in labels]
+    fig = go.Figure(go.Pie(
+        labels=labels, values=values, hole=0.5,
+        marker=dict(colors=colors),
+        textinfo="label+value+percent",
+    ))
+    fig.update_layout(title=title, height=380, showlegend=False)
+    return fig
+
+
+def render_sentiment_histogram(df, title="Sentiment Score Distribution"):
+    """Render a histogram of individual feedback sentiment scores."""
+    valid = df["sentiment_score"].dropna()
+    if valid.empty:
+        return None
+    fig = go.Figure(go.Histogram(
+        x=valid, nbinsx=20,
+        marker_color="#3498db",
+        marker_line=dict(color="white", width=1),
+    ))
+    fig.add_vline(x=0, line_dash="dash", line_color="gray", annotation_text="Neutral")
+    fig.add_vline(x=valid.mean(), line_dash="dot", line_color="#e74c3c",
+                  annotation_text=f"Avg: {valid.mean():+.1f}%")
+    fig.update_layout(
+        title=title, height=380,
+        xaxis_title="Sentiment Score (%)",
+        yaxis_title="Count",
+        xaxis=dict(range=[-105, 105]),
+    )
+    return fig
+
+
+def render_sentiment_section(df, section_title="Feedback Sentiment Analysis"):
+    """
+    Complete sentiment section: KPI row + donut + histogram.
+    Expects df to already have 'sentiment_score' and 'sentiment_label' columns.
+    """
+    stats = get_sentiment_stats(df)
+    if stats is None:
+        st.info("No feedback available for sentiment analysis in this selection.")
+        return
+
+    render_sentiment_kpi(stats, title=section_title)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fig = render_sentiment_donut(stats, "Sentiment Split")
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        fig = render_sentiment_histogram(df, "Score Distribution")
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def monthly_sentiment_trend(df):
+    """
+    Build a monthly average sentiment dataframe from data
+    that already has 'sentiment_score' and 'date' columns.
+    """
+    if df.empty or "date" not in df.columns or "sentiment_score" not in df.columns:
+        return pd.DataFrame()
+    d = df.dropna(subset=["sentiment_score"]).copy()
+    if d.empty:
+        return pd.DataFrame()
+    d["month"] = d["date"].dt.to_period("M").astype(str)
+    agg = d.groupby("month")["sentiment_score"].agg(
+        avg_sentiment="mean",
+        feedbacks="count",
+        min_sentiment="min",
+        max_sentiment="max",
+    ).reset_index()
+    agg["avg_sentiment"] = agg["avg_sentiment"].round(1)
+    agg["min_sentiment"] = agg["min_sentiment"].round(1)
+    agg["max_sentiment"] = agg["max_sentiment"].round(1)
+
+    # Positive / Neutral / Negative counts per month
+    pos = d[d["sentiment_score"] >= 20].groupby(d["date"].dt.to_period("M").astype(str)).size().rename("positive")
+    neu = d[(d["sentiment_score"] > -20) & (d["sentiment_score"] < 20)].groupby(d["date"].dt.to_period("M").astype(str)).size().rename("neutral")
+    neg = d[d["sentiment_score"] <= -20].groupby(d["date"].dt.to_period("M").astype(str)).size().rename("negative")
+
+    agg = agg.merge(pos, left_on="month", right_index=True, how="left")
+    agg = agg.merge(neu, left_on="month", right_index=True, how="left")
+    agg = agg.merge(neg, left_on="month", right_index=True, how="left")
+    agg = agg.fillna(0)
+    for c in ["positive", "neutral", "negative"]:
+        agg[c] = agg[c].astype(int)
+
+    return agg
+
+
+def render_sentiment_trend_chart(sent_monthly, title="Monthly Avg Sentiment Trend"):
+    """Line chart of monthly average sentiment with colored markers."""
+    if sent_monthly.empty:
+        return None
+    colors = [sentiment_color(v) for v in sent_monthly["avg_sentiment"]]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=sent_monthly["month"],
+        y=sent_monthly["avg_sentiment"],
+        mode="lines+markers+text",
+        text=sent_monthly["avg_sentiment"].apply(lambda v: f"{v:+.1f}%"),
+        textposition="top center",
+        line=dict(color="#8e44ad", width=3),
+        marker=dict(size=12, color=colors, line=dict(width=2, color="white")),
+    ))
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.add_hline(y=20, line_dash="dot", line_color="#2ecc71", opacity=0.3,
+                  annotation_text="Positive threshold")
+    fig.add_hline(y=-20, line_dash="dot", line_color="#e74c3c", opacity=0.3,
+                  annotation_text="Negative threshold")
+    fig.update_layout(
+        title=title, height=420,
+        yaxis_title="Avg Sentiment (%)",
+        yaxis=dict(range=[
+            min(-50, sent_monthly["avg_sentiment"].min() - 15),
+            max(50, sent_monthly["avg_sentiment"].max() + 15)
+        ]),
+    )
+    return fig
+
+
+def render_sentiment_stacked_bar(sent_monthly, title="Monthly Sentiment Breakdown"):
+    """Stacked bar of positive/neutral/negative counts per month."""
+    if sent_monthly.empty:
+        return None
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=sent_monthly["month"], y=sent_monthly["positive"],
+                         name="Positive", marker_color="#2ecc71",
+                         text=sent_monthly["positive"], textposition="inside"))
+    fig.add_trace(go.Bar(x=sent_monthly["month"], y=sent_monthly["neutral"],
+                         name="Neutral", marker_color="#f39c12",
+                         text=sent_monthly["neutral"], textposition="inside"))
+    fig.add_trace(go.Bar(x=sent_monthly["month"], y=sent_monthly["negative"],
+                         name="Negative", marker_color="#e74c3c",
+                         text=sent_monthly["negative"], textposition="inside"))
+    fig.update_layout(barmode="stack", title=title, height=420,
+                      legend=dict(orientation="h", y=1.02, x=1, xanchor="right"))
+    return fig
+
+
+def daily_sentiment_agg(df):
+    """Build daily average sentiment dataframe."""
+    if df.empty or "date" not in df.columns or "sentiment_score" not in df.columns:
+        return pd.DataFrame()
+    d = df.dropna(subset=["sentiment_score"]).copy()
+    if d.empty:
+        return pd.DataFrame()
+    d["day"] = d["date"].dt.date
+    agg = d.groupby("day")["sentiment_score"].agg(
+        avg_sentiment="mean",
+        feedbacks="count",
+    ).reset_index()
+    agg["avg_sentiment"] = agg["avg_sentiment"].round(1)
+    return agg
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  TEXT PREPROCESSING + WORDCLOUD UTILITIES
 # ═══════════════════════════════════════════════════════════════════
 
 def _nltk_pos_to_wordnet(tag):
-    """Map NLTK POS tag to WordNet POS for better lemmatization."""
     from nltk.corpus import wordnet
     if tag.startswith("J"):
         return wordnet.ADJ
@@ -94,85 +365,50 @@ def _nltk_pos_to_wordnet(tag):
         return wordnet.NOUN
     elif tag.startswith("R"):
         return wordnet.ADV
-    return wordnet.NOUN  # default
+    return wordnet.NOUN
 
 
 def preprocess_feedback_texts(texts):
-    """
-    Full semantic preprocessing pipeline:
-      1. Lowercase
-      2. Remove URLs, emails, numbers, punctuation
-      3. Tokenize
-      4. Remove English stopwords + domain-specific stopwords
-      5. POS-tag aware lemmatization
-      6. Remove single-character tokens
-      7. Return cleaned token list
-    """
     if not texts:
         return []
-
     english_stops = set(stopwords.words("english"))
     all_stops = english_stops | DOMAIN_STOPWORDS
     lemmatizer = WordNetLemmatizer()
-
     all_tokens = []
     for text in texts:
         if not isinstance(text, str) or not text.strip():
             continue
-        # lowercase
         text = text.lower()
-        # remove URLs
         text = re.sub(r"https?://\S+|www\.\S+", "", text)
-        # remove emails
         text = re.sub(r"\S+@\S+", "", text)
-        # remove numbers
         text = re.sub(r"\d+", "", text)
-        # remove punctuation
         text = text.translate(str.maketrans("", "", string.punctuation))
-        # remove extra whitespace
         text = re.sub(r"\s+", " ", text).strip()
-
         if not text:
             continue
-
-        # tokenize
         tokens = word_tokenize(text)
-        # POS tag for better lemmatization
         tagged = pos_tag(tokens)
-        # lemmatize + filter
         for word, tag in tagged:
             lemma = lemmatizer.lemmatize(word, _nltk_pos_to_wordnet(tag))
             if lemma not in all_stops and len(lemma) > 1:
                 all_tokens.append(lemma)
-
     return all_tokens
 
 
 def get_top_words(tokens, n=10):
-    """Return list of (word, count) tuples for top n words."""
     if not tokens:
         return []
     return Counter(tokens).most_common(n)
 
 
 def render_wordcloud_section(feedback_texts, section_title="Feedback Word Cloud"):
-    """
-    Render a complete word-cloud section:
-      - Preprocessing info
-      - Top 10 words bar chart
-      - Word cloud image
-    Designed to be called from any view (Today / Monthly / Daily).
-    """
     if not feedback_texts:
         st.info("No feedback text available for word cloud analysis.")
         return
-
     tokens = preprocess_feedback_texts(feedback_texts)
-
     if not tokens:
         st.info("No meaningful words found after preprocessing the feedback.")
         return
-
     top10 = get_top_words(tokens, 10)
     freq = Counter(tokens)
 
@@ -184,33 +420,19 @@ def render_wordcloud_section(feedback_texts, section_title="Feedback Word Cloud"
         f"**{len(freq)}** unique words."
     )
 
-    # ── Top 10 words bar chart ────────────────────────────────────
     top_df = pd.DataFrame(top10, columns=["Word", "Count"])
     fig_top = go.Figure(go.Bar(
-        x=top_df["Count"],
-        y=top_df["Word"],
-        orientation="h",
-        marker_color="#2980b9",
-        text=top_df["Count"],
-        textposition="outside",
+        x=top_df["Count"], y=top_df["Word"], orientation="h",
+        marker_color="#2980b9", text=top_df["Count"], textposition="outside",
     ))
     fig_top.update_layout(
-        title="Top 10 Words in Feedback",
-        height=400,
-        yaxis=dict(autorange="reversed"),
-        xaxis_title="Count",
-        yaxis_title="",
+        title="Top 10 Words in Feedback", height=400,
+        yaxis=dict(autorange="reversed"), xaxis_title="Count", yaxis_title="",
     )
 
-    # ── Word cloud ────────────────────────────────────────────────
     wc = WordCloud(
-        width=1000,
-        height=500,
-        background_color="white",
-        colormap="viridis",
-        max_words=120,
-        min_font_size=10,
-        prefer_horizontal=0.7,
+        width=1000, height=500, background_color="white",
+        colormap="viridis", max_words=120, min_font_size=10, prefer_horizontal=0.7,
     ).generate_from_frequencies(freq)
 
     fig_wc, ax = plt.subplots(figsize=(12, 6))
@@ -218,7 +440,6 @@ def render_wordcloud_section(feedback_texts, section_title="Feedback Word Cloud"
     ax.axis("off")
     plt.tight_layout(pad=0)
 
-    # ── Layout: bar chart left, word cloud right ──────────────────
     col_bar, col_wc = st.columns([1, 2])
     with col_bar:
         st.plotly_chart(fig_top, use_container_width=True)
@@ -228,10 +449,6 @@ def render_wordcloud_section(feedback_texts, section_title="Feedback Word Cloud"
 
 
 def extract_feedback_texts(df, col="feedback"):
-    """
-    Pull non-empty feedback strings from a dataframe.
-    Tries common column names if the given one doesn't exist.
-    """
     candidates = [col, "feedback", "Feedback", "feedback_text",
                   "case_feedback", "expert_feedback", "comments", "remark", "remarks"]
     for c in candidates:
@@ -543,7 +760,6 @@ def round_charts(df, title_suffix=""):
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    # --- TITLE ROW WITH DOWNLOAD BUTTON ---
     title_col, dl_col = st.columns([4, 1])
     with title_col:
         st.title("Vizva Support Dashboard")
@@ -564,7 +780,9 @@ def main():
     all_case_df = raw.copy()
     active_expert_df = filter_active_experts(raw)
 
-    # --- DOWNLOAD BUTTON TOP RIGHT ---
+    # ── Add sentiment scores to the active expert data ONCE ──────
+    active_expert_df, _fb_col = add_sentiment_column(active_expert_df)
+
     with dl_col:
         st.write("")
         st.write("")
@@ -576,14 +794,12 @@ def main():
             mime="text/csv"
         )
 
-    # --- SUPPORT TYPE SELECTOR ---
     st.sidebar.header("Support Type")
     selected_support = st.sidebar.selectbox("Select Support Type", SUPPORT_TYPES, index=0)
     support_label = selected_support
 
     support_df = get_by_support(active_expert_df, selected_support)
 
-    # Sidebar counts for all types
     st.sidebar.markdown("---")
     st.sidebar.metric("Total Cases (This Year)", len(all_case_df))
     for stype in SUPPORT_TYPES:
@@ -601,6 +817,18 @@ def main():
         st.stop()
 
     st.sidebar.success("Showing " + str(len(support_df)) + " " + support_label + " rows")
+
+    # ── Sidebar: Overall sentiment gauge for selected support type ─
+    overall_stats = get_sentiment_stats(support_df)
+    if overall_stats:
+        avg = overall_stats["avg"]
+        st.sidebar.markdown("---")
+        st.sidebar.metric(
+            "Avg Sentiment (" + support_label + ")",
+            f"{avg:+.1f}%",
+            delta=sentiment_label(avg),
+            delta_color="normal" if avg >= 0 else "inverse",
+        )
 
     hist = hist_monthly_df(selected_support)
     live = live_monthly(support_df)
@@ -637,6 +865,13 @@ def main():
 
         kpi_row(kd)
 
+        # ── TODAY'S SENTIMENT KPI (compact, right after task KPIs) ─
+        if not today_df.empty:
+            today_stats = get_sentiment_stats(today_df)
+            if today_stats:
+                st.markdown("---")
+                render_sentiment_kpi(today_stats, title="Today's Feedback Sentiment")
+
         if not today_df.empty:
             c1, c2 = st.columns(2)
             with c1:
@@ -656,11 +891,14 @@ def main():
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
 
-            # -- ROUND WISE TODAY (Interview Support Only) --
             if selected_support == "Interview Support":
                 st.markdown("---")
                 st.subheader("Round Breakdown - " + str(today))
                 round_charts(today_df, " - " + str(today))
+
+            # ── SENTIMENT DONUT + HISTOGRAM — TODAY ───────────────
+            st.markdown("---")
+            render_sentiment_section(today_df, section_title="Sentiment Analysis - " + str(today))
 
             # ── FEEDBACK WORD CLOUD — TODAY ───────────────────────
             st.markdown("---")
@@ -670,7 +908,7 @@ def main():
                 section_title="Feedback Word Cloud - " + str(today),
             )
 
-            with st.expander("Raw Data"):
+            with st.expander("Raw Data (includes Sentiment Score)"):
                 st.dataframe(today_df, use_container_width=True, height=400)
 
     # ======= MONTHLY =======
@@ -683,7 +921,6 @@ def main():
         title_range = "(Jul 2025 - Present)" if has_hist else "(2026 - Present)"
         st.header("Monthly Overview - " + support_label + " " + title_range)
 
-        # Show current month stats, not latest data month
         current_month_str = date.today().strftime("%Y-%m")
         current_month_row = monthly[monthly["month"] == current_month_str]
         if not current_month_row.empty:
@@ -698,6 +935,21 @@ def main():
         c[3].metric("Cancelled", int(latest["cancelled"]))
         c[4].metric("Pending", int(latest["pending"]))
         c[5].metric("Candidates", int(latest["candidates"]))
+
+        # ── CURRENT MONTH SENTIMENT KPI ──────────────────────────
+        current_month_data = support_df[support_df["date"].dt.to_period("M").astype(str) == current_month_str]
+        if not current_month_data.empty:
+            cm_stats = get_sentiment_stats(current_month_data)
+            if cm_stats:
+                avg = cm_stats["avg"]
+                st.columns(6)[0].empty()  # spacer
+                sent_cols = st.columns(4)
+                sent_cols[0].metric("Avg Sentiment (This Month)", f"{avg:+.1f}%",
+                                    delta=sentiment_label(avg),
+                                    delta_color="normal" if avg >= 0 else "inverse")
+                sent_cols[1].metric("Positive", cm_stats["positive"])
+                sent_cols[2].metric("Neutral", cm_stats["neutral"])
+                sent_cols[3].metric("Negative", cm_stats["negative"])
 
         st.plotly_chart(stacked_bar(monthly, title="Monthly " + support_label + " Counts"), use_container_width=True)
 
@@ -715,14 +967,34 @@ def main():
 
         st.plotly_chart(trend_line(monthly, "total", "Total " + support_label + " per Month", "#8e44ad"), use_container_width=True)
 
+        # ── MONTHLY SENTIMENT TREND ──────────────────────────────
+        st.markdown("---")
+        st.subheader("Sentiment Trend Across Months")
+
+        sent_monthly = monthly_sentiment_trend(support_df)
+        if not sent_monthly.empty:
+            c1, c2 = st.columns(2)
+            with c1:
+                fig = render_sentiment_trend_chart(sent_monthly, "Monthly Avg Sentiment - " + support_label)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                fig = render_sentiment_stacked_bar(sent_monthly, "Monthly Sentiment Breakdown")
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with st.expander("Monthly Sentiment Data"):
+                st.dataframe(sent_monthly, use_container_width=True)
+        else:
+            st.info("No feedback data available for sentiment trend.")
+
         with st.expander("Monthly Data Table"):
             st.dataframe(monthly, use_container_width=True)
 
-        # ── FEEDBACK WORD CLOUD — MONTHLY (with month selector) ───
+        # ── FEEDBACK ANALYSIS (Word Cloud + Sentiment per month) ──
         st.markdown("---")
         st.subheader("Feedback Analysis")
 
-        # Build month list from live data (feedback only exists in live API data)
         if "date" in support_df.columns:
             fb_df = support_df.copy()
             fb_df["month"] = fb_df["date"].dt.to_period("M").astype(str)
@@ -741,6 +1013,13 @@ def main():
             else:
                 fb_subset = fb_df[fb_df["month"] == sel_fb_month]
 
+            # Sentiment section for the selected month
+            render_sentiment_section(fb_subset,
+                                     section_title="Sentiment - " + support_label + " - " + sel_fb_month)
+
+            st.markdown("")
+
+            # Word cloud for the selected month
             feedback_texts = extract_feedback_texts(fb_subset)
             render_wordcloud_section(
                 feedback_texts,
@@ -855,6 +1134,12 @@ def main():
             kd["candidates"] = period["candidate_name"].nunique()
             kpi_row(kd)
 
+            # ── PERIOD SENTIMENT KPI ─────────────────────────────
+            period_stats = get_sentiment_stats(period)
+            if period_stats:
+                render_sentiment_kpi(period_stats,
+                                     title="Feedback Sentiment (" + str(start) + " to " + str(end) + ")")
+
             dd_plot = dd.copy()
             dd_plot["day"] = pd.to_datetime(dd_plot["day"])
             fig = go.Figure()
@@ -866,12 +1151,40 @@ def main():
 
             st.plotly_chart(stacked_bar(dd_plot, x="day", title="Daily Stacked View"), use_container_width=True)
 
+            # ── DAILY SENTIMENT TREND LINE ───────────────────────
+            daily_sent = daily_sentiment_agg(period)
+            if not daily_sent.empty:
+                st.markdown("---")
+                st.subheader("Daily Sentiment Trend")
+                d_colors = [sentiment_color(v) for v in daily_sent["avg_sentiment"]]
+                fig_ds = go.Figure()
+                fig_ds.add_trace(go.Scatter(
+                    x=pd.to_datetime(daily_sent["day"]),
+                    y=daily_sent["avg_sentiment"],
+                    mode="lines+markers+text",
+                    text=daily_sent["avg_sentiment"].apply(lambda v: f"{v:+.1f}%"),
+                    textposition="top center",
+                    line=dict(color="#8e44ad", width=2),
+                    marker=dict(size=10, color=d_colors, line=dict(width=1, color="white")),
+                ))
+                fig_ds.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+                fig_ds.add_hline(y=20, line_dash="dot", line_color="#2ecc71", opacity=0.3)
+                fig_ds.add_hline(y=-20, line_dash="dot", line_color="#e74c3c", opacity=0.3)
+                fig_ds.update_layout(
+                    title="Daily Avg Sentiment (" + str(start) + " to " + str(end) + ")",
+                    height=420, yaxis_title="Avg Sentiment (%)",
+                    yaxis=dict(range=[
+                        min(-50, daily_sent["avg_sentiment"].min() - 15),
+                        max(50, daily_sent["avg_sentiment"].max() + 15)
+                    ]),
+                )
+                st.plotly_chart(fig_ds, use_container_width=True)
+
             with st.expander("Daily Table"):
                 disp = dd.copy()
                 disp["day"] = pd.to_datetime(disp["day"]).dt.strftime("%Y-%m-%d")
                 st.dataframe(disp, use_container_width=True)
 
-            # -- ROUND WISE FOR DATE RANGE (Interview Support Only) --
             if selected_support == "Interview Support" and "round_name" in period.columns and not period.empty:
                 st.markdown("---")
                 st.subheader("Round Breakdown (" + str(start) + " to " + str(end) + ")")
@@ -887,6 +1200,11 @@ def main():
             kd2 = {s: int(tc.get(s, 0)) for s in TASK_ORDER}
             kd2["candidates"] = sdf["candidate_name"].nunique()
             kpi_row(kd2)
+
+            # ── SINGLE DAY SENTIMENT KPI ─────────────────────────
+            single_stats = get_sentiment_stats(sdf)
+            if single_stats:
+                render_sentiment_kpi(single_stats, title="Sentiment - " + str(single))
 
             c1, c2 = st.columns(2)
             with c1:
@@ -906,7 +1224,19 @@ def main():
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
 
-            # -- ROUND WISE FOR SINGLE DAY (Interview Support Only) --
+            # ── SINGLE DAY SENTIMENT DONUT + HISTOGRAM ───────────
+            if single_stats:
+                st.markdown("---")
+                col_d, col_h = st.columns(2)
+                with col_d:
+                    fig = render_sentiment_donut(single_stats, "Sentiment Split - " + str(single))
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+                with col_h:
+                    fig = render_sentiment_histogram(sdf, "Score Distribution - " + str(single))
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+
             if selected_support == "Interview Support" and "round_name" in sdf.columns:
                 st.markdown("---")
                 st.subheader("Round Breakdown - " + str(single))
@@ -937,6 +1267,7 @@ def main():
                     Pending=("task_status", lambda x: (x == "pending").sum()),
                     Candidates=("candidate_name", "nunique"),
                     Companies=("company_name", "nunique"),
+                    Avg_Sentiment=("sentiment_score", lambda x: round(x.dropna().mean(), 1) if x.dropna().any() else None),
                 ).reset_index()
                 ea["Completion_Pct"] = (ea["Completed"] / ea["Total"] * 100).round(1)
                 st.dataframe(ea.sort_values("Total", ascending=False), use_container_width=True)
@@ -1006,6 +1337,7 @@ def main():
                     Pending=("task_status", lambda x: (x == "pending").sum()),
                     Companies=("company_name", "nunique"),
                     Experts=("expert_name", "nunique"),
+                    Avg_Sentiment=("sentiment_score", lambda x: round(x.dropna().mean(), 1) if x.dropna().any() else None),
                 ).reset_index()
                 ca_agg["Completion_Pct"] = (ca_agg["Completed"] / ca_agg["Total"] * 100).round(1)
                 ca_agg = ca_agg.sort_values("Total", ascending=False)
@@ -1042,7 +1374,7 @@ def main():
                 st.info("No technology column found.")
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v13.0 | API-powered | Active Experts Only")
+    st.sidebar.caption("Vizva Dashboard v14.0 | API-powered | Active Experts Only | VADER Sentiment")
 
 
 # ================================================================
