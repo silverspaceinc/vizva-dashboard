@@ -6,7 +6,31 @@ from datetime import date, datetime
 import requests
 import io
 import re
+import string
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+import nltk
+from collections import Counter
 
+# ── NLTK bootstrap (download once, cached) ──────────────────────
+@st.cache_resource
+def _download_nltk():
+    nltk.download("stopwords", quiet=True)
+    nltk.download("wordnet", quiet=True)
+    nltk.download("omw-1.4", quiet=True)
+    nltk.download("punkt", quiet=True)
+    nltk.download("punkt_tab", quiet=True)
+    nltk.download("averaged_perceptron_tagger", quiet=True)
+    nltk.download("averaged_perceptron_tagger_eng", quiet=True)
+
+_download_nltk()
+
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from nltk.tokenize import word_tokenize
+from nltk import pos_tag
+
+# ── Page config ──────────────────────────────────────────────────
 st.set_page_config(page_title="Vizva Interview Dashboard", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
@@ -38,6 +62,191 @@ HIST = {
     },
 }
 
+# ── Domain-specific stopwords to exclude from analysis ───────────
+DOMAIN_STOPWORDS = {
+    # support-type subject words
+    "interview", "assessment", "mock", "resume", "understanding",
+    "support", "interviewer", "interviews", "assessments",
+    # generic filler words common in feedback
+    "candidate", "candidates", "expert", "experts",
+    "also", "would", "could", "get", "got", "go", "went",
+    "one", "two", "good", "well", "done", "like", "need",
+    "much", "many", "even", "still", "really", "thing", "things",
+    "make", "made", "take", "took", "give", "gave", "come", "came",
+    "know", "said", "say", "asked", "question", "questions",
+    "answer", "answered", "round", "rounds", "company", "name",
+    "time", "day", "date", "month", "yes", "no",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  TEXT PREPROCESSING + WORDCLOUD UTILITIES
+# ═══════════════════════════════════════════════════════════════════
+
+def _nltk_pos_to_wordnet(tag):
+    """Map NLTK POS tag to WordNet POS for better lemmatization."""
+    from nltk.corpus import wordnet
+    if tag.startswith("J"):
+        return wordnet.ADJ
+    elif tag.startswith("V"):
+        return wordnet.VERB
+    elif tag.startswith("N"):
+        return wordnet.NOUN
+    elif tag.startswith("R"):
+        return wordnet.ADV
+    return wordnet.NOUN  # default
+
+
+def preprocess_feedback_texts(texts):
+    """
+    Full semantic preprocessing pipeline:
+      1. Lowercase
+      2. Remove URLs, emails, numbers, punctuation
+      3. Tokenize
+      4. Remove English stopwords + domain-specific stopwords
+      5. POS-tag aware lemmatization
+      6. Remove single-character tokens
+      7. Return cleaned token list
+    """
+    if not texts:
+        return []
+
+    english_stops = set(stopwords.words("english"))
+    all_stops = english_stops | DOMAIN_STOPWORDS
+    lemmatizer = WordNetLemmatizer()
+
+    all_tokens = []
+    for text in texts:
+        if not isinstance(text, str) or not text.strip():
+            continue
+        # lowercase
+        text = text.lower()
+        # remove URLs
+        text = re.sub(r"https?://\S+|www\.\S+", "", text)
+        # remove emails
+        text = re.sub(r"\S+@\S+", "", text)
+        # remove numbers
+        text = re.sub(r"\d+", "", text)
+        # remove punctuation
+        text = text.translate(str.maketrans("", "", string.punctuation))
+        # remove extra whitespace
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if not text:
+            continue
+
+        # tokenize
+        tokens = word_tokenize(text)
+        # POS tag for better lemmatization
+        tagged = pos_tag(tokens)
+        # lemmatize + filter
+        for word, tag in tagged:
+            lemma = lemmatizer.lemmatize(word, _nltk_pos_to_wordnet(tag))
+            if lemma not in all_stops and len(lemma) > 1:
+                all_tokens.append(lemma)
+
+    return all_tokens
+
+
+def get_top_words(tokens, n=10):
+    """Return list of (word, count) tuples for top n words."""
+    if not tokens:
+        return []
+    return Counter(tokens).most_common(n)
+
+
+def render_wordcloud_section(feedback_texts, section_title="Feedback Word Cloud"):
+    """
+    Render a complete word-cloud section:
+      - Preprocessing info
+      - Top 10 words bar chart
+      - Word cloud image
+    Designed to be called from any view (Today / Monthly / Daily).
+    """
+    if not feedback_texts:
+        st.info("No feedback text available for word cloud analysis.")
+        return
+
+    tokens = preprocess_feedback_texts(feedback_texts)
+
+    if not tokens:
+        st.info("No meaningful words found after preprocessing the feedback.")
+        return
+
+    top10 = get_top_words(tokens, 10)
+    freq = Counter(tokens)
+
+    st.subheader(section_title)
+    st.caption(
+        f"Preprocessing: lowercased → punctuation/numbers removed → English stopwords removed → "
+        f"domain words removed (interview, assessment, mock …) → lemmatized. "
+        f"**{len(feedback_texts)}** feedback entries → **{len(tokens)}** tokens → "
+        f"**{len(freq)}** unique words."
+    )
+
+    # ── Top 10 words bar chart ────────────────────────────────────
+    top_df = pd.DataFrame(top10, columns=["Word", "Count"])
+    fig_top = go.Figure(go.Bar(
+        x=top_df["Count"],
+        y=top_df["Word"],
+        orientation="h",
+        marker_color="#2980b9",
+        text=top_df["Count"],
+        textposition="outside",
+    ))
+    fig_top.update_layout(
+        title="Top 10 Words in Feedback",
+        height=400,
+        yaxis=dict(autorange="reversed"),
+        xaxis_title="Count",
+        yaxis_title="",
+    )
+
+    # ── Word cloud ────────────────────────────────────────────────
+    wc = WordCloud(
+        width=1000,
+        height=500,
+        background_color="white",
+        colormap="viridis",
+        max_words=120,
+        min_font_size=10,
+        prefer_horizontal=0.7,
+    ).generate_from_frequencies(freq)
+
+    fig_wc, ax = plt.subplots(figsize=(12, 6))
+    ax.imshow(wc, interpolation="bilinear")
+    ax.axis("off")
+    plt.tight_layout(pad=0)
+
+    # ── Layout: bar chart left, word cloud right ──────────────────
+    col_bar, col_wc = st.columns([1, 2])
+    with col_bar:
+        st.plotly_chart(fig_top, use_container_width=True)
+    with col_wc:
+        st.pyplot(fig_wc)
+    plt.close(fig_wc)
+
+
+def extract_feedback_texts(df, col="feedback"):
+    """
+    Pull non-empty feedback strings from a dataframe.
+    Tries common column names if the given one doesn't exist.
+    """
+    candidates = [col, "feedback", "Feedback", "feedback_text",
+                  "case_feedback", "expert_feedback", "comments", "remark", "remarks"]
+    for c in candidates:
+        if c in df.columns:
+            series = df[c].dropna().astype(str).str.strip()
+            series = series[series != ""]
+            series = series[series.str.lower() != "nan"]
+            series = series[series.str.lower() != "none"]
+            return series.tolist()
+    return []
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ORIGINAL HELPERS (unchanged)
+# ═══════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=600)
 def fetch_all_data():
@@ -317,7 +526,7 @@ def round_charts(df, title_suffix=""):
         fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
                               textinfo="label+value+percent"))
         fig.update_layout(title="Round Distribution" + title_suffix, height=420)
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
     with c2:
         rt = df.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
         fig2 = go.Figure()
@@ -326,8 +535,12 @@ def round_charts(df, title_suffix=""):
                 fig2.add_trace(go.Bar(x=rt.index, y=rt[s], name=TASK_LABEL[s],
                                       marker_color=CLR[s], text=rt[s], textposition="inside"))
         fig2.update_layout(barmode="stack", title="Round x Task" + title_suffix, height=420)
-        st.plotly_chart(fig2, width="stretch")
+        st.plotly_chart(fig2, use_container_width=True)
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN APP
+# ═══════════════════════════════════════════════════════════════════
 
 def main():
     # --- TITLE ROW WITH DOWNLOAD BUTTON ---
@@ -427,21 +640,21 @@ def main():
         if not today_df.empty:
             c1, c2 = st.columns(2)
             with c1:
-                st.plotly_chart(donut(kd, "Task Split - " + str(today)), width="stretch")
+                st.plotly_chart(donut(kd, "Task Split - " + str(today)), use_container_width=True)
             with c2:
                 fig = h_bar_by_task(today_df, "company_name", 10, "Companies - " + str(today))
                 if fig:
-                    st.plotly_chart(fig, width="stretch")
+                    st.plotly_chart(fig, use_container_width=True)
 
             c3, c4 = st.columns(2)
             with c3:
                 fig = h_bar_by_task(today_df, "candidate_name", 10, "Candidates - " + str(today))
                 if fig:
-                    st.plotly_chart(fig, width="stretch")
+                    st.plotly_chart(fig, use_container_width=True)
             with c4:
                 fig = h_bar_by_task(today_df, "expert_name", 10, "Experts - " + str(today))
                 if fig:
-                    st.plotly_chart(fig, width="stretch")
+                    st.plotly_chart(fig, use_container_width=True)
 
             # -- ROUND WISE TODAY (Interview Support Only) --
             if selected_support == "Interview Support":
@@ -449,8 +662,16 @@ def main():
                 st.subheader("Round Breakdown - " + str(today))
                 round_charts(today_df, " - " + str(today))
 
+            # ── FEEDBACK WORD CLOUD — TODAY ───────────────────────
+            st.markdown("---")
+            feedback_texts = extract_feedback_texts(today_df)
+            render_wordcloud_section(
+                feedback_texts,
+                section_title="Feedback Word Cloud - " + str(today),
+            )
+
             with st.expander("Raw Data"):
-                st.dataframe(today_df, width="stretch", height=400)
+                st.dataframe(today_df, use_container_width=True, height=400)
 
     # ======= MONTHLY =======
     elif view == "Monthly Overview":
@@ -478,24 +699,53 @@ def main():
         c[4].metric("Pending", int(latest["pending"]))
         c[5].metric("Candidates", int(latest["candidates"]))
 
-        st.plotly_chart(stacked_bar(monthly, title="Monthly " + support_label + " Counts"), width="stretch")
+        st.plotly_chart(stacked_bar(monthly, title="Monthly " + support_label + " Counts"), use_container_width=True)
 
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(trend_line(monthly, "candidates", "Unique Candidates per Month"), width="stretch")
+            st.plotly_chart(trend_line(monthly, "candidates", "Unique Candidates per Month"), use_container_width=True)
         with c2:
-            st.plotly_chart(pct_line(monthly, "completed", "Completion Rate %", "#2ecc71"), width="stretch")
+            st.plotly_chart(pct_line(monthly, "completed", "Completion Rate %", "#2ecc71"), use_container_width=True)
 
         c3, c4 = st.columns(2)
         with c3:
-            st.plotly_chart(pct_line(monthly, "cancelled", "Cancellation Rate %", "#e74c3c"), width="stretch")
+            st.plotly_chart(pct_line(monthly, "cancelled", "Cancellation Rate %", "#e74c3c"), use_container_width=True)
         with c4:
-            st.plotly_chart(donut(latest.to_dict(), "Task Split - " + str(latest["month"])), width="stretch")
+            st.plotly_chart(donut(latest.to_dict(), "Task Split - " + str(latest["month"])), use_container_width=True)
 
-        st.plotly_chart(trend_line(monthly, "total", "Total " + support_label + " per Month", "#8e44ad"), width="stretch")
+        st.plotly_chart(trend_line(monthly, "total", "Total " + support_label + " per Month", "#8e44ad"), use_container_width=True)
 
         with st.expander("Monthly Data Table"):
-            st.dataframe(monthly, width="stretch")
+            st.dataframe(monthly, use_container_width=True)
+
+        # ── FEEDBACK WORD CLOUD — MONTHLY (with month selector) ───
+        st.markdown("---")
+        st.subheader("Feedback Analysis")
+
+        # Build month list from live data (feedback only exists in live API data)
+        if "date" in support_df.columns:
+            fb_df = support_df.copy()
+            fb_df["month"] = fb_df["date"].dt.to_period("M").astype(str)
+            fb_months = sorted(fb_df["month"].unique())
+
+            fb_month_options = ["All Months"] + fb_months
+            sel_fb_month = st.selectbox(
+                "Select Month for Feedback Analysis",
+                fb_month_options,
+                index=len(fb_month_options) - 1,
+                key="fb_month_sel",
+            )
+
+            if sel_fb_month == "All Months":
+                fb_subset = fb_df
+            else:
+                fb_subset = fb_df[fb_df["month"] == sel_fb_month]
+
+            feedback_texts = extract_feedback_texts(fb_subset)
+            render_wordcloud_section(
+                feedback_texts,
+                section_title="Feedback Word Cloud - " + support_label + " - " + sel_fb_month,
+            )
 
         # -- ROUND WISE MONTHLY (Interview Support Only) --
         if selected_support == "Interview Support" and "round_name" in support_df.columns:
@@ -534,11 +784,11 @@ def main():
                                              name=TASK_LABEL[s], marker_color=CLR[s],
                                              text=month_exp[s], textposition="inside"))
                 fig.update_layout(barmode="stack", title="Expert Counts - " + selected_month, height=500)
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, use_container_width=True)
 
                 st.dataframe(month_exp[["expert_name", "completed", "rescheduled", "cancelled",
                                         "pending", "total", "candidates"]],
-                             width="stretch")
+                             use_container_width=True)
 
             st.subheader("Expert Trend Across Months")
             experts_list = sorted(exp_monthly["expert_name"].unique())
@@ -553,7 +803,7 @@ def main():
                                                  mode="lines+markers", name=TASK_LABEL[s],
                                                  line=dict(color=CLR[s])))
                 fig.update_layout(title=selected_expert + " - Monthly Trend", height=400)
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, use_container_width=True)
 
         # -- CANDIDATE WISE MONTHLY --
         st.markdown("---")
@@ -579,9 +829,9 @@ def main():
                 fig.update_layout(barmode="stack",
                                   title="Candidate Counts - " + sel_cand_month,
                                   height=500, xaxis_tickangle=-45)
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, use_container_width=True)
 
-                st.dataframe(cand_month_data, width="stretch")
+                st.dataframe(cand_month_data, use_container_width=True)
 
     # ======= DAILY =======
     elif view == "Daily Drill-Down":
@@ -612,14 +862,14 @@ def main():
                 fig.add_trace(go.Scatter(x=dd_plot["day"], y=dd_plot[s], mode="lines+markers",
                                          name=TASK_LABEL[s], line=dict(color=CLR[s])))
             fig.update_layout(title="Daily Trend (" + str(start) + " to " + str(end) + ")", height=450)
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
 
-            st.plotly_chart(stacked_bar(dd_plot, x="day", title="Daily Stacked View"), width="stretch")
+            st.plotly_chart(stacked_bar(dd_plot, x="day", title="Daily Stacked View"), use_container_width=True)
 
             with st.expander("Daily Table"):
                 disp = dd.copy()
                 disp["day"] = pd.to_datetime(disp["day"]).dt.strftime("%Y-%m-%d")
-                st.dataframe(disp, width="stretch")
+                st.dataframe(disp, use_container_width=True)
 
             # -- ROUND WISE FOR DATE RANGE (Interview Support Only) --
             if selected_support == "Interview Support" and "round_name" in period.columns and not period.empty:
@@ -640,21 +890,21 @@ def main():
 
             c1, c2 = st.columns(2)
             with c1:
-                st.plotly_chart(donut(kd2, "Split - " + str(single)), width="stretch")
+                st.plotly_chart(donut(kd2, "Split - " + str(single)), use_container_width=True)
             with c2:
                 fig = h_bar_by_task(sdf, "company_name", 10, "Companies - " + str(single))
                 if fig:
-                    st.plotly_chart(fig, width="stretch")
+                    st.plotly_chart(fig, use_container_width=True)
 
             c3, c4 = st.columns(2)
             with c3:
                 fig = h_bar_by_task(sdf, "candidate_name", 10, "Candidates - " + str(single))
                 if fig:
-                    st.plotly_chart(fig, width="stretch")
+                    st.plotly_chart(fig, use_container_width=True)
             with c4:
                 fig = h_bar_by_task(sdf, "expert_name", 10, "Experts - " + str(single))
                 if fig:
-                    st.plotly_chart(fig, width="stretch")
+                    st.plotly_chart(fig, use_container_width=True)
 
             # -- ROUND WISE FOR SINGLE DAY (Interview Support Only) --
             if selected_support == "Interview Support" and "round_name" in sdf.columns:
@@ -662,7 +912,7 @@ def main():
                 st.subheader("Round Breakdown - " + str(single))
                 round_charts(sdf, " - " + str(single))
 
-            st.dataframe(sdf, width="stretch")
+            st.dataframe(sdf, use_container_width=True)
         elif single:
             st.info("No " + support_label + " on " + str(single))
 
@@ -677,7 +927,7 @@ def main():
         with tabs[0]:
             fig = expert_stack(support_df)
             if fig:
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, use_container_width=True)
             if "expert_name" in support_df.columns:
                 ea = support_df.groupby("expert_name").agg(
                     Total=("task_status", "size"),
@@ -689,12 +939,12 @@ def main():
                     Companies=("company_name", "nunique"),
                 ).reset_index()
                 ea["Completion_Pct"] = (ea["Completed"] / ea["Total"] * 100).round(1)
-                st.dataframe(ea.sort_values("Total", ascending=False), width="stretch")
+                st.dataframe(ea.sort_values("Total", ascending=False), use_container_width=True)
 
         with tabs[1]:
             fig = h_bar_by_task(support_df, "company_name", 20, "Top 20 Companies by Volume")
             if fig:
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, use_container_width=True)
             if "company_name" in support_df.columns:
                 top = support_df["company_name"].value_counts().head(15).index
                 ct = support_df[support_df["company_name"].isin(top)]
@@ -702,7 +952,7 @@ def main():
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
                                 color_continuous_scale="Blues", title="Company x Task Heatmap")
                 fig2.update_layout(height=500)
-                st.plotly_chart(fig2, width="stretch")
+                st.plotly_chart(fig2, use_container_width=True)
 
         with tabs[2]:
             if "round_name" in support_df.columns:
@@ -710,18 +960,18 @@ def main():
                 fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
                                       textinfo="label+value+percent"))
                 fig.update_layout(title="Round Distribution", height=420)
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, use_container_width=True)
 
                 rt = support_df.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(rt, text_auto=True, aspect="auto",
                                 color_continuous_scale="Oranges", title="Round x Task Heatmap")
                 fig2.update_layout(height=400)
-                st.plotly_chart(fig2, width="stretch")
+                st.plotly_chart(fig2, use_container_width=True)
 
         with tabs[3]:
             fig = day_of_week_chart(support_df)
             if fig:
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, use_container_width=True)
             if "date" in support_df.columns:
                 order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
                 tmp = support_df.copy()
@@ -730,7 +980,7 @@ def main():
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
                                 color_continuous_scale="Purples", title="Day x Task Heatmap")
                 fig2.update_layout(height=400)
-                st.plotly_chart(fig2, width="stretch")
+                st.plotly_chart(fig2, use_container_width=True)
 
         with tabs[4]:
             if "support_name" in all_case_df.columns:
@@ -738,13 +988,13 @@ def main():
                 fig = go.Figure(go.Bar(x=sc.index, y=sc.values, marker_color="#1abc9c",
                                        text=sc.values, textposition="outside"))
                 fig.update_layout(title="All Support Types (Current Year)", height=400)
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, use_container_width=True)
 
                 st_task = all_case_df.groupby(["support_name", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(st_task, text_auto=True, aspect="auto",
                                 color_continuous_scale="Teal", title="Support Type x Task")
                 fig2.update_layout(height=350)
-                st.plotly_chart(fig2, width="stretch")
+                st.plotly_chart(fig2, use_container_width=True)
 
         with tabs[5]:
             if "candidate_name" in support_df.columns:
@@ -760,7 +1010,7 @@ def main():
                 ca_agg["Completion_Pct"] = (ca_agg["Completed"] / ca_agg["Total"] * 100).round(1)
                 ca_agg = ca_agg.sort_values("Total", ascending=False)
                 st.subheader("Candidate Performance Table")
-                st.dataframe(ca_agg, width="stretch")
+                st.dataframe(ca_agg, use_container_width=True)
 
                 top30 = ca_agg.head(20).sort_values("Total")
                 fig = go.Figure()
@@ -774,25 +1024,25 @@ def main():
                                      name="Pending", orientation="h", marker_color="#3498db"))
                 fig.update_layout(barmode="stack", title="Top 20 Candidates", height=600,
                                   yaxis=dict(autorange="reversed"))
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, use_container_width=True)
 
         with tabs[6]:
             if "candidate_technology" in support_df.columns:
                 fig = h_bar_by_task(support_df, "candidate_technology", 20, "Top 20 Technologies")
                 if fig:
-                    st.plotly_chart(fig, width="stretch")
+                    st.plotly_chart(fig, use_container_width=True)
                 top_tech = support_df["candidate_technology"].value_counts().head(15).index
                 tt = support_df[support_df["candidate_technology"].isin(top_tech)]
                 pv = tt.groupby(["candidate_technology", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
                                 color_continuous_scale="Greens", title="Technology x Task Heatmap")
                 fig2.update_layout(height=500)
-                st.plotly_chart(fig2, width="stretch")
+                st.plotly_chart(fig2, use_container_width=True)
             else:
                 st.info("No technology column found.")
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v12.0 | API-powered | Active Experts Only")
+    st.sidebar.caption("Vizva Dashboard v13.0 | API-powered | Active Experts Only")
 
 
 # ================================================================
