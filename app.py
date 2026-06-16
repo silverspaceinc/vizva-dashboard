@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from wordcloud import WordCloud
 import nltk
 from collections import Counter
+import numpy as np
 
 # ── NLTK bootstrap (download once, cached) ──────────────────────
 @st.cache_resource
@@ -22,7 +23,6 @@ def _download_nltk():
     nltk.download("punkt_tab", quiet=True)
     nltk.download("averaged_perceptron_tagger", quiet=True)
     nltk.download("averaged_perceptron_tagger_eng", quiet=True)
-    nltk.download("vader_lexicon", quiet=True)
 
 _download_nltk()
 
@@ -30,7 +30,6 @@ from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from nltk.tokenize import word_tokenize
 from nltk import pos_tag
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
 st.set_page_config(page_title="Vizva Interview Dashboard", page_icon="chart_with_upwards_trend",
@@ -99,20 +98,123 @@ def sentiment_label(score):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  VADER SENTIMENT UTILITIES
+#  RoBERTa SENTIMENT UTILITIES  (replaces VADER)
+#  Model: cardiffnlp/twitter-roberta-base-sentiment-latest
+#  Labels: 0 -> Negative, 1 -> Neutral, 2 -> Positive
+#  Uses transformers + PyTorch (CPU) — cached so loaded only once
 # ═══════════════════════════════════════════════════════════════════
 
 @st.cache_resource
-def _get_vader():
-    return SentimentIntensityAnalyzer()
+def _load_roberta():
+    """Load RoBERTa sentiment model and tokenizer once, cache across reruns."""
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
+    model_name = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name)
+    model.eval()  # inference mode
+    return tokenizer, model, config
+
+
+def _preprocess_for_roberta(text):
+    """Replace usernames and URLs with placeholders (model convention)."""
+    tokens = []
+    for t in text.split(" "):
+        t = "@user" if t.startswith("@") and len(t) > 1 else t
+        t = "http" if t.startswith("http") else t
+        tokens.append(t)
+    return " ".join(tokens)
 
 
 def compute_sentiment_score(text):
+    """
+    Score a single text using RoBERTa.
+    Returns a value in [-100, +100]:
+      +100 = maximally positive
+      -100 = maximally negative
+        0  = perfectly neutral
+    Formula: score = (P(positive) - P(negative)) * 100
+    """
     if not isinstance(text, str) or not text.strip():
         return None
-    sia = _get_vader()
-    compound = sia.polarity_scores(text)["compound"]
-    return round(compound * 100, 1)
+    try:
+        import torch
+        from scipy.special import softmax as sp_softmax
+
+        tokenizer, model, config = _load_roberta()
+        cleaned = _preprocess_for_roberta(text)
+        # Truncate to 512 tokens (RoBERTa max)
+        encoded = tokenizer(cleaned, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            output = model(**encoded)
+        logits = output.logits[0].numpy()
+        probs = sp_softmax(logits)
+        # Labels: 0=Negative, 1=Neutral, 2=Positive
+        p_neg = float(probs[0])
+        p_neu = float(probs[1])
+        p_pos = float(probs[2])
+        score = (p_pos - p_neg) * 100
+        return round(score, 1)
+    except Exception:
+        return None
+
+
+def _batch_sentiment_scores(texts, batch_size=32):
+    """
+    Score a list of texts in batches for speed.
+    Returns a list of scores (same length as texts, None for empty/error).
+    """
+    import torch
+    from scipy.special import softmax as sp_softmax
+
+    tokenizer, model, config = _load_roberta()
+    scores = [None] * len(texts)
+
+    # Build index of valid texts
+    valid_indices = []
+    valid_texts = []
+    for i, t in enumerate(texts):
+        if isinstance(t, str) and t.strip():
+            valid_indices.append(i)
+            valid_texts.append(_preprocess_for_roberta(t))
+
+    if not valid_texts:
+        return scores
+
+    # Process in batches
+    for start in range(0, len(valid_texts), batch_size):
+        batch_texts = valid_texts[start:start + batch_size]
+        batch_indices = valid_indices[start:start + batch_size]
+        try:
+            encoded = tokenizer(
+                batch_texts,
+                return_tensors="pt",
+                truncation=True,
+                padding=True,
+                max_length=512,
+            )
+            with torch.no_grad():
+                output = model(**encoded)
+            logits = output.logits.numpy()
+            for j, idx in enumerate(batch_indices):
+                probs = sp_softmax(logits[j])
+                p_neg = float(probs[0])
+                p_pos = float(probs[2])
+                scores[idx] = round((p_pos - p_neg) * 100, 1)
+        except Exception:
+            # Fallback: score individually
+            for j, idx in enumerate(batch_indices):
+                try:
+                    enc = tokenizer(batch_texts[j], return_tensors="pt",
+                                    truncation=True, max_length=512)
+                    with torch.no_grad():
+                        out = model(**enc)
+                    probs = sp_softmax(out.logits[0].numpy())
+                    scores[idx] = round((float(probs[2]) - float(probs[0])) * 100, 1)
+                except Exception:
+                    scores[idx] = None
+
+    return scores
 
 
 def add_sentiment_column(df, feedback_col="feedback"):
@@ -128,7 +230,10 @@ def add_sentiment_column(df, feedback_col="feedback"):
         df["sentiment_label"] = None
         return df, None
 
-    df["sentiment_score"] = df[found_col].apply(compute_sentiment_score)
+    # Use batch scoring for efficiency
+    texts = df[found_col].tolist()
+    scores = _batch_sentiment_scores(texts, batch_size=32)
+    df["sentiment_score"] = scores
     df["sentiment_label"] = df["sentiment_score"].apply(
         lambda x: sentiment_label(x) if pd.notna(x) else None
     )
@@ -751,7 +856,8 @@ def main():
     active_expert_df = filter_active_experts(raw)
 
     # ── Add sentiment scores to the active expert data ONCE ──────
-    active_expert_df, _fb_col = add_sentiment_column(active_expert_df)
+    with st.spinner("Running RoBERTa sentiment analysis on feedback..."):
+        active_expert_df, _fb_col = add_sentiment_column(active_expert_df)
 
     with dl_col:
         st.write("")
@@ -1393,7 +1499,7 @@ def main():
                 st.info("No technology column found.")
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v15.1 | API-powered | Active Experts Only | VADER Sentiment")
+    st.sidebar.caption("Vizva Dashboard v16.0 | API-powered | Active Experts Only | RoBERTa Sentiment")
 
 
 # ================================================================
