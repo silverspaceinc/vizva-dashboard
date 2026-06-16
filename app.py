@@ -83,7 +83,6 @@ SENT_CLR = {"Positive": "#2ecc71", "Neutral": "#f39c12", "Negative": "#e74c3c"}
 
 
 def sentiment_color(score):
-    """Return hex color for a -100..100 sentiment score."""
     if score >= 20:
         return "#2ecc71"
     elif score <= -20:
@@ -92,7 +91,6 @@ def sentiment_color(score):
 
 
 def sentiment_label(score):
-    """Return human label for a -100..100 sentiment score."""
     if score >= 20:
         return "Positive"
     elif score <= -20:
@@ -110,10 +108,6 @@ def _get_vader():
 
 
 def compute_sentiment_score(text):
-    """
-    Compute VADER compound score for a single text string.
-    Returns score scaled to -100 … +100 (percentage scale).
-    """
     if not isinstance(text, str) or not text.strip():
         return None
     sia = _get_vader()
@@ -122,11 +116,6 @@ def compute_sentiment_score(text):
 
 
 def add_sentiment_column(df, feedback_col="feedback"):
-    """
-    Add 'sentiment_score' (-100..100) and 'sentiment_label' columns
-    to the dataframe based on the feedback column.
-    Returns the dataframe (modified in place) and the feedback column name found.
-    """
     candidates = [feedback_col, "feedback", "Feedback", "feedback_text",
                   "case_feedback", "expert_feedback", "comments", "remark", "remarks"]
     found_col = None
@@ -147,10 +136,6 @@ def add_sentiment_column(df, feedback_col="feedback"):
 
 
 def get_sentiment_stats(df):
-    """
-    Return dict with avg, min, max, count, and label distribution
-    from a dataframe that already has 'sentiment_score' column.
-    """
     valid = df["sentiment_score"].dropna()
     if valid.empty:
         return None
@@ -167,7 +152,6 @@ def get_sentiment_stats(df):
 
 
 def render_sentiment_kpi(stats, title="Feedback Sentiment"):
-    """Render a row of sentiment KPI metrics."""
     if stats is None:
         st.info("No feedback available for sentiment analysis.")
         return
@@ -189,7 +173,6 @@ def render_sentiment_kpi(stats, title="Feedback Sentiment"):
 
 
 def render_sentiment_donut(stats, title="Sentiment Split"):
-    """Render a donut chart of Positive / Neutral / Negative counts."""
     if stats is None:
         return None
     labels = ["Positive", "Neutral", "Negative"]
@@ -205,7 +188,6 @@ def render_sentiment_donut(stats, title="Sentiment Split"):
 
 
 def render_sentiment_histogram(df, title="Sentiment Score Distribution"):
-    """Render a histogram of individual feedback sentiment scores."""
     valid = df["sentiment_score"].dropna()
     if valid.empty:
         return None
@@ -227,10 +209,6 @@ def render_sentiment_histogram(df, title="Sentiment Score Distribution"):
 
 
 def render_sentiment_section(df, section_title="Feedback Sentiment Analysis"):
-    """
-    Complete sentiment section: KPI row + donut + histogram.
-    Expects df to already have 'sentiment_score' and 'sentiment_label' columns.
-    """
     stats = get_sentiment_stats(df)
     if stats is None:
         st.info("No feedback available for sentiment analysis in this selection.")
@@ -250,10 +228,6 @@ def render_sentiment_section(df, section_title="Feedback Sentiment Analysis"):
 
 
 def monthly_sentiment_trend(df):
-    """
-    Build a monthly average sentiment dataframe from data
-    that already has 'sentiment_score' and 'date' columns.
-    """
     if df.empty or "date" not in df.columns or "sentiment_score" not in df.columns:
         return pd.DataFrame()
     d = df.dropna(subset=["sentiment_score"]).copy()
@@ -270,7 +244,6 @@ def monthly_sentiment_trend(df):
     agg["min_sentiment"] = agg["min_sentiment"].round(1)
     agg["max_sentiment"] = agg["max_sentiment"].round(1)
 
-    # Positive / Neutral / Negative counts per month
     pos = d[d["sentiment_score"] >= 20].groupby(d["date"].dt.to_period("M").astype(str)).size().rename("positive")
     neu = d[(d["sentiment_score"] > -20) & (d["sentiment_score"] < 20)].groupby(d["date"].dt.to_period("M").astype(str)).size().rename("neutral")
     neg = d[d["sentiment_score"] <= -20].groupby(d["date"].dt.to_period("M").astype(str)).size().rename("negative")
@@ -286,7 +259,6 @@ def monthly_sentiment_trend(df):
 
 
 def render_sentiment_trend_chart(sent_monthly, title="Monthly Avg Sentiment Trend"):
-    """Line chart of monthly average sentiment with colored markers."""
     if sent_monthly.empty:
         return None
     colors = [sentiment_color(v) for v in sent_monthly["avg_sentiment"]]
@@ -317,7 +289,6 @@ def render_sentiment_trend_chart(sent_monthly, title="Monthly Avg Sentiment Tren
 
 
 def render_sentiment_stacked_bar(sent_monthly, title="Monthly Sentiment Breakdown"):
-    """Stacked bar of positive/neutral/negative counts per month."""
     if sent_monthly.empty:
         return None
     fig = go.Figure()
@@ -336,7 +307,6 @@ def render_sentiment_stacked_bar(sent_monthly, title="Monthly Sentiment Breakdow
 
 
 def daily_sentiment_agg(df):
-    """Build daily average sentiment dataframe."""
     if df.empty or "date" not in df.columns or "sentiment_score" not in df.columns:
         return pd.DataFrame()
     d = df.dropna(subset=["sentiment_score"]).copy()
@@ -911,6 +881,73 @@ def main():
             with st.expander("Raw Data (includes Sentiment Score)"):
                 st.dataframe(today_df, use_container_width=True, height=400)
 
+        # ── ABOUT TO MOVE TO MARKET (Resume Understanding with pending status) ──
+        st.markdown("---")
+        st.subheader("About to Move to Market")
+        st.caption("Resume Understanding candidates with pending status — ready to enter the market")
+
+        resume_df = get_by_support(active_expert_df, "Resume Understanding")
+        if not resume_df.empty and "task_status" in resume_df.columns:
+            market_df = resume_df[resume_df["task_status"] == "pending"].copy()
+
+            if not market_df.empty:
+                mc = st.columns(4)
+                mc[0].metric("Total Pending", len(market_df))
+                mc[1].metric("Candidates", market_df["candidate_name"].nunique() if "candidate_name" in market_df.columns else 0)
+                mc[2].metric("Companies", market_df["company_name"].nunique() if "company_name" in market_df.columns else 0)
+                mc[3].metric("Experts", market_df["expert_name"].nunique() if "expert_name" in market_df.columns else 0)
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    if "candidate_name" in market_df.columns:
+                        cand_counts = market_df["candidate_name"].value_counts().head(15)
+                        fig = go.Figure(go.Bar(
+                            y=cand_counts.index, x=cand_counts.values,
+                            orientation="h", marker_color="#1abc9c",
+                            text=cand_counts.values, textposition="outside"
+                        ))
+                        fig.update_layout(title="Candidates - About to Move to Market",
+                                          height=max(400, len(cand_counts) * 35),
+                                          yaxis=dict(autorange="reversed"))
+                        st.plotly_chart(fig, use_container_width=True)
+
+                with c2:
+                    if "company_name" in market_df.columns:
+                        comp_counts = market_df["company_name"].value_counts().head(15)
+                        fig = go.Figure(go.Bar(
+                            y=comp_counts.index, x=comp_counts.values,
+                            orientation="h", marker_color="#e67e22",
+                            text=comp_counts.values, textposition="outside"
+                        ))
+                        fig.update_layout(title="Companies - About to Move to Market",
+                                          height=max(400, len(comp_counts) * 35),
+                                          yaxis=dict(autorange="reversed"))
+                        st.plotly_chart(fig, use_container_width=True)
+
+                if "candidate_technology" in market_df.columns:
+                    tech_counts = market_df["candidate_technology"].value_counts().head(15)
+                    if not tech_counts.empty:
+                        fig = go.Figure(go.Bar(
+                            y=tech_counts.index, x=tech_counts.values,
+                            orientation="h", marker_color="#9b59b6",
+                            text=tech_counts.values, textposition="outside"
+                        ))
+                        fig.update_layout(title="Technologies - About to Move to Market",
+                                          height=max(400, len(tech_counts) * 35),
+                                          yaxis=dict(autorange="reversed"))
+                        st.plotly_chart(fig, use_container_width=True)
+
+                with st.expander("Full List - About to Move to Market"):
+                    display_cols = [c for c in ["candidate_name", "company_name", "expert_name",
+                                                "candidate_technology", "date", "task_status"]
+                                    if c in market_df.columns]
+                    st.dataframe(market_df[display_cols] if display_cols else market_df,
+                                 use_container_width=True, height=400)
+            else:
+                st.info("No Resume Understanding candidates with pending status found.")
+        else:
+            st.info("No Resume Understanding data available.")
+
     # ======= MONTHLY =======
     elif view == "Monthly Overview":
         if monthly.empty:
@@ -1374,7 +1411,7 @@ def main():
                 st.info("No technology column found.")
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v14.0 | API-powered | Active Experts Only | VADER Sentiment")
+    st.sidebar.caption("Vizva Dashboard v15.0 | API-powered | Active Experts Only | VADER Sentiment")
 
 
 # ================================================================
