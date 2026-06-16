@@ -891,38 +891,22 @@ def main():
             market_df = resume_df[resume_df["task_status"] == "pending"].copy()
 
             if not market_df.empty:
-                mc = st.columns(4)
+                mc = st.columns(3)
                 mc[0].metric("Total Pending", len(market_df))
                 mc[1].metric("Candidates", market_df["candidate_name"].nunique() if "candidate_name" in market_df.columns else 0)
-                mc[2].metric("Companies", market_df["company_name"].nunique() if "company_name" in market_df.columns else 0)
-                mc[3].metric("Experts", market_df["expert_name"].nunique() if "expert_name" in market_df.columns else 0)
+                mc[2].metric("Experts", market_df["expert_name"].nunique() if "expert_name" in market_df.columns else 0)
 
-                c1, c2 = st.columns(2)
-                with c1:
-                    if "candidate_name" in market_df.columns:
-                        cand_counts = market_df["candidate_name"].value_counts().head(15)
-                        fig = go.Figure(go.Bar(
-                            y=cand_counts.index, x=cand_counts.values,
-                            orientation="h", marker_color="#1abc9c",
-                            text=cand_counts.values, textposition="outside"
-                        ))
-                        fig.update_layout(title="Candidates - About to Move to Market",
-                                          height=max(400, len(cand_counts) * 35),
-                                          yaxis=dict(autorange="reversed"))
-                        st.plotly_chart(fig, use_container_width=True)
-
-                with c2:
-                    if "company_name" in market_df.columns:
-                        comp_counts = market_df["company_name"].value_counts().head(15)
-                        fig = go.Figure(go.Bar(
-                            y=comp_counts.index, x=comp_counts.values,
-                            orientation="h", marker_color="#e67e22",
-                            text=comp_counts.values, textposition="outside"
-                        ))
-                        fig.update_layout(title="Companies - About to Move to Market",
-                                          height=max(400, len(comp_counts) * 35),
-                                          yaxis=dict(autorange="reversed"))
-                        st.plotly_chart(fig, use_container_width=True)
+                if "candidate_name" in market_df.columns:
+                    cand_counts = market_df["candidate_name"].value_counts().head(15)
+                    fig = go.Figure(go.Bar(
+                        y=cand_counts.index, x=cand_counts.values,
+                        orientation="h", marker_color="#1abc9c",
+                        text=cand_counts.values, textposition="outside"
+                    ))
+                    fig.update_layout(title="Candidates - About to Move to Market",
+                                      height=max(400, len(cand_counts) * 35),
+                                      yaxis=dict(autorange="reversed"))
+                    st.plotly_chart(fig, use_container_width=True)
 
                 if "candidate_technology" in market_df.columns:
                     tech_counts = market_df["candidate_technology"].value_counts().head(15)
@@ -938,7 +922,7 @@ def main():
                         st.plotly_chart(fig, use_container_width=True)
 
                 with st.expander("Full List - About to Move to Market"):
-                    display_cols = [c for c in ["candidate_name", "company_name", "expert_name",
+                    display_cols = [c for c in ["candidate_name", "expert_name",
                                                 "candidate_technology", "date", "task_status"]
                                     if c in market_df.columns]
                     st.dataframe(market_df[display_cols] if display_cols else market_df,
@@ -1050,13 +1034,11 @@ def main():
             else:
                 fb_subset = fb_df[fb_df["month"] == sel_fb_month]
 
-            # Sentiment section for the selected month
             render_sentiment_section(fb_subset,
                                      section_title="Sentiment - " + support_label + " - " + sel_fb_month)
 
             st.markdown("")
 
-            # Word cloud for the selected month
             feedback_texts = extract_feedback_texts(fb_subset)
             render_wordcloud_section(
                 feedback_texts,
@@ -1411,7 +1393,7 @@ def main():
                 st.info("No technology column found.")
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v15.0 | API-powered | Active Experts Only | VADER Sentiment")
+    st.sidebar.caption("Vizva Dashboard v15.1 | API-powered | Active Experts Only | VADER Sentiment")
 
 
 # ================================================================
