@@ -1,5 +1,3 @@
-
-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -13,6 +11,7 @@ import matplotlib.pyplot as plt
 from wordcloud import WordCloud
 import nltk
 from collections import Counter
+import numpy as np
 
 # ── NLTK bootstrap (download once, cached) ──────────────────────
 @st.cache_resource
@@ -101,7 +100,7 @@ def sentiment_label(score):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  VADER SENTIMENT UTILITIES
+#  VADER SENTIMENT UTILITIES (used by Dashboard views)
 # ═══════════════════════════════════════════════════════════════════
 
 @st.cache_resource
@@ -321,6 +320,108 @@ def daily_sentiment_agg(df):
     ).reset_index()
     agg["avg_sentiment"] = agg["avg_sentiment"].round(1)
     return agg
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  RoBERTa ONNX SENTIMENT (used ONLY by Transcript Analyzer view)
+#  Model: cardiffnlp/twitter-roberta-base-sentiment-latest
+#  ONNX weights: Xenova/twitter-roberta-base-sentiment-latest
+#  Labels: 0 -> Negative, 1 -> Neutral, 2 -> Positive
+#  NO PyTorch — uses onnxruntime + quantized ONNX (~126MB)
+# ═══════════════════════════════════════════════════════════════════
+
+@st.cache_resource
+def _load_roberta_onnx():
+    """Load tokenizer + ONNX session once, cache across reruns."""
+    from transformers import AutoTokenizer
+    from huggingface_hub import hf_hub_download
+    import onnxruntime as ort
+
+    model_id = "Xenova/twitter-roberta-base-sentiment-latest"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model_path = hf_hub_download(repo_id=model_id, filename="onnx/model_quantized.onnx")
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options.intra_op_num_threads = 2
+    session = ort.InferenceSession(model_path, sess_options, providers=["CPUExecutionProvider"])
+    return tokenizer, session
+
+
+def _roberta_softmax(x):
+    e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return e_x / e_x.sum(axis=-1, keepdims=True)
+
+
+def _roberta_preprocess(text):
+    tokens = []
+    for t in text.split(" "):
+        t = "@user" if t.startswith("@") and len(t) > 1 else t
+        t = "http" if t.startswith("http") else t
+        tokens.append(t)
+    return " ".join(tokens)
+
+
+def roberta_score_text(text):
+    """Score a single text with RoBERTa ONNX. Returns dict."""
+    tokenizer, session = _load_roberta_onnx()
+    cleaned = _roberta_preprocess(text)
+    encoded = tokenizer(cleaned, truncation=True, max_length=512, return_tensors="np")
+    feeds = {
+        "input_ids": encoded["input_ids"].astype(np.int64),
+        "attention_mask": encoded["attention_mask"].astype(np.int64),
+    }
+    logits = session.run(None, feeds)[0]
+    probs = _roberta_softmax(logits)[0]
+    score = round((float(probs[2]) - float(probs[0])) * 100, 1)
+    return {
+        "score": score,
+        "p_negative": round(float(probs[0]) * 100, 1),
+        "p_neutral": round(float(probs[1]) * 100, 1),
+        "p_positive": round(float(probs[2]) * 100, 1),
+    }
+
+
+def roberta_score_chunks(text, chunk_mode="paragraph"):
+    """Split text into chunks and score each with RoBERTa ONNX."""
+    if chunk_mode == "paragraph":
+        chunks = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    elif chunk_mode == "sentence":
+        chunks = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    else:
+        chunks = [text.strip()]
+    if not chunks:
+        return []
+
+    tokenizer, session = _load_roberta_onnx()
+    results = []
+    for chunk in chunks:
+        cleaned = _roberta_preprocess(chunk)
+        try:
+            encoded = tokenizer(cleaned, truncation=True, max_length=512, return_tensors="np")
+            feeds = {
+                "input_ids": encoded["input_ids"].astype(np.int64),
+                "attention_mask": encoded["attention_mask"].astype(np.int64),
+            }
+            logits = session.run(None, feeds)[0]
+            probs = _roberta_softmax(logits)[0]
+            score = round((float(probs[2]) - float(probs[0])) * 100, 1)
+            results.append({
+                "text": chunk[:200] + ("..." if len(chunk) > 200 else ""),
+                "full_text": chunk,
+                "score": score,
+                "p_negative": round(float(probs[0]) * 100, 1),
+                "p_neutral": round(float(probs[1]) * 100, 1),
+                "p_positive": round(float(probs[2]) * 100, 1),
+                "label": "Positive" if score >= 20 else ("Negative" if score <= -20 else "Neutral"),
+            })
+        except Exception:
+            results.append({
+                "text": chunk[:200] + ("..." if len(chunk) > 200 else ""),
+                "full_text": chunk,
+                "score": None, "p_negative": None, "p_neutral": None,
+                "p_positive": None, "label": "Error",
+            })
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -728,6 +829,194 @@ def round_charts(df, title_suffix=""):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  TRANSCRIPT ANALYZER VIEW (RoBERTa ONNX)
+# ═══════════════════════════════════════════════════════════════════
+
+def transcript_analyzer_view():
+    st.header("Transcript Sentiment Analyzer")
+    st.caption("Powered by RoBERTa (cardiffnlp/twitter-roberta-base-sentiment-latest) via ONNX Runtime")
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Analysis Settings")
+    chunk_mode = st.sidebar.radio(
+        "Split transcript into:",
+        ["Full Text (single score)", "Paragraphs", "Sentences"],
+        index=1,
+        key="ta_chunk_mode",
+    )
+    chunk_map = {
+        "Full Text (single score)": "full",
+        "Paragraphs": "paragraph",
+        "Sentences": "sentence",
+    }
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(
+        "**Score Range**\n\n"
+        "- **Positive**: score >= +20%\n"
+        "- **Neutral**: -20% < score < +20%\n"
+        "- **Negative**: score <= -20%\n\n"
+        "Score = (P(pos) - P(neg)) x 100"
+    )
+
+    transcript = st.text_area(
+        "Paste your transcript below:",
+        height=300,
+        placeholder="Paste the full interview transcript, feedback, or any text here...\n\nSeparate paragraphs with blank lines for paragraph-level analysis.",
+        key="ta_transcript",
+    )
+
+    analyze_btn = st.button("Analyze Sentiment", type="primary", key="ta_analyze_btn")
+
+    if analyze_btn and transcript.strip():
+        with st.spinner("Loading RoBERTa ONNX model & analyzing..."):
+            mode = chunk_map[chunk_mode]
+
+            overall = roberta_score_text(transcript)
+            ov_score = overall["score"]
+            ov_color = sentiment_color(ov_score)
+            ov_label = sentiment_label(ov_score)
+
+            st.markdown("---")
+            st.subheader("Overall Sentiment: " + ov_label + " (" + f"{ov_score:+.1f}%" + ")")
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Overall Score", f"{ov_score:+.1f}%")
+            k2.metric("P(Positive)", f"{overall['p_positive']:.1f}%")
+            k3.metric("P(Neutral)", f"{overall['p_neutral']:.1f}%")
+            k4.metric("P(Negative)", f"{overall['p_negative']:.1f}%")
+
+            fig_donut = go.Figure(go.Pie(
+                labels=["Positive", "Neutral", "Negative"],
+                values=[overall["p_positive"], overall["p_neutral"], overall["p_negative"]],
+                hole=0.55,
+                marker=dict(colors=["#2ecc71", "#f39c12", "#e74c3c"]),
+                textinfo="label+percent",
+            ))
+            fig_donut.update_layout(
+                title="Probability Distribution",
+                height=350, showlegend=False,
+                annotations=[dict(text=f"{ov_score:+.1f}%", x=0.5, y=0.5,
+                                  font_size=24, font_color=ov_color, showarrow=False)],
+            )
+
+            if mode != "full":
+                chunks = roberta_score_chunks(transcript, chunk_mode=mode)
+
+                if chunks:
+                    valid_chunks = [c for c in chunks if c["score"] is not None]
+                    scores = [c["score"] for c in valid_chunks]
+
+                    st.markdown("---")
+                    unit_name = "Paragraph" if mode == "paragraph" else "Sentence"
+                    st.subheader(unit_name + "-Level Breakdown (" + str(len(chunks)) + " " + unit_name.lower() + "s)")
+
+                    if scores:
+                        pos_count = sum(1 for s in scores if s >= 20)
+                        neu_count = sum(1 for s in scores if -20 < s < 20)
+                        neg_count = sum(1 for s in scores if s <= -20)
+                        avg_score = round(np.mean(scores), 1)
+
+                        s1, s2, s3, s4, s5 = st.columns(5)
+                        s1.metric("Avg " + unit_name + " Score", f"{avg_score:+.1f}%")
+                        s2.metric("Total " + unit_name + "s", len(chunks))
+                        s3.metric("Positive", pos_count)
+                        s4.metric("Neutral", neu_count)
+                        s5.metric("Negative", neg_count)
+
+                    col_donut, col_bar = st.columns(2)
+                    with col_donut:
+                        st.plotly_chart(fig_donut, use_container_width=True)
+                    with col_bar:
+                        if scores:
+                            bar_colors = [sentiment_color(s) for s in scores]
+                            bar_labels = [unit_name[0] + str(i + 1) for i in range(len(scores))]
+                            fig_bar = go.Figure(go.Bar(
+                                x=bar_labels, y=scores,
+                                marker_color=bar_colors,
+                                text=[f"{s:+.1f}%" for s in scores],
+                                textposition="outside",
+                            ))
+                            fig_bar.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+                            fig_bar.add_hline(y=20, line_dash="dot", line_color="#2ecc71", opacity=0.3)
+                            fig_bar.add_hline(y=-20, line_dash="dot", line_color="#e74c3c", opacity=0.3)
+                            fig_bar.update_layout(
+                                title="Sentiment by " + unit_name,
+                                height=350,
+                                yaxis_title="Sentiment Score (%)",
+                                yaxis=dict(range=[
+                                    min(-60, min(scores) - 15),
+                                    max(60, max(scores) + 15),
+                                ]),
+                            )
+                            st.plotly_chart(fig_bar, use_container_width=True)
+
+                    if len(scores) > 1:
+                        st.markdown("---")
+                        st.subheader("Sentiment Flow Through Transcript")
+                        flow_colors = [sentiment_color(s) for s in scores]
+                        fig_flow = go.Figure()
+                        fig_flow.add_trace(go.Scatter(
+                            x=list(range(1, len(scores) + 1)),
+                            y=scores,
+                            mode="lines+markers+text",
+                            text=[f"{s:+.1f}%" for s in scores],
+                            textposition="top center",
+                            line=dict(color="#8e44ad", width=3),
+                            marker=dict(size=12, color=flow_colors,
+                                        line=dict(width=2, color="white")),
+                        ))
+                        fig_flow.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+                        fig_flow.add_hline(y=20, line_dash="dot", line_color="#2ecc71", opacity=0.3)
+                        fig_flow.add_hline(y=-20, line_dash="dot", line_color="#e74c3c", opacity=0.3)
+                        fig_flow.update_layout(
+                            height=400,
+                            xaxis_title=unit_name + " Number",
+                            yaxis_title="Sentiment Score (%)",
+                            yaxis=dict(range=[
+                                min(-60, min(scores) - 15),
+                                max(60, max(scores) + 15),
+                            ]),
+                        )
+                        st.plotly_chart(fig_flow, use_container_width=True)
+
+                    st.markdown("---")
+                    st.subheader("Detailed " + unit_name + " Scores")
+                    for i, chunk in enumerate(chunks):
+                        c_label = chunk["label"]
+                        score_str = f"{chunk['score']:+.1f}%" if chunk["score"] is not None else "N/A"
+
+                        with st.expander(
+                            unit_name + " " + str(i + 1) + ": " + c_label + " (" + score_str + ") — " + chunk["text"]
+                        ):
+                            if chunk["score"] is not None:
+                                mc = st.columns(4)
+                                mc[0].metric("Score", score_str)
+                                mc[1].metric("P(Positive)", f"{chunk['p_positive']:.1f}%")
+                                mc[2].metric("P(Neutral)", f"{chunk['p_neutral']:.1f}%")
+                                mc[3].metric("P(Negative)", f"{chunk['p_negative']:.1f}%")
+                            st.markdown("**Full text:**")
+                            st.text(chunk["full_text"])
+
+            else:
+                col_donut, col_info = st.columns(2)
+                with col_donut:
+                    st.plotly_chart(fig_donut, use_container_width=True)
+                with col_info:
+                    st.markdown(
+                        "### Interpretation\n\n"
+                        "The overall sentiment score is **" + f"{ov_score:+.1f}%" + "** (" + ov_label + ").\n\n"
+                        "- **P(Positive)**: " + f"{overall['p_positive']:.1f}%" + "\n"
+                        "- **P(Neutral)**: " + f"{overall['p_neutral']:.1f}%" + "\n"
+                        "- **P(Negative)**: " + f"{overall['p_negative']:.1f}%" + "\n\n"
+                        "Score = (P(positive) - P(negative)) x 100, range -100% to +100%."
+                    )
+
+    elif analyze_btn:
+        st.warning("Please paste some text before clicking Analyze.")
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  MAIN APP
 # ═══════════════════════════════════════════════════════════════════
 
@@ -816,8 +1105,16 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
-                                  "Daily Drill-Down", "Deep-Dive Analytics"],
+                                  "Daily Drill-Down", "Deep-Dive Analytics",
+                                  "Transcript Analyzer"],
                             label_visibility="collapsed")
+
+    # ======= TRANSCRIPT ANALYZER =======
+    if view == "Transcript Analyzer":
+        transcript_analyzer_view()
+        st.sidebar.markdown("---")
+        st.sidebar.caption("Vizva Dashboard v16.0 | API-powered | Active Experts Only | RoBERTa ONNX")
+        return
 
     # ======= TODAY =======
     if view == "Todays Snapshot":
@@ -1395,7 +1692,7 @@ def main():
                 st.info("No technology column found.")
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v15.1 | API-powered | Active Experts Only | VADER Sentiment")
+    st.sidebar.caption("Vizva Dashboard v16.0 | API-powered | Active Experts Only | RoBERTa ONNX")
 
 
 # ================================================================
