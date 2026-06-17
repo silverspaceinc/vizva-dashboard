@@ -328,19 +328,6 @@ def daily_sentiment_agg(df):
 #  Used ONLY when Interview Support is selected
 # ═══════════════════════════════════════════════════════════════════
 
-def parse_time_column(df, col):
-    """Parse a time column, treating 'noon' as 12:00 PM.
-    Returns a Series of datetime.time objects (NaT → None)."""
-    if col not in df.columns:
-        return pd.Series([None] * len(df), index=df.index)
-    s = df[col].astype(str).str.strip()
-    # Replace noon/Noon/NOON with 12:00 PM before parsing
-    noon_mask = s.str.lower() == "noon"
-    s = s.where(~noon_mask, "12:00 PM")
-    parsed = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
-    return parsed.dt.time
-
-
 def add_start_time_columns(df):
     """Add start_hour, start_hour_label, and interview_duration_min columns.
     Modifies df in-place and returns it."""
@@ -353,7 +340,18 @@ def add_start_time_columns(df):
     st_raw = df["start_time"].astype(str).str.strip()
     noon_s = st_raw.str.lower() == "noon"
     st_raw = st_raw.where(~noon_s, "12:00 PM")
-    start_parsed = pd.to_datetime(st_raw, errors="coerce", infer_datetime_format=True)
+    # Try multiple common time formats
+    start_parsed = pd.to_datetime(st_raw, errors="coerce", format="%I:%M %p")
+    # Fallback: try 24-hour format for unparsed values
+    mask_nat = start_parsed.isna() & st_raw.notna() & (st_raw != "") & (st_raw.str.lower() != "nan")
+    if mask_nat.any():
+        fallback1 = pd.to_datetime(st_raw[mask_nat], errors="coerce", format="%H:%M")
+        start_parsed.loc[mask_nat] = fallback1
+    # Fallback: try mixed format parsing for anything still missing
+    mask_nat2 = start_parsed.isna() & st_raw.notna() & (st_raw != "") & (st_raw.str.lower() != "nan")
+    if mask_nat2.any():
+        fallback2 = pd.to_datetime(st_raw[mask_nat2], errors="coerce", format="mixed")
+        start_parsed.loc[mask_nat2] = fallback2
 
     df["start_hour"] = start_parsed.dt.hour
     df["start_hour_label"] = start_parsed.dt.strftime("%I %p")  # e.g. "02 PM"
@@ -363,7 +361,17 @@ def add_start_time_columns(df):
         et_raw = df["end_time"].astype(str).str.strip()
         noon_e = et_raw.str.lower() == "noon"
         et_raw = et_raw.where(~noon_e, "12:00 PM")
-        end_parsed = pd.to_datetime(et_raw, errors="coerce", infer_datetime_format=True)
+        end_parsed = pd.to_datetime(et_raw, errors="coerce", format="%I:%M %p")
+        # Fallback: 24-hour format
+        emask1 = end_parsed.isna() & et_raw.notna() & (et_raw != "") & (et_raw.str.lower() != "nan")
+        if emask1.any():
+            efb1 = pd.to_datetime(et_raw[emask1], errors="coerce", format="%H:%M")
+            end_parsed.loc[emask1] = efb1
+        # Fallback: mixed
+        emask2 = end_parsed.isna() & et_raw.notna() & (et_raw != "") & (et_raw.str.lower() != "nan")
+        if emask2.any():
+            efb2 = pd.to_datetime(et_raw[emask2], errors="coerce", format="mixed")
+            end_parsed.loc[emask2] = efb2
 
         # Duration in minutes (only when both are valid)
         duration = (end_parsed - start_parsed).dt.total_seconds() / 60.0
@@ -374,6 +382,7 @@ def add_start_time_columns(df):
         df["interview_duration_min"] = np.nan
 
     return df
+
 
 
 def render_start_time_insights(df, title_suffix=""):
