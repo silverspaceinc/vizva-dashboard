@@ -323,6 +323,271 @@ def daily_sentiment_agg(df):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  START TIME / INTERVIEW DURATION UTILITIES
+#  Treats "noon" (case-insensitive) as 12:00 PM
+#  Used ONLY when Interview Support is selected
+# ═══════════════════════════════════════════════════════════════════
+
+def parse_time_column(df, col):
+    """Parse a time column, treating 'noon' as 12:00 PM.
+    Returns a Series of datetime.time objects (NaT → None)."""
+    if col not in df.columns:
+        return pd.Series([None] * len(df), index=df.index)
+    s = df[col].astype(str).str.strip()
+    # Replace noon/Noon/NOON with 12:00 PM before parsing
+    noon_mask = s.str.lower() == "noon"
+    s = s.where(~noon_mask, "12:00 PM")
+    parsed = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+    return parsed.dt.time
+
+
+def add_start_time_columns(df):
+    """Add start_hour, start_hour_label, and interview_duration_min columns.
+    Modifies df in-place and returns it."""
+    if "start_time" not in df.columns:
+        return df
+
+    df = df.copy()
+
+    # ── Parse start_time ─────────────────────────────────────────
+    st_raw = df["start_time"].astype(str).str.strip()
+    noon_s = st_raw.str.lower() == "noon"
+    st_raw = st_raw.where(~noon_s, "12:00 PM")
+    start_parsed = pd.to_datetime(st_raw, errors="coerce", infer_datetime_format=True)
+
+    df["start_hour"] = start_parsed.dt.hour
+    df["start_hour_label"] = start_parsed.dt.strftime("%I %p")  # e.g. "02 PM"
+
+    # ── Parse end_time and compute duration ──────────────────────
+    if "end_time" in df.columns:
+        et_raw = df["end_time"].astype(str).str.strip()
+        noon_e = et_raw.str.lower() == "noon"
+        et_raw = et_raw.where(~noon_e, "12:00 PM")
+        end_parsed = pd.to_datetime(et_raw, errors="coerce", infer_datetime_format=True)
+
+        # Duration in minutes (only when both are valid)
+        duration = (end_parsed - start_parsed).dt.total_seconds() / 60.0
+        # Discard negatives and unreasonably long durations (> 480 min = 8 hrs)
+        duration = duration.where((duration > 0) & (duration <= 480), other=np.nan)
+        df["interview_duration_min"] = duration.round(1)
+    else:
+        df["interview_duration_min"] = np.nan
+
+    return df
+
+
+def render_start_time_insights(df, title_suffix=""):
+    """Render the Start Time Insights section: hourly distribution,
+    peak-hour KPIs, mean interview time, and duration histogram."""
+    if "start_hour" not in df.columns:
+        st.info("No start_time data available for time-of-day analysis.")
+        return
+
+    valid = df.dropna(subset=["start_hour"]).copy()
+    if valid.empty:
+        st.info("No valid start_time entries found" + title_suffix + ".")
+        return
+
+    st.subheader("Start Time Insights" + title_suffix)
+
+    # ── KPI row ──────────────────────────────────────────────────
+    total_with_time = len(valid)
+    hour_counts = valid["start_hour"].value_counts().sort_index()
+    peak_hour = int(hour_counts.idxmax())
+    peak_count = int(hour_counts.max())
+    peak_label = datetime(2000, 1, 1, peak_hour).strftime("%I:%M %p")
+    mean_hour = valid["start_hour"].mean()
+    mean_label = datetime(2000, 1, 1, int(mean_hour), int((mean_hour % 1) * 60)).strftime("%I:%M %p")
+
+    has_duration = valid["interview_duration_min"].notna().any() if "interview_duration_min" in valid.columns else False
+    avg_dur = round(valid["interview_duration_min"].mean(), 1) if has_duration else None
+
+    k_cols = st.columns(5 if has_duration else 4)
+    k_cols[0].metric("Interviews with Time", total_with_time)
+    k_cols[1].metric("Peak Hour", peak_label)
+    k_cols[2].metric("Interviews at Peak", peak_count)
+    k_cols[3].metric("Mean Start Time", mean_label)
+    if has_duration:
+        k_cols[4].metric("Avg Duration", f"{avg_dur} min")
+
+    # ── Hourly distribution bar chart ────────────────────────────
+    all_hours = list(range(0, 24))
+    hour_labels = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0") for h in all_hours]
+    counts = [int(hour_counts.get(h, 0)) for h in all_hours]
+
+    bar_colors = ["#e74c3c" if h == peak_hour else "#3498db" for h in all_hours]
+
+    fig_hourly = go.Figure(go.Bar(
+        x=hour_labels, y=counts,
+        marker_color=bar_colors,
+        text=counts, textposition="outside",
+    ))
+    fig_hourly.update_layout(
+        title="Interview Count by Hour of Day" + title_suffix,
+        height=420,
+        xaxis_title="Hour of Day",
+        yaxis_title="Number of Interviews",
+        xaxis=dict(tickangle=-45),
+    )
+
+    # ── Duration histogram (if available) ────────────────────────
+    fig_dur = None
+    if has_duration:
+        dur_valid = valid["interview_duration_min"].dropna()
+        fig_dur = go.Figure(go.Histogram(
+            x=dur_valid, nbinsx=20,
+            marker_color="#9b59b6",
+            marker_line=dict(color="white", width=1),
+        ))
+        fig_dur.add_vline(x=dur_valid.mean(), line_dash="dot", line_color="#e74c3c",
+                          annotation_text=f"Avg: {dur_valid.mean():.0f} min")
+        fig_dur.update_layout(
+            title="Interview Duration Distribution" + title_suffix,
+            height=420,
+            xaxis_title="Duration (minutes)",
+            yaxis_title="Count",
+        )
+
+    if fig_dur:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(fig_hourly, use_container_width=True)
+        with c2:
+            st.plotly_chart(fig_dur, use_container_width=True)
+    else:
+        st.plotly_chart(fig_hourly, use_container_width=True)
+
+    # ── Time-slot breakdown table ────────────────────────────────
+    slots = {
+        "Early Morning (6-9 AM)": (6, 9),
+        "Morning (9 AM-12 PM)": (9, 12),
+        "Afternoon (12-3 PM)": (12, 15),
+        "Late Afternoon (3-6 PM)": (15, 18),
+        "Evening (6-9 PM)": (18, 21),
+        "Night (9 PM-6 AM)": None,
+    }
+    slot_rows = []
+    for slot_name, rng in slots.items():
+        if rng:
+            cnt = int(((valid["start_hour"] >= rng[0]) & (valid["start_hour"] < rng[1])).sum())
+        else:
+            cnt = int(((valid["start_hour"] >= 21) | (valid["start_hour"] < 6)).sum())
+        pct = round(cnt / total_with_time * 100, 1) if total_with_time > 0 else 0
+        slot_rows.append({"Time Slot": slot_name, "Count": cnt, "% of Total": pct})
+    slot_df = pd.DataFrame(slot_rows)
+
+    with st.expander("Time Slot Breakdown" + title_suffix):
+        st.dataframe(slot_df, use_container_width=True, hide_index=True)
+
+
+def render_monthly_start_time_trend(df, title_suffix=""):
+    """Render a monthly x hour-of-day heatmap showing interview counts,
+    plus a monthly line chart of mean start time."""
+    if "start_hour" not in df.columns or "date" not in df.columns:
+        return
+
+    valid = df.dropna(subset=["start_hour"]).copy()
+    if valid.empty:
+        return
+
+    valid["month"] = valid["date"].dt.to_period("M").astype(str)
+
+    st.subheader("Monthly Start Time Trends" + title_suffix)
+
+    # ── Heatmap: month x hour ────────────────────────────────────
+    pivot = valid.groupby(["month", "start_hour"]).size().reset_index(name="count")
+    pivot_wide = pivot.pivot(index="start_hour", columns="month", values="count").fillna(0).astype(int)
+    # Ensure all hours 0-23 are present
+    pivot_wide = pivot_wide.reindex(range(24), fill_value=0)
+    pivot_wide.index = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0") for h in range(24)]
+
+    fig_heat = px.imshow(
+        pivot_wide, text_auto=True, aspect="auto",
+        color_continuous_scale="Blues",
+        title="Interviews by Hour & Month" + title_suffix,
+        labels=dict(x="Month", y="Hour of Day", color="Count"),
+    )
+    fig_heat.update_layout(height=550)
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+    # ── Monthly mean start time + count line chart ───────────────
+    monthly_agg = valid.groupby("month").agg(
+        interviews=("start_hour", "size"),
+        mean_start_hour=("start_hour", "mean"),
+    ).reset_index()
+    monthly_agg["mean_start_hour"] = monthly_agg["mean_start_hour"].round(2)
+    monthly_agg["mean_start_label"] = monthly_agg["mean_start_hour"].apply(
+        lambda h: datetime(2000, 1, 1, int(h), int((h % 1) * 60)).strftime("%I:%M %p")
+    )
+
+    # Monthly duration mean (if available)
+    has_dur = "interview_duration_min" in valid.columns and valid["interview_duration_min"].notna().any()
+    if has_dur:
+        dur_agg = valid.groupby("month")["interview_duration_min"].mean().round(1).rename("avg_duration_min")
+        monthly_agg = monthly_agg.merge(dur_agg, on="month", how="left")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig_count = go.Figure()
+        fig_count.add_trace(go.Bar(
+            x=monthly_agg["month"], y=monthly_agg["interviews"],
+            marker_color="#3498db",
+            text=monthly_agg["interviews"], textposition="outside",
+        ))
+        fig_count.update_layout(
+            title="Monthly Interview Count (with start_time)" + title_suffix,
+            height=400, xaxis_title="Month", yaxis_title="Interviews",
+        )
+        st.plotly_chart(fig_count, use_container_width=True)
+
+    with c2:
+        fig_mean = go.Figure()
+        fig_mean.add_trace(go.Scatter(
+            x=monthly_agg["month"],
+            y=monthly_agg["mean_start_hour"],
+            mode="lines+markers+text",
+            text=monthly_agg["mean_start_label"],
+            textposition="top center",
+            line=dict(color="#e67e22", width=3),
+            marker=dict(size=10),
+        ))
+        fig_mean.update_layout(
+            title="Mean Interview Start Time by Month" + title_suffix,
+            height=400, xaxis_title="Month",
+            yaxis_title="Hour of Day (24h)",
+            yaxis=dict(range=[
+                max(0, monthly_agg["mean_start_hour"].min() - 2),
+                min(24, monthly_agg["mean_start_hour"].max() + 2),
+            ]),
+        )
+        st.plotly_chart(fig_mean, use_container_width=True)
+
+    # ── Monthly avg duration trend (if available) ────────────────
+    if has_dur and "avg_duration_min" in monthly_agg.columns:
+        fig_dur_trend = go.Figure()
+        fig_dur_trend.add_trace(go.Scatter(
+            x=monthly_agg["month"],
+            y=monthly_agg["avg_duration_min"],
+            mode="lines+markers+text",
+            text=monthly_agg["avg_duration_min"].apply(lambda v: f"{v:.0f} min" if pd.notna(v) else ""),
+            textposition="top center",
+            line=dict(color="#9b59b6", width=3),
+            marker=dict(size=10),
+        ))
+        fig_dur_trend.update_layout(
+            title="Avg Interview Duration by Month" + title_suffix,
+            height=400, xaxis_title="Month", yaxis_title="Duration (minutes)",
+        )
+        st.plotly_chart(fig_dur_trend, use_container_width=True)
+
+    with st.expander("Monthly Start Time Data" + title_suffix):
+        display_cols = ["month", "interviews", "mean_start_label"]
+        if has_dur and "avg_duration_min" in monthly_agg.columns:
+            display_cols.append("avg_duration_min")
+        st.dataframe(monthly_agg[display_cols], use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  RoBERTa ONNX SENTIMENT (used ONLY by Transcript Analyzer view)
 #  Model: cardiffnlp/twitter-roberta-base-sentiment-latest
 #  ONNX weights: Xenova/twitter-roberta-base-sentiment-latest
@@ -1061,6 +1326,10 @@ def main():
 
     support_df = get_by_support(active_expert_df, selected_support)
 
+    # ── Add start_time columns ONCE for Interview Support ────────
+    if selected_support == "Interview Support" and "start_time" in support_df.columns:
+        support_df = add_start_time_columns(support_df)
+
     st.sidebar.markdown("---")
     st.sidebar.metric("Total Cases (This Year)", len(all_case_df))
     for stype in SUPPORT_TYPES:
@@ -1091,6 +1360,18 @@ def main():
             delta_color="normal" if avg >= 0 else "inverse",
         )
 
+    # ── Sidebar: Start Time summary for Interview Support ────────
+    if selected_support == "Interview Support" and "start_hour" in support_df.columns:
+        valid_st = support_df["start_hour"].dropna()
+        if not valid_st.empty:
+            peak_h = int(valid_st.value_counts().idxmax())
+            peak_lbl = datetime(2000, 1, 1, peak_h).strftime("%I:%M %p")
+            st.sidebar.metric("Peak Interview Hour", peak_lbl)
+            if "interview_duration_min" in support_df.columns:
+                avg_d = support_df["interview_duration_min"].dropna()
+                if not avg_d.empty:
+                    st.sidebar.metric("Avg Duration", f"{avg_d.mean():.0f} min")
+
     hist = hist_monthly_df(selected_support)
     live = live_monthly(support_df)
     if not hist.empty and not live.empty:
@@ -1113,7 +1394,7 @@ def main():
     if view == "Transcript Analyzer":
         transcript_analyzer_view()
         st.sidebar.markdown("---")
-        st.sidebar.caption("Vizva Dashboard v16.0 | API-powered | Active Experts Only | RoBERTa ONNX")
+        st.sidebar.caption("Vizva Dashboard v17.0 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics")
         return
 
     # ======= TODAY =======
@@ -1140,6 +1421,11 @@ def main():
             if today_stats:
                 st.markdown("---")
                 render_sentiment_kpi(today_stats, title="Today's Feedback Sentiment")
+
+        # ── TODAY'S START TIME INSIGHTS (Interview Support only) ──
+        if selected_support == "Interview Support" and not today_df.empty and "start_hour" in today_df.columns:
+            st.markdown("---")
+            render_start_time_insights(today_df, title_suffix=" - " + str(today))
 
         if not today_df.empty:
             c1, c2 = st.columns(2)
@@ -1286,6 +1572,14 @@ def main():
             st.plotly_chart(donut(latest.to_dict(), "Task Split - " + str(latest["month"])), use_container_width=True)
 
         st.plotly_chart(trend_line(monthly, "total", "Total " + support_label + " per Month", "#8e44ad"), use_container_width=True)
+
+        # ── START TIME INSIGHTS — OVERALL (Interview Support) ────
+        if selected_support == "Interview Support" and "start_hour" in support_df.columns:
+            st.markdown("---")
+            render_start_time_insights(support_df, title_suffix=" - All Months")
+
+            st.markdown("---")
+            render_monthly_start_time_trend(support_df, title_suffix=" - " + support_label)
 
         # ── MONTHLY SENTIMENT TREND ──────────────────────────────
         st.markdown("---")
@@ -1568,9 +1862,14 @@ def main():
     elif view == "Deep-Dive Analytics":
         st.header("Deep-Dive Analytics - " + support_label)
 
-        tabs = st.tabs(["Experts", "Companies", "Rounds",
-                         "Day of Week", "All Support Types",
-                         "Candidates", "Technology"])
+        tab_names = ["Experts", "Companies", "Rounds",
+                     "Day of Week", "All Support Types",
+                     "Candidates", "Technology"]
+        # Add Start Time tab for Interview Support
+        if selected_support == "Interview Support" and "start_hour" in support_df.columns:
+            tab_names.append("Start Time Analysis")
+
+        tabs = st.tabs(tab_names)
 
         with tabs[0]:
             fig = expert_stack(support_df)
@@ -1691,8 +1990,15 @@ def main():
             else:
                 st.info("No technology column found.")
 
+        # ── START TIME ANALYSIS TAB (Interview Support only) ─────
+        if selected_support == "Interview Support" and "start_hour" in support_df.columns and len(tabs) > 7:
+            with tabs[7]:
+                render_start_time_insights(support_df, title_suffix=" - All Data")
+                st.markdown("---")
+                render_monthly_start_time_trend(support_df, title_suffix="")
+
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v16.0 | API-powered | Active Experts Only | RoBERTa ONNX")
+    st.sidebar.caption("Vizva Dashboard v17.0 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics")
 
 
 # ================================================================
