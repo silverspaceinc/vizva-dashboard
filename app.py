@@ -843,117 +843,96 @@ def render_clash_summary(df, title_suffix=""):
                                       "Days with Clashes", "Mean Clash Start Time"]
         st.dataframe(expert_agg_display, use_container_width=True, hide_index=True)
 
-    # ── Monthly summary table ────────────────────────────────────
-    with st.expander("Monthly Clash Summary" + title_suffix):
-        monthly_table = clash_groups.groupby("month").agg(
-            clash_groups_count=("group_size", "size"),
-            total_interviews=("group_size", "sum"),
-            experts=("expert_name", "nunique"),
-            mean_start=("mean_start_minutes", "mean"),
-        ).reset_index()
-        monthly_table["mean_start_label"] = monthly_table["mean_start"].apply(
-            _mean_start_label_from_minutes
-        )
-        monthly_table.columns = ["Month", "Clash Groups", "Interviews in Clashes",
-                                 "Experts Affected", "Mean Start (min)", "Mean Clash Start Time"]
-        st.dataframe(monthly_table[["Month", "Clash Groups", "Interviews in Clashes",
-                                     "Experts Affected", "Mean Clash Start Time"]],
-                     use_container_width=True, hide_index=True)
-
-    # ── Detailed clash groups ────────────────────────────────────
+    # ── Detailed Clash Groups table ──────────────────────────────
     with st.expander("Detailed Clash Groups" + title_suffix):
-        display_groups = clash_groups.copy()
-        display_groups["date"] = display_groups["date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(
-            display_groups[["expert_name", "date", "group_size", "interviews_str",
-                            "mean_start_label", "month"]].rename(columns={
-                "expert_name": "Expert",
-                "date": "Date",
-                "group_size": "Interviews",
-                "interviews_str": "Start Times",
-                "mean_start_label": "Mean Start Time",
-                "month": "Month",
-            }),
-            use_container_width=True, hide_index=True,
-        )
+        detail = clash_groups[["expert_name", "date", "group_size",
+                               "interviews_str", "mean_start_label", "month"]].copy()
+        detail.columns = ["Expert", "Date", "Group Size", "Overlapping Times",
+                          "Mean Start", "Month"]
+        detail["Date"] = detail["Date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(detail, use_container_width=True, hide_index=True)
 
-    # ── Detailed clash pairs ─────────────────────────────────────
     if not clash_pairs.empty:
-        with st.expander("All Clash Pairs" + title_suffix):
-            display_pairs = clash_pairs.copy()
-            display_pairs["date"] = display_pairs["date"].dt.strftime("%Y-%m-%d")
-            st.dataframe(
-                display_pairs[["expert_name", "date", "start_time_1",
-                                "start_time_2", "time_diff_min", "month"]],
-                use_container_width=True, hide_index=True,
-            )
+        with st.expander("Detailed Clash Pairs" + title_suffix):
+            pairs_disp = clash_pairs[["expert_name", "date", "start_time_1",
+                                      "start_time_2", "time_diff_min", "month"]].copy()
+            pairs_disp.columns = ["Expert", "Date", "Time 1", "Time 2",
+                                  "Diff (min)", "Month"]
+            pairs_disp["Date"] = pairs_disp["Date"].dt.strftime("%Y-%m-%d")
+            st.dataframe(pairs_disp, use_container_width=True, hide_index=True)
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  TODAY'S CLASH SUMMARY (compact view for Today's Snapshot)
+# ═══════════════════════════════════════════════════════════════════
 
 def render_today_clash_summary(df):
-    """Render a compact clash summary for today's snapshot."""
+    """Compact clash summary for today's snapshot."""
     clash_groups, clash_pairs = detect_expert_clashes(df)
 
     if clash_groups.empty:
-        st.success("No scheduling clashes today.")
+        st.success("No scheduling clashes detected today.")
         return
 
     total_groups = len(clash_groups)
     total_interviews = int(clash_groups["group_size"].sum())
-    experts_affected = clash_groups["expert_name"].nunique()
-    mean_min = clash_groups["mean_start_minutes"].mean()
-    mean_label = _mean_start_label_from_minutes(mean_min)
+    experts_with = clash_groups["expert_name"].nunique()
+    overall_mean_min = clash_groups["mean_start_minutes"].mean()
+    overall_mean_label = _mean_start_label_from_minutes(overall_mean_min)
 
     k = st.columns(4)
-    k[0].metric("Clash Groups Today", total_groups)
+    k[0].metric("⚠️ Clash Groups", total_groups)
     k[1].metric("Interviews in Clashes", total_interviews)
-    k[2].metric("Experts Affected", experts_affected)
-    k[3].metric("Mean Clash Start Time", mean_label)
+    k[2].metric("Experts with Clashes", experts_with)
+    k[3].metric("Mean Clash Start Time", overall_mean_label)
 
-    size_counts = clash_groups["group_size"].value_counts().sort_index()
-    size_parts = [str(int(v)) + "x " + str(int(s)) + "-interview" for s, v in size_counts.items()]
-    st.caption("Clash breakdown: " + ", ".join(size_parts))
+    with st.expander("Clash Details"):
+        display = clash_groups[["expert_name", "group_size", "interviews_str",
+                                "mean_start_label"]].copy()
+        display.columns = ["Expert", "Group Size", "Overlapping Times", "Mean Start"]
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
-    with st.expander("Today's Clash Details"):
-        display_groups = clash_groups.copy()
-        display_groups["date"] = display_groups["date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(
-            display_groups[["expert_name", "date", "group_size", "interviews_str",
-                            "mean_start_label"]].rename(columns={
-                "expert_name": "Expert",
-                "date": "Date",
-                "group_size": "Interviews",
-                "interviews_str": "Start Times",
-                "mean_start_label": "Mean Start Time",
-            }),
-            use_container_width=True, hide_index=True,
-        )
+        if not clash_pairs.empty:
+            st.caption("Pairwise Clashes")
+            pairs_display = clash_pairs[["expert_name", "start_time_1",
+                                         "start_time_2", "time_diff_min"]].copy()
+            pairs_display.columns = ["Expert", "Time 1", "Time 2", "Diff (min)"]
+            st.dataframe(pairs_display, use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  BLOCKAGE DETECTION
-#  Rule: In any 30-minute bracket, ALL experts have at least one
-#  interview AND at least one expert has a clash in that bracket.
-#  This means zero capacity — no one is free and there's a conflict.
+#  A blockage occurs in a 30-minute bracket on a given day when:
+#    1) ALL active experts have at least one interview in that bracket
+#    2) At least one expert has a clash (2+ interviews) in that bracket
+#
+#  Active experts = all unique expert names from the last 5 calendar
+#  days of data PLUS any new experts appearing on the target day.
 # ═══════════════════════════════════════════════════════════════════
 
+def _get_active_experts(df):
+    """Return the set of active expert names from the last 5 calendar days of data."""
+    if df.empty or "expert_name" not in df.columns or "date" not in df.columns:
+        return set()
+    all_dates = df["date"].dt.date.unique()
+    if len(all_dates) == 0:
+        return set()
+    sorted_dates = sorted(all_dates, reverse=True)
+    last_5_dates = set(sorted_dates[:5])
+    mask_last5 = df["date"].dt.date.isin(last_5_dates)
+    return set(df.loc[mask_last5, "expert_name"].dropna().unique())
+
+
 def detect_blockages(df):
-    """Detect Blockage events.
+    """Detect blockage events across all days in df.
 
-    A Blockage occurs in a 30-minute time bracket on a given day when:
-      1) Every unique expert (for that day) has >=1 interview starting
-         within that bracket.
-      2) At least one expert has a clash (2+ interviews) in that bracket.
-
-    Brackets slide in 30-min steps: 00:00-00:30, 00:30-01:00, ... 23:30-00:00
-
-    Returns a DataFrame with columns:
-        date, day_name, bracket_start_min, bracket_label,
-        total_experts_today, experts_in_bracket, experts_with_clash,
-        involved_experts (list), clash_experts (list),
-        mean_start_minutes, mean_start_label, month
+    Returns a DataFrame with one row per blockage bracket, columns:
+      date, day_name, bracket_start_min, bracket_label,
+      total_experts_active, experts_in_bracket, experts_with_clash,
+      involved_experts, clash_experts, mean_start_minutes,
+      mean_start_label, month
     """
     empty = pd.DataFrame()
-
     if "_parsed_start" not in df.columns or "expert_name" not in df.columns or "date" not in df.columns:
         return empty
 
@@ -964,14 +943,27 @@ def detect_blockages(df):
     valid["_day"] = valid["date"].dt.date
     valid["_start_minutes"] = valid["_parsed_start"].dt.hour * 60 + valid["_parsed_start"].dt.minute
 
+    # Pre-compute the active expert pool (based on last 5 dates in the full dataset)
+    base_active = _get_active_experts(df)
+
     blockage_rows = []
 
-    for day, day_grp in valid.groupby("_day"):
-        all_experts_today = set(day_grp["expert_name"].unique())
-        n_experts = len(all_experts_today)
-        if n_experts < 2:
+    for day_val, day_grp in valid.groupby("_day"):
+        # Active experts for this day = base pool + any new experts on this day
+        experts_on_day = set(day_grp["expert_name"].unique())
+        day_active = base_active | experts_on_day
+
+        if len(day_active) < 2:
             continue
 
+        total_active = len(day_active)
+
+        # If any active expert has 0 interviews today, blockage is impossible
+        experts_with_interviews_today = experts_on_day
+        if len(day_active - experts_with_interviews_today) > 0:
+            continue
+
+        # Scan 30-minute brackets: 0, 30, 60, ..., 1410
         for bracket_start in range(0, 1440, 30):
             bracket_end = bracket_start + 30
 
@@ -985,34 +977,37 @@ def detect_blockages(df):
 
             experts_in_bracket = set(in_bracket["expert_name"].unique())
 
-            if experts_in_bracket != all_experts_today:
+            # Condition 1: ALL active experts must be in this bracket
+            if experts_in_bracket != day_active:
                 continue
 
+            # Condition 2: at least one expert has 2+ interviews in this bracket
             expert_counts = in_bracket.groupby("expert_name").size()
-            clash_experts = set(expert_counts[expert_counts >= 2].index)
+            clash_expert_names = set(expert_counts[expert_counts >= 2].index)
 
-            if not clash_experts:
+            if not clash_expert_names:
                 continue
 
-            bracket_h = bracket_start // 60
-            bracket_m = bracket_start % 60
-            bracket_label = datetime(2000, 1, 1, bracket_h, bracket_m).strftime("%I:%M %p")
-
+            # BLOCKAGE detected
             mean_min = in_bracket["_start_minutes"].mean()
             mean_h = int(mean_min // 60) % 24
             mean_m = int(mean_min % 60)
             mean_label = datetime(2000, 1, 1, mean_h, mean_m).strftime("%I:%M %p")
 
+            bracket_h = int(bracket_start // 60) % 24
+            bracket_m = int(bracket_start % 60)
+            bracket_label = datetime(2000, 1, 1, bracket_h, bracket_m).strftime("%I:%M %p")
+
             blockage_rows.append({
-                "date": pd.Timestamp(day),
-                "day_name": pd.Timestamp(day).day_name(),
+                "date": pd.Timestamp(day_val),
+                "day_name": pd.Timestamp(day_val).day_name(),
                 "bracket_start_min": bracket_start,
                 "bracket_label": bracket_label,
-                "total_experts_today": n_experts,
+                "total_experts_active": total_active,
                 "experts_in_bracket": len(experts_in_bracket),
-                "experts_with_clash": len(clash_experts),
-                "involved_experts": sorted(experts_in_bracket),
-                "clash_experts": sorted(clash_experts),
+                "experts_with_clash": len(clash_expert_names),
+                "involved_experts": ", ".join(sorted(experts_in_bracket)),
+                "clash_experts": ", ".join(sorted(clash_expert_names)),
                 "mean_start_minutes": round(mean_min, 1),
                 "mean_start_label": mean_label,
             })
@@ -1020,114 +1015,127 @@ def detect_blockages(df):
     if not blockage_rows:
         return empty
 
-    blockage_df = pd.DataFrame(blockage_rows)
-    blockage_df["month"] = blockage_df["date"].dt.to_period("M").astype(str)
-    return blockage_df
+    result = pd.DataFrame(blockage_rows)
+    result["month"] = result["date"].dt.to_period("M").astype(str)
+    return result
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  TODAY'S BLOCKAGE INDICATOR
+# ═══════════════════════════════════════════════════════════════════
 
 def render_today_blockage(df):
-    """Render Blockage indicator for Today's Snapshot."""
-    blockage_df = detect_blockages(df)
+    """Compact blockage indicator for Today's Snapshot."""
+    blockages = detect_blockages(df)
 
-    if blockage_df.empty:
-        st.success("No Blockage detected today — capacity is available.")
+    if blockages.empty:
+        st.success("No blockage detected today. At least one expert is available in every bracket.")
         return
 
-    n = len(blockage_df)
-    st.error(
-        f"**BLOCKAGE DETECTED** — {n} time bracket{'s' if n > 1 else ''} "
-        f"where ALL experts are busy AND a clash exists. Zero available capacity!"
-    )
+    today_val = date.today()
+    today_blockages = blockages[blockages["date"].dt.date == today_val]
+
+    if today_blockages.empty:
+        st.success("No blockage detected today.")
+        return
+
+    total_brackets = len(today_blockages)
+    all_experts_count = today_blockages["total_experts_active"].iloc[0]
+    total_clash_experts = today_blockages["clash_experts"].str.split(", ").explode().nunique()
+    mean_min = today_blockages["mean_start_minutes"].mean()
+    mean_label = _mean_start_label_from_minutes(mean_min)
+
+    st.warning(f"🚨 **{total_brackets} Blockage Bracket(s) Detected Today!**")
 
     k = st.columns(4)
-    k[0].metric("Blockage Brackets", n)
-    k[1].metric("Experts (All Busy)", int(blockage_df["total_experts_today"].iloc[0]))
-    k[2].metric("Total Clash Experts", int(blockage_df["experts_with_clash"].sum()))
-    mean_min = blockage_df["mean_start_minutes"].mean()
-    k[3].metric("Mean Blockage Time", _mean_start_label_from_minutes(mean_min))
+    k[0].metric("Blockage Brackets", total_brackets)
+    k[1].metric("Experts (All Busy)", all_experts_count)
+    k[2].metric("Total Clash Experts", total_clash_experts)
+    k[3].metric("Mean Blockage Time", mean_label)
 
-    with st.expander("Blockage Details — Today"):
-        display = blockage_df[["bracket_label", "total_experts_today",
-                               "experts_with_clash", "mean_start_label"]].copy()
-        display.columns = ["Time Bracket", "Total Experts", "Experts with Clash",
-                           "Mean Start Time"]
+    with st.expander("Blockage Details"):
+        display = today_blockages[["bracket_label", "total_experts_active",
+                                    "experts_with_clash", "involved_experts",
+                                    "clash_experts", "mean_start_label"]].copy()
+        display.columns = ["Bracket", "Active Experts", "Experts w/ Clash",
+                           "All Experts", "Clash Experts", "Mean Start"]
         st.dataframe(display, use_container_width=True, hide_index=True)
 
-        for _, row in blockage_df.iterrows():
-            st.caption(
-                f"**{row['bracket_label']}** — Clash experts: "
-                + ", ".join(row["clash_experts"])
-                + f" | All experts: " + ", ".join(row["involved_experts"])
-            )
 
+# ═══════════════════════════════════════════════════════════════════
+#  BLOCKAGE ANALYTICS (full view for Monthly / Deep-Dive)
+# ═══════════════════════════════════════════════════════════════════
 
 def render_blockage_summary(df, title_suffix=""):
-    """Full Blockage analytics: month-wise, expert-wise, time-wise."""
-    blockage_df = detect_blockages(df)
+    """Full blockage analytics section."""
+    blockages = detect_blockages(df)
 
     st.subheader("Blockage Analysis" + title_suffix)
     st.caption(
-        "A **Blockage** = a 30-min bracket where ALL experts have interviews "
-        "AND at least one expert has a clash (2+ interviews). "
-        "Result: zero available capacity in that window."
+        "A blockage occurs in a 30-min bracket when ALL active experts "
+        "(from the last 5 days + any new experts that day) have at least one "
+        "interview AND at least one expert has a scheduling clash (2+ interviews) "
+        "in that bracket. If any active expert has zero interviews that day, "
+        "blockage is impossible."
     )
 
-    if blockage_df.empty:
-        st.success("No Blockages detected" + title_suffix + ".")
+    if blockages.empty:
+        st.success("No blockage events detected" + title_suffix + ".")
         return
 
-    # ── KPI row ──────────────────────────────────────────────────
-    total_blockages = len(blockage_df)
-    days_with_blockage = blockage_df["date"].dt.date.nunique()
-    months_with_blockage = blockage_df["month"].nunique()
-    total_clash_experts = int(blockage_df["experts_with_clash"].sum())
-    mean_min = blockage_df["mean_start_minutes"].mean()
+    # ── KPIs ─────────────────────────────────────────────────────
+    total_events = len(blockages)
+    days_with = blockages["date"].dt.date.nunique()
+    months_with = blockages["month"].nunique()
+    total_clash_experts = blockages["clash_experts"].str.split(", ").explode().nunique()
+    mean_min = blockages["mean_start_minutes"].mean()
     mean_label = _mean_start_label_from_minutes(mean_min)
 
     k = st.columns(5)
-    k[0].metric("Total Blockage Events", total_blockages)
-    k[1].metric("Days with Blockage", days_with_blockage)
-    k[2].metric("Months with Blockage", months_with_blockage)
+    k[0].metric("Total Blockage Events", total_events)
+    k[1].metric("Days with Blockage", days_with)
+    k[2].metric("Months with Blockage", months_with)
     k[3].metric("Total Clash Experts", total_clash_experts)
     k[4].metric("Mean Blockage Time", mean_label)
 
-    # ── Month-wise Blockage Trend ────────────────────────────────
+    # ── Monthly Blockage Trend ───────────────────────────────────
     st.markdown("---")
-    st.subheader("Monthly Blockage Trend" + title_suffix)
+    st.subheader("Monthly Blockage Trends" + title_suffix)
 
-    monthly_b = blockage_df.groupby("month").agg(
-        blockage_count=("bracket_label", "size"),
-        days=("date", lambda x: x.dt.date.nunique()),
-        clash_experts=("experts_with_clash", "sum"),
-        mean_start=("mean_start_minutes", "mean"),
-    ).reset_index()
-    monthly_b["mean_start_label"] = monthly_b["mean_start"].apply(
-        _mean_start_label_from_minutes
-    )
-    monthly_b["mean_start_hour"] = (monthly_b["mean_start"] / 60).round(2)
+    monthly_counts = blockages.groupby("month").size().reset_index(name="blockage_events")
 
-    col_mb1, col_mb2 = st.columns(2)
-    with col_mb1:
-        fig_mb = go.Figure(go.Bar(
-            x=monthly_b["month"], y=monthly_b["blockage_count"],
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        fig_monthly = go.Figure(go.Bar(
+            x=monthly_counts["month"],
+            y=monthly_counts["blockage_events"],
             marker_color="#e74c3c",
-            text=monthly_b["blockage_count"], textposition="outside",
+            text=monthly_counts["blockage_events"],
+            textposition="outside",
         ))
-        fig_mb.update_layout(
+        fig_monthly.update_layout(
             title="Blockage Events by Month",
             height=420,
             xaxis_title="Month",
             yaxis_title="Blockage Events",
         )
-        st.plotly_chart(fig_mb, use_container_width=True)
+        st.plotly_chart(fig_monthly, use_container_width=True)
 
-    with col_mb2:
+    with col_m2:
+        monthly_mean = blockages.groupby("month").agg(
+            mean_start=("mean_start_minutes", "mean"),
+        ).reset_index()
+        monthly_mean["mean_start_label"] = monthly_mean["mean_start"].apply(
+            _mean_start_label_from_minutes
+        )
+        monthly_mean["mean_start_hour"] = (monthly_mean["mean_start"] / 60).round(2)
+
         fig_mm = go.Figure()
         fig_mm.add_trace(go.Scatter(
-            x=monthly_b["month"],
-            y=monthly_b["mean_start_hour"],
+            x=monthly_mean["month"],
+            y=monthly_mean["mean_start_hour"],
             mode="lines+markers+text",
-            text=monthly_b["mean_start_label"],
+            text=monthly_mean["mean_start_label"],
             textposition="top center",
             line=dict(color="#e74c3c", width=3),
             marker=dict(size=10),
@@ -1138,76 +1146,41 @@ def render_blockage_summary(df, title_suffix=""):
             xaxis_title="Month",
             yaxis_title="Hour of Day (24h)",
             yaxis=dict(range=[
-                max(0, monthly_b["mean_start_hour"].min() - 2),
-                min(24, monthly_b["mean_start_hour"].max() + 2),
+                max(0, monthly_mean["mean_start_hour"].min() - 2),
+                min(24, monthly_mean["mean_start_hour"].max() + 2),
             ]),
         )
         st.plotly_chart(fig_mm, use_container_width=True)
 
-    # ── Expert-wise Blockage Frequency ───────────────────────────
+    # ── Expert-wise Blockage Involvement ─────────────────────────
     st.markdown("---")
     st.subheader("Expert-wise Blockage Involvement" + title_suffix)
-    st.caption("How often each expert appears in a Blockage bracket (as busy or clashing)")
 
-    exploded = blockage_df.explode("involved_experts")
-    expert_blockage_counts = exploded.groupby("involved_experts").agg(
-        blockage_events=("bracket_label", "size"),
-        months=("month", "nunique"),
-    ).reset_index().rename(columns={"involved_experts": "expert_name"})
-    expert_blockage_counts = expert_blockage_counts.sort_values(
-        "blockage_events", ascending=False
-    )
+    all_involved = blockages["involved_experts"].str.split(", ").explode()
+    expert_involvement = all_involved.value_counts().head(20)
 
-    exploded_clash = blockage_df.explode("clash_experts")
-    clash_expert_counts = exploded_clash.groupby("clash_experts").size().rename(
-        "as_clash_expert"
-    ).reset_index().rename(columns={"clash_experts": "expert_name"})
-
-    expert_blockage = expert_blockage_counts.merge(
-        clash_expert_counts, on="expert_name", how="left"
-    ).fillna(0)
-    expert_blockage["as_clash_expert"] = expert_blockage["as_clash_expert"].astype(int)
-
-    col_e1, col_e2 = st.columns(2)
-    with col_e1:
-        top = expert_blockage.head(15).sort_values("blockage_events")
-        fig_eb = go.Figure()
-        fig_eb.add_trace(go.Bar(
-            y=top["expert_name"], x=top["blockage_events"],
-            orientation="h", marker_color="#e74c3c",
-            text=top["blockage_events"], textposition="outside",
-            name="Blockage Brackets",
+    if not expert_involvement.empty:
+        fig_exp = go.Figure(go.Bar(
+            y=expert_involvement.index,
+            x=expert_involvement.values,
+            orientation="h",
+            marker_color="#e74c3c",
+            text=expert_involvement.values,
+            textposition="outside",
         ))
-        fig_eb.update_layout(
-            title="Top 15 Experts in Blockage Events",
-            height=max(420, len(top) * 35),
-            xaxis_title="Blockage Events",
+        fig_exp.update_layout(
+            title="Top 20 Experts in Blockage Events",
+            height=max(420, len(expert_involvement) * 35),
             yaxis=dict(autorange="reversed"),
+            xaxis_title="Blockage Events Involved",
         )
-        st.plotly_chart(fig_eb, use_container_width=True)
+        st.plotly_chart(fig_exp, use_container_width=True)
 
-    with col_e2:
-        top2 = expert_blockage.head(15).sort_values("as_clash_expert")
-        fig_ec = go.Figure()
-        fig_ec.add_trace(go.Bar(
-            y=top2["expert_name"], x=top2["as_clash_expert"],
-            orientation="h", marker_color="#8e44ad",
-            text=top2["as_clash_expert"], textposition="outside",
-            name="As Clash Expert",
-        ))
-        fig_ec.update_layout(
-            title="Top 15 — Times as Clash Expert in Blockage",
-            height=max(420, len(top2) * 35),
-            xaxis_title="Times as Clash Expert",
-            yaxis=dict(autorange="reversed"),
-        )
-        st.plotly_chart(fig_ec, use_container_width=True)
-
-    # ── Time-of-Day Blockage Distribution ────────────────────────
+    # ── Time-of-Day Distribution ─────────────────────────────────
     st.markdown("---")
     st.subheader("Blockage Time-of-Day Distribution" + title_suffix)
 
-    blockage_hours = (blockage_df["bracket_start_min"] // 60).astype(int)
+    blockage_hours = (blockages["bracket_start_min"] // 60).astype(int)
     hour_counts = blockage_hours.value_counts().sort_index()
 
     all_hours = list(range(0, 24))
@@ -1216,254 +1189,121 @@ def render_blockage_summary(df, title_suffix=""):
     peak_h = int(hour_counts.idxmax()) if not hour_counts.empty else 0
     bar_colors = ["#e74c3c" if h == peak_h else "#f39c12" for h in all_hours]
 
-    fig_bh = go.Figure(go.Bar(
+    fig_tod = go.Figure(go.Bar(
         x=hour_labels, y=counts,
         marker_color=bar_colors,
         text=counts, textposition="outside",
     ))
-    fig_bh.update_layout(
-        title="Blockage Events by Hour of Day" + title_suffix,
+    fig_tod.update_layout(
+        title="Blockage Brackets by Hour of Day" + title_suffix,
         height=420,
         xaxis_title="Hour of Day",
-        yaxis_title="Blockage Events",
+        yaxis_title="Blockage Brackets",
         xaxis=dict(tickangle=-45),
     )
-    st.plotly_chart(fig_bh, use_container_width=True)
+    st.plotly_chart(fig_tod, use_container_width=True)
 
-    # ── Expert x Month Heatmap ───────────────────────────────────
+    # ── Expert × Month Heatmap ───────────────────────────────────
     st.markdown("---")
-    st.subheader("Expert x Month Blockage Heatmap" + title_suffix)
+    st.subheader("Expert × Month Blockage Heatmap" + title_suffix)
 
-    exploded_monthly = exploded.groupby(["involved_experts", "month"]).size().reset_index(
-        name="count"
-    ).rename(columns={"involved_experts": "expert_name"})
-    pivot_em = exploded_monthly.pivot(
-        index="expert_name", columns="month", values="count"
-    ).fillna(0).astype(int)
+    exploded = blockages.copy()
+    exploded["expert_list"] = exploded["involved_experts"].str.split(", ")
+    exploded = exploded.explode("expert_list")
 
-    if not pivot_em.empty:
+    pivot_hm = exploded.groupby(["expert_list", "month"]).size().reset_index(name="count")
+    pivot_wide = pivot_hm.pivot(index="expert_list", columns="month", values="count").fillna(0).astype(int)
+
+    if not pivot_wide.empty:
+        pivot_wide["_total"] = pivot_wide.sum(axis=1)
+        pivot_wide = pivot_wide.sort_values("_total", ascending=False).head(20).drop(columns="_total")
+
         fig_hm = px.imshow(
-            pivot_em, text_auto=True, aspect="auto",
+            pivot_wide, text_auto=True, aspect="auto",
             color_continuous_scale="Reds",
-            title="Expert x Month Blockage Frequency",
-            labels=dict(x="Month", y="Expert", color="Blockages"),
+            title="Expert × Month Blockage Heatmap (Top 20)" + title_suffix,
+            labels=dict(x="Month", y="Expert", color="Events"),
         )
-        fig_hm.update_layout(height=max(450, len(pivot_em) * 25))
+        fig_hm.update_layout(height=max(450, len(pivot_wide) * 30))
         st.plotly_chart(fig_hm, use_container_width=True)
 
     # ── Detailed Blockage Table ──────────────────────────────────
     with st.expander("Detailed Blockage Events" + title_suffix):
-        display_b = blockage_df.copy()
-        display_b["date"] = display_b["date"].dt.strftime("%Y-%m-%d")
-        display_b["involved_experts_str"] = display_b["involved_experts"].apply(
-            lambda x: ", ".join(x)
-        )
-        display_b["clash_experts_str"] = display_b["clash_experts"].apply(
-            lambda x: ", ".join(x)
-        )
-        st.dataframe(
-            display_b[["date", "day_name", "bracket_label", "total_experts_today",
-                        "experts_with_clash", "mean_start_label",
-                        "involved_experts_str", "clash_experts_str", "month"]].rename(columns={
-                "date": "Date",
-                "day_name": "Day",
-                "bracket_label": "Time Bracket",
-                "total_experts_today": "Total Experts",
-                "experts_with_clash": "Clash Experts",
-                "mean_start_label": "Mean Start Time",
-                "involved_experts_str": "All Experts",
-                "clash_experts_str": "Clashing Experts",
-                "month": "Month",
-            }),
-            use_container_width=True, hide_index=True,
-        )
+        display = blockages[["date", "day_name", "bracket_label",
+                              "total_experts_active", "experts_with_clash",
+                              "involved_experts", "clash_experts",
+                              "mean_start_label", "month"]].copy()
+        display.columns = ["Date", "Day", "Bracket", "Active Experts",
+                           "Experts w/ Clash", "All Involved", "Clash Experts",
+                           "Mean Start", "Month"]
+        display["Date"] = display["Date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  RoBERTa ONNX SENTIMENT (used ONLY by Transcript Analyzer view)
-#  Model: cardiffnlp/twitter-roberta-base-sentiment-latest
-#  ONNX weights: Xenova/twitter-roberta-base-sentiment-latest
-#  Labels: 0 -> Negative, 1 -> Neutral, 2 -> Positive
-#  NO PyTorch — uses onnxruntime + quantized ONNX (~126MB)
+#  WORD CLOUD & FEEDBACK TEXT UTILITIES
 # ═══════════════════════════════════════════════════════════════════
 
-@st.cache_resource
-def _load_roberta_onnx():
-    """Load tokenizer + ONNX session once, cache across reruns."""
-    from transformers import AutoTokenizer
-    from huggingface_hub import hf_hub_download
-    import onnxruntime as ort
-
-    model_id = "Xenova/twitter-roberta-base-sentiment-latest"
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model_path = hf_hub_download(repo_id=model_id, filename="onnx/model_quantized.onnx")
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess_options.intra_op_num_threads = 2
-    session = ort.InferenceSession(model_path, sess_options, providers=["CPUExecutionProvider"])
-    return tokenizer, session
-
-
-def _roberta_softmax(x):
-    e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
-    return e_x / e_x.sum(axis=-1, keepdims=True)
-
-
-def _roberta_preprocess(text):
-    tokens = []
-    for t in text.split(" "):
-        t = "@user" if t.startswith("@") and len(t) > 1 else t
-        t = "http" if t.startswith("http") else t
-        tokens.append(t)
-    return " ".join(tokens)
-
-
-def roberta_score_text(text):
-    """Score a single text with RoBERTa ONNX. Returns dict."""
-    tokenizer, session = _load_roberta_onnx()
-    cleaned = _roberta_preprocess(text)
-    encoded = tokenizer(cleaned, truncation=True, max_length=512, return_tensors="np")
-    feeds = {
-        "input_ids": encoded["input_ids"].astype(np.int64),
-        "attention_mask": encoded["attention_mask"].astype(np.int64),
-    }
-    logits = session.run(None, feeds)[0]
-    probs = _roberta_softmax(logits)[0]
-    score = round((float(probs[2]) - float(probs[0])) * 100, 1)
-    return {
-        "score": score,
-        "p_negative": round(float(probs[0]) * 100, 1),
-        "p_neutral": round(float(probs[1]) * 100, 1),
-        "p_positive": round(float(probs[2]) * 100, 1),
-    }
-
-
-def roberta_score_chunks(text, chunk_mode="paragraph"):
-    """Split text into chunks and score each with RoBERTa ONNX."""
-    if chunk_mode == "paragraph":
-        chunks = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-    elif chunk_mode == "sentence":
-        chunks = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    else:
-        chunks = [text.strip()]
-    if not chunks:
-        return []
-
-    tokenizer, session = _load_roberta_onnx()
-    results = []
-    for chunk in chunks:
-        cleaned = _roberta_preprocess(chunk)
-        try:
-            encoded = tokenizer(cleaned, truncation=True, max_length=512, return_tensors="np")
-            feeds = {
-                "input_ids": encoded["input_ids"].astype(np.int64),
-                "attention_mask": encoded["attention_mask"].astype(np.int64),
-            }
-            logits = session.run(None, feeds)[0]
-            probs = _roberta_softmax(logits)[0]
-            score = round((float(probs[2]) - float(probs[0])) * 100, 1)
-            results.append({
-                "text": chunk[:200] + ("..." if len(chunk) > 200 else ""),
-                "full_text": chunk,
-                "score": score,
-                "p_negative": round(float(probs[0]) * 100, 1),
-                "p_neutral": round(float(probs[1]) * 100, 1),
-                "p_positive": round(float(probs[2]) * 100, 1),
-                "label": "Positive" if score >= 20 else ("Negative" if score <= -20 else "Neutral"),
-            })
-        except Exception:
-            results.append({
-                "text": chunk[:200] + ("..." if len(chunk) > 200 else ""),
-                "full_text": chunk,
-                "score": None, "p_negative": None, "p_neutral": None,
-                "p_positive": None, "label": "Error",
-            })
-    return results
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  TEXT PREPROCESSING + WORDCLOUD UTILITIES
-# ═══════════════════════════════════════════════════════════════════
-
-def _nltk_pos_to_wordnet(tag):
-    from nltk.corpus import wordnet
-    if tag.startswith("J"):
-        return wordnet.ADJ
-    elif tag.startswith("V"):
-        return wordnet.VERB
-    elif tag.startswith("N"):
-        return wordnet.NOUN
-    elif tag.startswith("R"):
-        return wordnet.ADV
-    return wordnet.NOUN
-
-
-def preprocess_feedback_texts(texts):
+def render_wordcloud_section(texts, section_title="Word Cloud"):
     if not texts:
-        return []
-    english_stops = set(stopwords.words("english"))
-    all_stops = english_stops | DOMAIN_STOPWORDS
+        st.info("No text available for word cloud.")
+        return
+
+    st.subheader(section_title)
+
+    stop_words = set(stopwords.words("english")) | DOMAIN_STOPWORDS
     lemmatizer = WordNetLemmatizer()
+
     all_tokens = []
     for text in texts:
-        if not isinstance(text, str) or not text.strip():
-            continue
         text = text.lower()
-        text = re.sub(r"https?://\S+|www\.\S+", "", text)
-        text = re.sub(r"\S+@\S+", "", text)
-        text = re.sub(r"\d+", "", text)
-        text = text.translate(str.maketrans("", "", string.punctuation))
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
-            continue
+        text = re.sub(r'[^a-zA-Z\s]', '', text)
         tokens = word_tokenize(text)
         tagged = pos_tag(tokens)
         for word, tag in tagged:
-            lemma = lemmatizer.lemmatize(word, _nltk_pos_to_wordnet(tag))
-            if lemma not in all_stops and len(lemma) > 1:
+            if word in stop_words or len(word) < 3:
+                continue
+            if tag.startswith("NN"):
+                pos_wn = "n"
+            elif tag.startswith("VB"):
+                pos_wn = "v"
+            elif tag.startswith("JJ"):
+                pos_wn = "a"
+            elif tag.startswith("RB"):
+                pos_wn = "r"
+            else:
+                pos_wn = "n"
+            lemma = lemmatizer.lemmatize(word, pos=pos_wn)
+            if lemma not in stop_words and len(lemma) >= 3:
                 all_tokens.append(lemma)
-    return all_tokens
 
-
-def get_top_words(tokens, n=10):
-    if not tokens:
-        return []
-    return Counter(tokens).most_common(n)
-
-
-def render_wordcloud_section(feedback_texts, section_title="Feedback Word Cloud"):
-    if not feedback_texts:
-        st.info("No feedback text available for word cloud analysis.")
+    if not all_tokens:
+        st.info("No meaningful words extracted from the feedback.")
         return
-    tokens = preprocess_feedback_texts(feedback_texts)
-    if not tokens:
-        st.info("No meaningful words found after preprocessing the feedback.")
-        return
-    top10 = get_top_words(tokens, 10)
-    freq = Counter(tokens)
 
-    st.subheader(section_title)
-    st.caption(
-        f"Preprocessing: lowercased → punctuation/numbers removed → English stopwords removed → "
-        f"domain words removed (interview, assessment, mock …) → lemmatized. "
-        f"**{len(feedback_texts)}** feedback entries → **{len(tokens)}** tokens → "
-        f"**{len(freq)}** unique words."
-    )
+    freq = Counter(all_tokens)
+    top_n = 30
+    top_words = freq.most_common(top_n)
 
-    top_df = pd.DataFrame(top10, columns=["Word", "Count"])
     fig_top = go.Figure(go.Bar(
-        x=top_df["Count"], y=top_df["Word"], orientation="h",
-        marker_color="#2980b9", text=top_df["Count"], textposition="outside",
+        x=[c for _, c in top_words],
+        y=[w for w, _ in top_words],
+        orientation="h",
+        marker_color="#3498db",
+        text=[c for _, c in top_words],
+        textposition="outside",
     ))
     fig_top.update_layout(
-        title="Top 10 Words in Feedback", height=400,
-        yaxis=dict(autorange="reversed"), xaxis_title="Count", yaxis_title="",
+        title=f"Top {top_n} Words",
+        height=max(400, top_n * 28),
+        yaxis=dict(autorange="reversed"),
+        xaxis_title="Frequency",
     )
 
-    wc = WordCloud(
-        width=1000, height=500, background_color="white",
-        colormap="viridis", max_words=120, min_font_size=10, prefer_horizontal=0.7,
-    ).generate_from_frequencies(freq)
+    wc = WordCloud(width=1200, height=600, background_color="white",
+                   max_words=200, colormap="viridis",
+                   prefer_horizontal=0.7)
+    wc.generate_from_frequencies(freq)
 
     fig_wc, ax = plt.subplots(figsize=(12, 6))
     ax.imshow(wc, interpolation="bilinear")
@@ -1843,69 +1683,61 @@ def transcript_analyzer_view():
             k3.metric("P(Neutral)", f"{overall['p_neutral']:.1f}%")
             k4.metric("P(Positive)", f"{overall['p_positive']:.1f}%")
 
-            fig_donut = go.Figure(go.Pie(
-                labels=["Negative", "Neutral", "Positive"],
-                values=[overall["p_negative"], overall["p_neutral"], overall["p_positive"]],
-                hole=0.5,
-                marker=dict(colors=["#e74c3c", "#f39c12", "#2ecc71"]),
-                textinfo="label+value+percent",
-            ))
-            fig_donut.update_layout(
-                title="Probability Distribution", height=380, showlegend=False,
-                annotations=[dict(text=f"{ov_score:+.1f}%", x=0.5, y=0.5,
-                                  font_size=24, font_color=ov_color, showarrow=False)],
-            )
+            if mode == "full":
+                st.markdown("---")
+                st.subheader("Full Text Analysis")
+                st.markdown(transcript)
+            else:
+                if mode == "paragraph":
+                    raw_chunks = [p.strip() for p in transcript.split("\n\n") if p.strip()]
+                    unit_name = "Paragraph"
+                else:
+                    from nltk.tokenize import sent_tokenize
+                    raw_chunks = sent_tokenize(transcript)
+                    unit_name = "Sentence"
 
-            if mode != "full":
-                chunks = roberta_score_chunks(transcript, chunk_mode=mode)
+                chunks = []
+                for chunk_text in raw_chunks:
+                    result = roberta_score_text(chunk_text)
+                    result["full_text"] = chunk_text
+                    chunks.append(result)
 
-                if chunks:
-                    valid_chunks = [c for c in chunks if c["score"] is not None]
-                    scores = [c["score"] for c in valid_chunks]
+                scores = [c["score"] for c in chunks if c["score"] is not None]
 
+                if scores:
                     st.markdown("---")
-                    unit_name = "Paragraph" if mode == "paragraph" else "Sentence"
-                    st.subheader(unit_name + "-Level Breakdown (" + str(len(chunks)) + " " + unit_name.lower() + "s)")
+                    st.subheader(unit_name + "-Level Sentiment")
 
-                    if scores:
-                        pos_count = sum(1 for s in scores if s >= 20)
-                        neu_count = sum(1 for s in scores if -20 < s < 20)
-                        neg_count = sum(1 for s in scores if s <= -20)
-                        avg_score = round(np.mean(scores), 1)
+                    fig_donut = render_sentiment_donut(
+                        {"positive": sum(1 for s in scores if s >= 20),
+                         "neutral": sum(1 for s in scores if -20 < s < 20),
+                         "negative": sum(1 for s in scores if s <= -20)},
+                        unit_name + " Sentiment Split"
+                    )
 
-                        s1, s2, s3, s4, s5 = st.columns(5)
-                        s1.metric("Avg " + unit_name + " Score", f"{avg_score:+.1f}%")
-                        s2.metric("Total " + unit_name + "s", len(chunks))
-                        s3.metric("Positive", pos_count)
-                        s4.metric("Neutral", neu_count)
-                        s5.metric("Negative", neg_count)
-
-                    col_donut, col_bar = st.columns(2)
-                    with col_donut:
-                        st.plotly_chart(fig_donut, use_container_width=True)
-                    with col_bar:
-                        if scores:
-                            bar_colors = [sentiment_color(s) for s in scores]
-                            bar_labels = [unit_name[0] + str(i + 1) for i in range(len(scores))]
-                            fig_bar = go.Figure(go.Bar(
-                                x=bar_labels, y=scores,
-                                marker_color=bar_colors,
-                                text=[f"{s:+.1f}%" for s in scores],
-                                textposition="outside",
-                            ))
-                            fig_bar.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-                            fig_bar.add_hline(y=20, line_dash="dot", line_color="#2ecc71", opacity=0.3)
-                            fig_bar.add_hline(y=-20, line_dash="dot", line_color="#e74c3c", opacity=0.3)
-                            fig_bar.update_layout(
-                                title="Sentiment by " + unit_name,
-                                height=350,
-                                yaxis_title="Sentiment Score (%)",
-                                yaxis=dict(range=[
-                                    min(-60, min(scores) - 15),
-                                    max(60, max(scores) + 15),
-                                ]),
-                            )
-                            st.plotly_chart(fig_bar, use_container_width=True)
+                    col_bar_ta, col_donut_ta = st.columns(2)
+                    with col_bar_ta:
+                        colors = [sentiment_color(s) for s in scores]
+                        fig_bar = go.Figure(go.Bar(
+                            x=[unit_name + " " + str(i + 1) for i in range(len(scores))],
+                            y=scores,
+                            marker_color=colors,
+                            text=[f"{s:+.1f}%" for s in scores],
+                            textposition="outside",
+                        ))
+                        fig_bar.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+                        fig_bar.add_hline(y=20, line_dash="dot", line_color="#2ecc71", opacity=0.3)
+                        fig_bar.add_hline(y=-20, line_dash="dot", line_color="#e74c3c", opacity=0.3)
+                        fig_bar.update_layout(
+                            title="Sentiment by " + unit_name,
+                            height=350,
+                            yaxis_title="Sentiment Score (%)",
+                            yaxis=dict(range=[
+                                min(-60, min(scores) - 15),
+                                max(60, max(scores) + 15),
+                            ]),
+                        )
+                        st.plotly_chart(fig_bar, use_container_width=True)
 
                     if len(scores) > 1:
                         st.markdown("---")
@@ -1943,7 +1775,7 @@ def transcript_analyzer_view():
                         c_label = chunk["label"]
                         c_color = sentiment_color(c_score) if c_score is not None else "#999"
                         with st.expander(unit_name + " " + str(i + 1) + " — " + c_label +
-                                          (" (" + f"{c_score:+.1f}%" + ")" if c_score is not None else "")):
+                                        (" (" + f"{c_score:+.1f}%" + ")" if c_score is not None else "")):
                             st.markdown(chunk["full_text"])
                             if c_score is not None:
                                 st.caption(
@@ -1952,8 +1784,69 @@ def transcript_analyzer_view():
                                     f"P(neu): {chunk['p_neutral']:.1f}% | "
                                     f"P(pos): {chunk['p_positive']:.1f}%"
                                 )
-            else:
-                st.plotly_chart(fig_donut, use_container_width=True)
+                else:
+                    st.plotly_chart(fig_donut, use_container_width=True)
+
+
+@st.cache_resource
+def _load_roberta_onnx():
+    """Load RoBERTa ONNX model and tokenizer."""
+    try:
+        from transformers import AutoTokenizer
+        import onnxruntime as ort
+        import os
+
+        model_name = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        onnx_path = "roberta_sentiment.onnx"
+        if not os.path.exists(onnx_path):
+            from optimum.onnxruntime import ORTModelForSequenceClassification
+            model = ORTModelForSequenceClassification.from_pretrained(model_name, export=True)
+            model.save_pretrained(".")
+            if os.path.exists("model.onnx"):
+                os.rename("model.onnx", onnx_path)
+
+        session = ort.InferenceSession(onnx_path)
+        return tokenizer, session
+    except Exception as e:
+        st.error(f"Failed to load RoBERTa ONNX: {e}")
+        return None, None
+
+
+def roberta_score_text(text):
+    """Score a piece of text using RoBERTa ONNX. Returns dict with score, label, probabilities."""
+    default = {"score": None, "label": "Unknown", "p_negative": 0, "p_neutral": 0, "p_positive": 0}
+    if not isinstance(text, str) or not text.strip():
+        return default
+
+    tokenizer, session = _load_roberta_onnx()
+    if tokenizer is None or session is None:
+        return default
+
+    try:
+        inputs = tokenizer(text, return_tensors="np", truncation=True, max_length=512)
+        input_feed = {k: v for k, v in inputs.items() if k in [inp.name for inp in session.get_inputs()]}
+        outputs = session.run(None, input_feed)
+        logits = outputs[0][0]
+
+        from scipy.special import softmax
+        probs = softmax(logits)
+
+        p_neg = float(probs[0]) * 100
+        p_neu = float(probs[1]) * 100
+        p_pos = float(probs[2]) * 100
+        score = p_pos - p_neg
+
+        return {
+            "score": round(score, 1),
+            "label": sentiment_label(score),
+            "p_negative": round(p_neg, 1),
+            "p_neutral": round(p_neu, 1),
+            "p_positive": round(p_pos, 1),
+        }
+    except Exception:
+        return default
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2098,25 +1991,25 @@ def main():
 
         kpi_row(kd)
 
-        # ── TODAY'S SENTIMENT KPI ────────────────────────────────────
+        # ── TODAY'S SENTIMENT KPI ────────────────────────────────
         if not today_df.empty:
             today_stats = get_sentiment_stats(today_df)
             if today_stats:
                 st.markdown("---")
                 render_sentiment_kpi(today_stats, title="Today's Feedback Sentiment")
 
-        # ── TODAY'S START TIME INSIGHTS ──────────────────────────────
+        # ── TODAY'S START TIME INSIGHTS ──────────────────────────
         if selected_support == "Interview Support" and not today_df.empty and "start_hour" in today_df.columns:
             st.markdown("---")
             render_start_time_insights(today_df, title_suffix=" - " + str(today))
 
-        # ── TODAY'S CLASH DETECTION ──────────────────────────────────
+        # ── TODAY'S CLASH DETECTION ──────────────────────────────
         if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
             st.markdown("---")
             st.subheader("Scheduling Clashes - " + str(today))
             render_today_clash_summary(today_df)
 
-        # ── TODAY'S BLOCKAGE DETECTION ───────────────────────────────
+        # ── TODAY'S BLOCKAGE DETECTION ───────────────────────────
         if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
             st.markdown("---")
             st.subheader("Blockage Indicator - " + str(today))
@@ -2146,11 +2039,11 @@ def main():
                 st.subheader("Round Breakdown - " + str(today))
                 round_charts(today_df, " - " + str(today))
 
-            # ── SENTIMENT DONUT + HISTOGRAM — TODAY ──────────────────
+            # ── SENTIMENT DONUT + HISTOGRAM — TODAY ──────────────
             st.markdown("---")
             render_sentiment_section(today_df, section_title="Sentiment Analysis - " + str(today))
 
-            # ── FEEDBACK WORD CLOUD — TODAY ──────────────────────────
+            # ── FEEDBACK WORD CLOUD — TODAY ──────────────────────
             st.markdown("---")
             feedback_texts = extract_feedback_texts(today_df)
             render_wordcloud_section(
@@ -2161,7 +2054,7 @@ def main():
             with st.expander("Raw Data (includes Sentiment Score)"):
                 st.dataframe(today_df, use_container_width=True, height=400)
 
-        # ── ABOUT TO MOVE TO MARKET ──────────────────────────────────
+        # ── ABOUT TO MOVE TO MARKET ──────────────────────────────
         st.markdown("---")
         st.subheader("About to Move to Market")
         st.caption("Resume Understanding candidates with pending status — ready to enter the market")
@@ -2203,8 +2096,8 @@ def main():
 
                 with st.expander("Full List - About to Move to Market"):
                     display_cols = [c for c in ["candidate_name", "expert_name",
-                                                 "candidate_technology", "date", "task_status"]
-                                    if c in market_df.columns]
+                                                "candidate_technology", "date", "task_status"]
+                                   if c in market_df.columns]
                     st.dataframe(market_df[display_cols] if display_cols else market_df,
                                  use_container_width=True, height=400)
             else:
@@ -2237,7 +2130,7 @@ def main():
         c[4].metric("Pending", int(latest["pending"]))
         c[5].metric("Candidates", int(latest["candidates"]))
 
-        # ── CURRENT MONTH SENTIMENT KPI ──────────────────────────────
+        # ── CURRENT MONTH SENTIMENT KPI ──────────────────────────
         current_month_data = support_df[support_df["date"].dt.to_period("M").astype(str) == current_month_str]
         if not current_month_data.empty:
             cm_stats = get_sentiment_stats(current_month_data)
@@ -2269,7 +2162,7 @@ def main():
 
         st.plotly_chart(trend_line(monthly, "total", "Total " + support_label + " per Month", "#8e44ad"), use_container_width=True)
 
-        # ── START TIME INSIGHTS — OVERALL ────────────────────────────
+        # ── START TIME INSIGHTS — OVERALL ────────────────────────
         if selected_support == "Interview Support" and "start_hour" in support_df.columns:
             st.markdown("---")
             render_start_time_insights(support_df, title_suffix=" - All Months")
@@ -2277,17 +2170,17 @@ def main():
             st.markdown("---")
             render_monthly_start_time_trend(support_df, title_suffix=" - " + support_label)
 
-        # ── CLASH DETECTION — OVERALL ────────────────────────────────
+        # ── CLASH DETECTION — OVERALL ────────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
             st.markdown("---")
             render_clash_summary(support_df, title_suffix=" - All Months")
 
-        # ── BLOCKAGE ANALYSIS — OVERALL ──────────────────────────────
+        # ── BLOCKAGE ANALYSIS — OVERALL ──────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
             st.markdown("---")
             render_blockage_summary(support_df, title_suffix=" - All Months")
 
-        # ── MONTHLY SENTIMENT TRENDS ─────────────────────────────────
+        # ── MONTHLY SENTIMENT TRENDS ─────────────────────────────
         st.markdown("---")
         st.subheader("Monthly Sentiment Trends")
         sent_monthly = monthly_sentiment_trend(support_df)
@@ -2306,7 +2199,7 @@ def main():
         else:
             st.info("No sentiment data available for trend analysis.")
 
-        # ── MONTHLY (Interview Support Only) ─────────────────────────
+        # ── MONTHLY (Interview Support Only) ─────────────────────
         if selected_support == "Interview Support":
             st.markdown("---")
             st.subheader("Round-wise Monthly Breakdown")
@@ -2331,7 +2224,7 @@ def main():
                 me = month_exp[month_exp["month"] == sel_m2].sort_values("total", ascending=False)
                 st.dataframe(me, use_container_width=True)
 
-        # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────────
+        # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────
         st.markdown("---")
         st.subheader("Candidate-wise Monthly Counts (All Support Types)")
         cand_monthly = candidate_monthly_support(active_expert_df)
@@ -2365,7 +2258,7 @@ def main():
             kd["candidates"] = period["candidate_name"].nunique()
             kpi_row(kd)
 
-            # ── PERIOD SENTIMENT KPI ─────────────────────────────────
+            # ── PERIOD SENTIMENT KPI ─────────────────────────────
             period_stats = get_sentiment_stats(period)
             if period_stats:
                 render_sentiment_kpi(period_stats,
@@ -2382,7 +2275,7 @@ def main():
 
             st.plotly_chart(stacked_bar(dd_plot, x="day", title="Daily Stacked View"), use_container_width=True)
 
-            # ── DAILY SENTIMENT TREND LINE ───────────────────────────
+            # ── DAILY SENTIMENT TREND LINE ───────────────────────
             daily_sent = daily_sentiment_agg(period)
             if not daily_sent.empty:
                 st.markdown("---")
@@ -2432,7 +2325,7 @@ def main():
             kd2["candidates"] = sdf["candidate_name"].nunique()
             kpi_row(kd2)
 
-            # ── SINGLE DAY SENTIMENT KPI ─────────────────────────────
+            # ── SINGLE DAY SENTIMENT KPI ─────────────────────────
             single_stats = get_sentiment_stats(sdf)
             if single_stats:
                 render_sentiment_kpi(single_stats, title="Sentiment - " + str(single))
@@ -2455,7 +2348,7 @@ def main():
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
 
-            # ── SINGLE DAY SENTIMENT DONUT + HISTOGRAM ───────────────
+            # ── SINGLE DAY SENTIMENT DONUT + HISTOGRAM ───────────
             if single_stats:
                 st.markdown("---")
                 col_d, col_h = st.columns(2)
@@ -2610,19 +2503,19 @@ def main():
             else:
                 st.info("No technology column found.")
 
-        # ── START TIME ANALYSIS TAB ──────────────────────────────────
+        # ── START TIME ANALYSIS TAB ──────────────────────────────
         if selected_support == "Interview Support" and "start_hour" in support_df.columns and "Start Time" in tab_names:
             with tabs[tab_names.index("Start Time")]:
                 render_start_time_insights(support_df, title_suffix=" - All Data")
                 st.markdown("---")
                 render_monthly_start_time_trend(support_df, title_suffix="")
 
-        # ── CLASH DETECTION TAB ──────────────────────────────────────
+        # ── CLASH DETECTION TAB ──────────────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns and "Clash Detection" in tab_names:
             with tabs[tab_names.index("Clash Detection")]:
                 render_clash_summary(support_df, title_suffix=" - All Data")
 
-        # ── BLOCKAGE TAB ─────────────────────────────────────────────
+        # ── BLOCKAGE TAB ─────────────────────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns and "Blockage" in tab_names:
             with tabs[tab_names.index("Blockage")]:
                 render_blockage_summary(support_df, title_suffix=" - All Data")
