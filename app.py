@@ -329,7 +329,7 @@ def daily_sentiment_agg(df):
 # ═══════════════════════════════════════════════════════════════════
 
 def add_start_time_columns(df):
-    """Add start_hour and start_hour_label columns.
+    """Add start_hour, start_hour_label, and _parsed_start columns.
     Modifies df in-place and returns it."""
     if "start_time" not in df.columns:
         return df
@@ -502,185 +502,460 @@ def render_monthly_start_time_trend(df, title_suffix=""):
 # ═══════════════════════════════════════════════════════════════════
 #  SCHEDULING CLASH DETECTION
 #  Rule: same expert, same day, 2+ interviews within 30-min window
-#  A clash = any pair where |start_time_A - start_time_B| <= 30 min
+#  A clash GROUP = cluster of interviews where each is within 30 min
+#  of at least one other in the group (connected component).
+#  A "2-interview clash" means exactly 2 interviews overlap.
+#  A "3-interview clash" means 3 interviews form a connected group.
 # ═══════════════════════════════════════════════════════════════════
 
-def detect_expert_clashes(df):
-    """Detect scheduling clashes for experts.
+def _build_clash_groups(minutes_list):
+    """Given a sorted list of (index, minutes) tuples, find connected
+    components where any two nodes within 30 min are connected.
+    Returns list of groups (each group = list of (index, minutes))."""
+    if len(minutes_list) < 2:
+        return []
+    # Build adjacency
+    n = len(minutes_list)
+    adj = {i: set() for i in range(n)}
+    for i in range(n):
+        for j in range(i + 1, n):
+            if abs(minutes_list[j][1] - minutes_list[i][1]) <= 30:
+                adj[i].add(j)
+                adj[j].add(i)
+    # Find connected components via BFS
+    visited = set()
+    groups = []
+    for i in range(n):
+        if i in visited or not adj[i]:
+            continue
+        component = []
+        queue = [i]
+        while queue:
+            node = queue.pop(0)
+            if node in visited:
+                continue
+            visited.add(node)
+            component.append(minutes_list[node])
+            for nb in adj[node]:
+                if nb not in visited:
+                    queue.append(nb)
+        if len(component) >= 2:
+            groups.append(component)
+    return groups
 
-    Returns a DataFrame of clash pairs with columns:
-        expert_name, date, start_time_1, start_time_2,
-        time_diff_min, month
-    Each row represents one clashing pair of interviews.
+
+def detect_expert_clashes(df):
+    """Detect scheduling clash GROUPS for experts.
+
+    Returns two DataFrames:
+      1) clash_groups_df — one row per clash group:
+           expert_name, date, month, group_size, interviews_str,
+           mean_start_minutes, mean_start_label, start_times_list
+      2) clash_pairs_df — one row per pair within a group:
+           expert_name, date, month, start_time_1, start_time_2, time_diff_min
     """
+    empty_groups = pd.DataFrame()
+    empty_pairs = pd.DataFrame()
+
     if "_parsed_start" not in df.columns or "expert_name" not in df.columns or "date" not in df.columns:
-        return pd.DataFrame()
+        return empty_groups, empty_pairs
 
     valid = df.dropna(subset=["_parsed_start", "expert_name", "date"]).copy()
     if valid.empty:
-        return pd.DataFrame()
+        return empty_groups, empty_pairs
 
     valid["_day"] = valid["date"].dt.date
-    # Extract time-of-day as total minutes since midnight for comparison
     valid["_start_minutes"] = valid["_parsed_start"].dt.hour * 60 + valid["_parsed_start"].dt.minute
 
-    clash_rows = []
+    group_rows = []
+    pair_rows = []
+
     for (expert, day), grp in valid.groupby(["expert_name", "_day"]):
         if len(grp) < 2:
             continue
         sorted_grp = grp.sort_values("_start_minutes")
-        minutes_list = sorted_grp["_start_minutes"].values
-        times_list = sorted_grp["_parsed_start"].dt.strftime("%I:%M %p").values
-        indices = sorted_grp.index.values
+        minutes_indexed = list(enumerate(zip(
+            sorted_grp["_start_minutes"].values,
+            sorted_grp["_parsed_start"].dt.strftime("%I:%M %p").values
+        )))
+        # Flatten to (original_pos, minutes)
+        minutes_list = [(i, int(m)) for i, (m, _) in minutes_indexed]
+        time_labels = {i: lbl for i, (_, lbl) in minutes_indexed}
 
-        # Check all pairs (since group is typically small)
-        for i in range(len(sorted_grp)):
-            for j in range(i + 1, len(sorted_grp)):
-                diff = abs(int(minutes_list[j]) - int(minutes_list[i]))
-                if diff <= 30:
-                    clash_rows.append({
-                        "expert_name": expert,
-                        "date": day,
-                        "start_time_1": times_list[i],
-                        "start_time_2": times_list[j],
-                        "time_diff_min": diff,
-                    })
+        groups = _build_clash_groups(minutes_list)
 
-    if not clash_rows:
-        return pd.DataFrame()
+        for group in groups:
+            size = len(group)
+            times = [time_labels[idx] for idx, _ in group]
+            mins_vals = [m for _, m in group]
+            mean_min = sum(mins_vals) / len(mins_vals)
+            mean_h = int(mean_min // 60)
+            mean_m = int(mean_min % 60)
+            mean_label = datetime(2000, 1, 1, mean_h, mean_m).strftime("%I:%M %p")
 
-    clash_df = pd.DataFrame(clash_rows)
-    clash_df["date"] = pd.to_datetime(clash_df["date"])
-    clash_df["month"] = clash_df["date"].dt.to_period("M").astype(str)
-    return clash_df
+            group_rows.append({
+                "expert_name": expert,
+                "date": day,
+                "group_size": size,
+                "interviews_str": ", ".join(times),
+                "mean_start_minutes": round(mean_min, 1),
+                "mean_start_label": mean_label,
+                "start_times_list": times,
+            })
+
+            # Generate all pairs within this group
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    diff = abs(group[j][1] - group[i][1])
+                    if diff <= 30:
+                        pair_rows.append({
+                            "expert_name": expert,
+                            "date": day,
+                            "start_time_1": time_labels[group[i][0]],
+                            "start_time_2": time_labels[group[j][0]],
+                            "time_diff_min": diff,
+                        })
+
+    if not group_rows:
+        return empty_groups, empty_pairs
+
+    clash_groups_df = pd.DataFrame(group_rows)
+    clash_groups_df["date"] = pd.to_datetime(clash_groups_df["date"])
+    clash_groups_df["month"] = clash_groups_df["date"].dt.to_period("M").astype(str)
+
+    clash_pairs_df = pd.DataFrame(pair_rows) if pair_rows else empty_pairs
+    if not clash_pairs_df.empty:
+        clash_pairs_df["date"] = pd.to_datetime(clash_pairs_df["date"])
+        clash_pairs_df["month"] = clash_pairs_df["date"].dt.to_period("M").astype(str)
+
+    return clash_groups_df, clash_pairs_df
+
+
+def _mean_start_label_from_minutes(minutes_val):
+    """Convert float minutes-since-midnight to HH:MM AM/PM label."""
+    h = int(minutes_val // 60) % 24
+    m = int(minutes_val % 60)
+    return datetime(2000, 1, 1, h, m).strftime("%I:%M %p")
 
 
 def render_clash_summary(df, title_suffix=""):
-    """Render the Scheduling Clash Summary section.
-    df should be the Interview Support dataframe with _parsed_start column.
-    """
-    clash_df = detect_expert_clashes(df)
+    """Render the full Scheduling Clash Summary section."""
+    clash_groups, clash_pairs = detect_expert_clashes(df)
 
     st.subheader("Scheduling Clash Detection" + title_suffix)
-    st.caption("A clash occurs when the same expert has 2+ interviews within a 30-minute window on the same day.")
+    st.caption(
+        "A clash occurs when the same expert has 2+ interviews within a "
+        "30-minute window on the same day. A '3-interview clash' means 3 "
+        "interviews form a connected overlap group."
+    )
 
-    if clash_df.empty:
+    if clash_groups.empty:
         st.success("No scheduling clashes detected" + title_suffix + ".")
         return
 
     # ── KPI row ──────────────────────────────────────────────────
-    total_clash_pairs = len(clash_df)
-    experts_with_clashes = clash_df["expert_name"].nunique()
-    days_with_clashes = clash_df["date"].dt.date.nunique()
-    # Count total interviews involved in clashes (unique times per expert per day)
-    interviews_in_clashes = 0
-    for (expert, day), grp in clash_df.groupby(["expert_name", clash_df["date"].dt.date]):
-        unique_times = set(grp["start_time_1"].tolist() + grp["start_time_2"].tolist())
-        interviews_in_clashes += len(unique_times)
+    total_groups = len(clash_groups)
+    total_interviews_in_clashes = int(clash_groups["group_size"].sum())
+    experts_with_clashes = clash_groups["expert_name"].nunique()
+    days_with_clashes = clash_groups["date"].dt.date.nunique()
+    overall_mean_min = clash_groups["mean_start_minutes"].mean()
+    overall_mean_label = _mean_start_label_from_minutes(overall_mean_min)
 
-    k = st.columns(4)
-    k[0].metric("Clash Pairs", total_clash_pairs)
-    k[1].metric("Experts with Clashes", experts_with_clashes)
-    k[2].metric("Days with Clashes", days_with_clashes)
-    k[3].metric("Interviews in Clashes", interviews_in_clashes)
+    k = st.columns(5)
+    k[0].metric("Clash Groups", total_groups)
+    k[1].metric("Interviews in Clashes", total_interviews_in_clashes)
+    k[2].metric("Experts with Clashes", experts_with_clashes)
+    k[3].metric("Days with Clashes", days_with_clashes)
+    k[4].metric("Mean Clash Start Time", overall_mean_label)
 
-    # ── Expert-wise clash summary ────────────────────────────────
-    expert_clash = clash_df.groupby("expert_name").agg(
-        clash_pairs=("expert_name", "size"),
-        clash_days=("date", lambda x: x.dt.date.nunique()),
-    ).reset_index().sort_values("clash_pairs", ascending=False)
+    # ── Clash Size Distribution (2-way, 3-way, 4-way+) ──────────
+    st.markdown("---")
+    st.subheader("Clash Size Distribution" + title_suffix)
+    st.caption("How many interviews overlap in each clash group")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        fig = go.Figure(go.Bar(
-            y=expert_clash["expert_name"],
-            x=expert_clash["clash_pairs"],
+    size_counts = clash_groups["group_size"].value_counts().sort_index()
+    size_labels = [str(s) + "-Interview Clash" for s in size_counts.index]
+    size_colors = ["#f39c12" if s == 2 else "#e74c3c" if s == 3 else "#8e44ad"
+                   for s in size_counts.index]
+
+    col_size1, col_size2 = st.columns(2)
+    with col_size1:
+        fig_size = go.Figure(go.Bar(
+            x=size_labels, y=size_counts.values,
+            marker_color=size_colors,
+            text=size_counts.values, textposition="outside",
+        ))
+        fig_size.update_layout(
+            title="Overall Clash Size Distribution",
+            height=400,
+            xaxis_title="Clash Type",
+            yaxis_title="Number of Clash Groups",
+        )
+        st.plotly_chart(fig_size, use_container_width=True)
+
+    with col_size2:
+        fig_pie = go.Figure(go.Pie(
+            labels=size_labels, values=size_counts.values.tolist(),
+            hole=0.45,
+            marker=dict(colors=size_colors),
+            textinfo="label+value+percent",
+        ))
+        fig_pie.update_layout(title="Clash Size Split", height=400, showlegend=False)
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    # ── Expert-wise Clash Size Breakdown ─────────────────────────
+    st.markdown("---")
+    st.subheader("Expert-wise Clash Breakdown" + title_suffix)
+
+    expert_size = clash_groups.groupby(["expert_name", "group_size"]).size().reset_index(name="count")
+    expert_size["size_label"] = expert_size["group_size"].apply(lambda s: str(s) + "-Interview")
+
+    expert_totals = expert_size.groupby("expert_name")["count"].sum().sort_values(ascending=False)
+    top_experts = expert_totals.head(20).index.tolist()
+    expert_size_top = expert_size[expert_size["expert_name"].isin(top_experts)]
+
+    col_e1, col_e2 = st.columns(2)
+    with col_e1:
+        # Stacked bar: experts x clash sizes
+        pivot_es = expert_size_top.pivot_table(
+            index="expert_name", columns="size_label", values="count", fill_value=0
+        )
+        # Sort by total
+        pivot_es["_total"] = pivot_es.sum(axis=1)
+        pivot_es = pivot_es.sort_values("_total", ascending=True).drop(columns="_total")
+
+        fig_es = go.Figure()
+        color_map = {"2-Interview": "#f39c12", "3-Interview": "#e74c3c",
+                     "4-Interview": "#8e44ad", "5-Interview": "#2c3e50"}
+        for col_name in sorted(pivot_es.columns):
+            clr = color_map.get(col_name, "#95a5a6")
+            fig_es.add_trace(go.Bar(
+                y=pivot_es.index, x=pivot_es[col_name],
+                name=col_name, orientation="h",
+                marker_color=clr,
+                text=pivot_es[col_name], textposition="inside",
+            ))
+        fig_es.update_layout(
+            barmode="stack",
+            title="Clash Groups by Expert & Size",
+            height=max(420, len(top_experts) * 35),
+            xaxis_title="Clash Groups",
+            legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
+        )
+        st.plotly_chart(fig_es, use_container_width=True)
+
+    with col_e2:
+        # Expert total clashes + total interviews in clashes
+        expert_agg = clash_groups.groupby("expert_name").agg(
+            clash_groups_count=("group_size", "size"),
+            total_interviews=("group_size", "sum"),
+            clash_days=("date", lambda x: x.dt.date.nunique()),
+            mean_start=("mean_start_minutes", "mean"),
+        ).reset_index().sort_values("clash_groups_count", ascending=False)
+        expert_agg["mean_start_label"] = expert_agg["mean_start"].apply(_mean_start_label_from_minutes)
+
+        fig_e2 = go.Figure()
+        fig_e2.add_trace(go.Bar(
+            y=expert_agg["expert_name"].head(15),
+            x=expert_agg["clash_groups_count"].head(15),
             orientation="h",
             marker_color="#e74c3c",
-            text=expert_clash["clash_pairs"],
+            text=expert_agg["clash_groups_count"].head(15),
             textposition="outside",
+            name="Clash Groups",
         ))
-        fig.update_layout(
-            title="Clash Pairs by Expert" + title_suffix,
-            height=max(400, len(expert_clash) * 35),
+        fig_e2.update_layout(
+            title="Top 15 Experts by Clash Groups",
+            height=max(420, 15 * 35),
             yaxis=dict(autorange="reversed"),
-            xaxis_title="Number of Clash Pairs",
+            xaxis_title="Clash Groups",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig_e2, use_container_width=True)
 
-    with col2:
-        # Monthly clash trend
-        monthly_clash = clash_df.groupby("month").agg(
-            clash_pairs=("month", "size"),
-            experts=("expert_name", "nunique"),
-        ).reset_index()
+    # ── Monthly Clash Trend with Size Breakdown ──────────────────
+    st.markdown("---")
+    st.subheader("Monthly Clash Trends" + title_suffix)
 
-        fig2 = go.Figure()
-        fig2.add_trace(go.Bar(
-            x=monthly_clash["month"],
-            y=monthly_clash["clash_pairs"],
-            marker_color="#e74c3c",
-            text=monthly_clash["clash_pairs"],
-            textposition="outside",
-            name="Clash Pairs",
-        ))
-        fig2.add_trace(go.Scatter(
-            x=monthly_clash["month"],
-            y=monthly_clash["experts"],
-            mode="lines+markers+text",
-            text=monthly_clash["experts"],
-            textposition="top center",
-            line=dict(color="#f39c12", width=2),
-            marker=dict(size=8),
-            name="Experts Affected",
-            yaxis="y2",
-        ))
-        fig2.update_layout(
-            title="Monthly Clash Trend" + title_suffix,
+    monthly_size = clash_groups.groupby(["month", "group_size"]).size().reset_index(name="count")
+    monthly_size["size_label"] = monthly_size["group_size"].apply(lambda s: str(s) + "-Interview")
+
+    pivot_ms = monthly_size.pivot_table(
+        index="month", columns="size_label", values="count", fill_value=0
+    ).reset_index()
+
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        fig_ms = go.Figure()
+        for col_name in sorted([c for c in pivot_ms.columns if c != "month"]):
+            clr = color_map.get(col_name, "#95a5a6")
+            fig_ms.add_trace(go.Bar(
+                x=pivot_ms["month"], y=pivot_ms[col_name],
+                name=col_name, marker_color=clr,
+                text=pivot_ms[col_name], textposition="inside",
+            ))
+        fig_ms.update_layout(
+            barmode="stack",
+            title="Monthly Clash Groups by Size",
             height=420,
-            yaxis=dict(title="Clash Pairs"),
-            yaxis2=dict(title="Experts Affected", overlaying="y", side="right"),
-            legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
+            yaxis_title="Clash Groups",
+            legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig_ms, use_container_width=True)
 
-    # ── Expert-wise clash table ──────────────────────────────────
+    with col_m2:
+        # Monthly mean clash start time
+        monthly_mean = clash_groups.groupby("month").agg(
+            clash_groups_count=("group_size", "size"),
+            mean_start=("mean_start_minutes", "mean"),
+        ).reset_index()
+        monthly_mean["mean_start_label"] = monthly_mean["mean_start"].apply(
+            _mean_start_label_from_minutes
+        )
+        monthly_mean["mean_start_hour"] = (monthly_mean["mean_start"] / 60).round(2)
+
+        fig_mm = go.Figure()
+        fig_mm.add_trace(go.Scatter(
+            x=monthly_mean["month"],
+            y=monthly_mean["mean_start_hour"],
+            mode="lines+markers+text",
+            text=monthly_mean["mean_start_label"],
+            textposition="top center",
+            line=dict(color="#e74c3c", width=3),
+            marker=dict(size=10),
+        ))
+        fig_mm.update_layout(
+            title="Mean Clash Start Time by Month",
+            height=420,
+            xaxis_title="Month",
+            yaxis_title="Hour of Day (24h)",
+            yaxis=dict(range=[
+                max(0, monthly_mean["mean_start_hour"].min() - 2),
+                min(24, monthly_mean["mean_start_hour"].max() + 2),
+            ]),
+        )
+        st.plotly_chart(fig_mm, use_container_width=True)
+
+    # ── Clash Time-of-Day Distribution ───────────────────────────
+    st.markdown("---")
+    st.subheader("Clash Time-of-Day Distribution" + title_suffix)
+    st.caption("Which hours of the day do clashes most frequently occur?")
+
+    clash_hours = (clash_groups["mean_start_minutes"] // 60).astype(int)
+    hour_clash_counts = clash_hours.value_counts().sort_index()
+
+    all_hours = list(range(0, 24))
+    hour_labels_clash = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0") for h in all_hours]
+    counts_clash = [int(hour_clash_counts.get(h, 0)) for h in all_hours]
+    peak_clash_h = int(hour_clash_counts.idxmax()) if not hour_clash_counts.empty else 0
+    bar_colors_clash = ["#e74c3c" if h == peak_clash_h else "#f39c12" for h in all_hours]
+
+    fig_hour = go.Figure(go.Bar(
+        x=hour_labels_clash, y=counts_clash,
+        marker_color=bar_colors_clash,
+        text=counts_clash, textposition="outside",
+    ))
+    fig_hour.update_layout(
+        title="Clash Groups by Hour of Day" + title_suffix,
+        height=420,
+        xaxis_title="Hour of Day",
+        yaxis_title="Clash Groups",
+        xaxis=dict(tickangle=-45),
+    )
+    st.plotly_chart(fig_hour, use_container_width=True)
+
+    # ── Expert-wise summary table ────────────────────────────────
     with st.expander("Expert Clash Summary Table" + title_suffix):
-        st.dataframe(expert_clash, use_container_width=True, hide_index=True)
+        expert_agg_display = expert_agg.copy()
+        expert_agg_display = expert_agg_display[["expert_name", "clash_groups_count",
+                                                  "total_interviews", "clash_days",
+                                                  "mean_start_label"]]
+        expert_agg_display.columns = ["Expert", "Clash Groups", "Interviews in Clashes",
+                                       "Days with Clashes", "Mean Clash Start Time"]
+        st.dataframe(expert_agg_display, use_container_width=True, hide_index=True)
 
-    # ── Detailed clash pairs ─────────────────────────────────────
-    with st.expander("Detailed Clash Pairs" + title_suffix):
-        display_clash = clash_df.copy()
-        display_clash["date"] = display_clash["date"].dt.strftime("%Y-%m-%d")
+    # ── Monthly summary table ────────────────────────────────────
+    with st.expander("Monthly Clash Summary" + title_suffix):
+        monthly_table = clash_groups.groupby("month").agg(
+            clash_groups_count=("group_size", "size"),
+            total_interviews=("group_size", "sum"),
+            experts=("expert_name", "nunique"),
+            mean_start=("mean_start_minutes", "mean"),
+        ).reset_index()
+        monthly_table["mean_start_label"] = monthly_table["mean_start"].apply(
+            _mean_start_label_from_minutes
+        )
+        monthly_table.columns = ["Month", "Clash Groups", "Interviews in Clashes",
+                                  "Experts Affected", "Mean Start (min)", "Mean Clash Start Time"]
+        st.dataframe(monthly_table[["Month", "Clash Groups", "Interviews in Clashes",
+                                     "Experts Affected", "Mean Clash Start Time"]],
+                     use_container_width=True, hide_index=True)
+
+    # ── Detailed clash groups ────────────────────────────────────
+    with st.expander("Detailed Clash Groups" + title_suffix):
+        display_groups = clash_groups.copy()
+        display_groups["date"] = display_groups["date"].dt.strftime("%Y-%m-%d")
         st.dataframe(
-            display_clash[["expert_name", "date", "start_time_1", "start_time_2", "time_diff_min", "month"]],
+            display_groups[["expert_name", "date", "group_size", "interviews_str",
+                            "mean_start_label", "month"]].rename(columns={
+                "expert_name": "Expert",
+                "date": "Date",
+                "group_size": "Interviews",
+                "interviews_str": "Start Times",
+                "mean_start_label": "Mean Start Time",
+                "month": "Month",
+            }),
             use_container_width=True, hide_index=True,
         )
+
+    # ── Detailed clash pairs ─────────────────────────────────────
+    if not clash_pairs.empty:
+        with st.expander("All Clash Pairs" + title_suffix):
+            display_pairs = clash_pairs.copy()
+            display_pairs["date"] = display_pairs["date"].dt.strftime("%Y-%m-%d")
+            st.dataframe(
+                display_pairs[["expert_name", "date", "start_time_1",
+                                "start_time_2", "time_diff_min", "month"]],
+                use_container_width=True, hide_index=True,
+            )
 
 
 def render_today_clash_summary(df):
     """Render a compact clash summary for today's snapshot."""
-    clash_df = detect_expert_clashes(df)
+    clash_groups, clash_pairs = detect_expert_clashes(df)
 
-    if clash_df.empty:
+    if clash_groups.empty:
         st.success("No scheduling clashes today.")
         return
 
-    total_pairs = len(clash_df)
-    experts_affected = clash_df["expert_name"].nunique()
+    total_groups = len(clash_groups)
+    total_interviews = int(clash_groups["group_size"].sum())
+    experts_affected = clash_groups["expert_name"].nunique()
+    mean_min = clash_groups["mean_start_minutes"].mean()
+    mean_label = _mean_start_label_from_minutes(mean_min)
 
-    k = st.columns(3)
-    k[0].metric("Clash Pairs Today", total_pairs)
-    k[1].metric("Experts Affected", experts_affected)
-    # List the expert names
-    expert_list = ", ".join(clash_df["expert_name"].unique().tolist())
-    k[2].metric("Clash Experts", expert_list if len(expert_list) < 40 else str(experts_affected) + " experts")
+    k = st.columns(4)
+    k[0].metric("Clash Groups Today", total_groups)
+    k[1].metric("Interviews in Clashes", total_interviews)
+    k[2].metric("Experts Affected", experts_affected)
+    k[3].metric("Mean Clash Start Time", mean_label)
+
+    # Size distribution
+    size_counts = clash_groups["group_size"].value_counts().sort_index()
+    size_parts = [str(int(v)) + "x " + str(int(s)) + "-interview" for s, v in size_counts.items()]
+    st.caption("Clash breakdown: " + ", ".join(size_parts))
 
     with st.expander("Today's Clash Details"):
-        display_clash = clash_df.copy()
-        display_clash["date"] = display_clash["date"].dt.strftime("%Y-%m-%d")
+        display_groups = clash_groups.copy()
+        display_groups["date"] = display_groups["date"].dt.strftime("%Y-%m-%d")
         st.dataframe(
-            display_clash[["expert_name", "date", "start_time_1", "start_time_2", "time_diff_min"]],
+            display_groups[["expert_name", "date", "group_size", "interviews_str",
+                            "mean_start_label"]].rename(columns={
+                "expert_name": "Expert",
+                "date": "Date",
+                "group_size": "Interviews",
+                "interviews_str": "Start Times",
+                "mean_start_label": "Mean Start Time",
+            }),
             use_container_width=True, hide_index=True,
         )
 
@@ -1465,11 +1740,11 @@ def main():
 
     # ── Sidebar: Clash indicator for Interview Support ────────────
     if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
-        clash_check = detect_expert_clashes(support_df)
-        if not clash_check.empty:
+        clash_groups_check, _ = detect_expert_clashes(support_df)
+        if not clash_groups_check.empty:
             st.sidebar.markdown("---")
-            st.sidebar.metric("⚠️ Total Clash Pairs", len(clash_check))
-            st.sidebar.metric("Experts with Clashes", clash_check["expert_name"].nunique())
+            st.sidebar.metric("⚠️ Total Clash Groups", len(clash_groups_check))
+            st.sidebar.metric("Experts with Clashes", clash_groups_check["expert_name"].nunique())
 
     hist = hist_monthly_df(selected_support)
     live = live_monthly(support_df)
@@ -1493,7 +1768,7 @@ def main():
     if view == "Transcript Analyzer":
         transcript_analyzer_view()
         st.sidebar.markdown("---")
-        st.sidebar.caption("Vizva Dashboard v18.0 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics | Clash Detection")
+        st.sidebar.caption("Vizva Dashboard v18.1 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics | Clash Detection")
         return
 
     # ======= TODAY =======
@@ -1514,19 +1789,19 @@ def main():
 
         kpi_row(kd)
 
-        # ── TODAY'S SENTIMENT KPI (compact, right after task KPIs) ─
+        # ── TODAY'S SENTIMENT KPI ────────────────────────────────
         if not today_df.empty:
             today_stats = get_sentiment_stats(today_df)
             if today_stats:
                 st.markdown("---")
                 render_sentiment_kpi(today_stats, title="Today's Feedback Sentiment")
 
-        # ── TODAY'S START TIME INSIGHTS (Interview Support only) ──
+        # ── TODAY'S START TIME INSIGHTS ──────────────────────────
         if selected_support == "Interview Support" and not today_df.empty and "start_hour" in today_df.columns:
             st.markdown("---")
             render_start_time_insights(today_df, title_suffix=" - " + str(today))
 
-        # ── TODAY'S CLASH DETECTION (Interview Support only) ──────
+        # ── TODAY'S CLASH DETECTION ──────────────────────────────
         if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
             st.markdown("---")
             st.subheader("Scheduling Clashes - " + str(today))
@@ -1571,7 +1846,7 @@ def main():
             with st.expander("Raw Data (includes Sentiment Score)"):
                 st.dataframe(today_df, use_container_width=True, height=400)
 
-        # ── ABOUT TO MOVE TO MARKET (Resume Understanding with pending status) ──
+        # ── ABOUT TO MOVE TO MARKET ──────────────────────────────
         st.markdown("---")
         st.subheader("About to Move to Market")
         st.caption("Resume Understanding candidates with pending status — ready to enter the market")
@@ -1679,7 +1954,7 @@ def main():
 
         st.plotly_chart(trend_line(monthly, "total", "Total " + support_label + " per Month", "#8e44ad"), use_container_width=True)
 
-        # ── START TIME INSIGHTS — OVERALL (Interview Support) ────
+        # ── START TIME INSIGHTS — OVERALL ────────────────────────
         if selected_support == "Interview Support" and "start_hour" in support_df.columns:
             st.markdown("---")
             render_start_time_insights(support_df, title_suffix=" - All Months")
@@ -1687,7 +1962,7 @@ def main():
             st.markdown("---")
             render_monthly_start_time_trend(support_df, title_suffix=" - " + support_label)
 
-        # ── CLASH DETECTION — OVERALL (Interview Support) ────────
+        # ── CLASH DETECTION — OVERALL ────────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
             st.markdown("---")
             render_clash_summary(support_df, title_suffix=" - All Months")
@@ -1736,7 +2011,7 @@ def main():
                 me = month_exp[month_exp["month"] == sel_m2].sort_values("total", ascending=False)
                 st.dataframe(me, use_container_width=True)
 
-        # ── CANDIDATE-WISE MONTHLY COUNTS (all support types) ────
+        # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────
         st.markdown("---")
         st.subheader("Candidate-wise Monthly Counts (All Support Types)")
         cand_monthly = candidate_monthly_support(active_expert_df)
@@ -2013,21 +2288,21 @@ def main():
             else:
                 st.info("No technology column found.")
 
-        # ── START TIME ANALYSIS TAB (Interview Support only) ─────
+        # ── START TIME ANALYSIS TAB ──────────────────────────────
         if selected_support == "Interview Support" and "start_hour" in support_df.columns and len(tabs) > 7:
             with tabs[7]:
                 render_start_time_insights(support_df, title_suffix=" - All Data")
                 st.markdown("---")
                 render_monthly_start_time_trend(support_df, title_suffix="")
 
-        # ── CLASH DETECTION TAB (Interview Support only) ─────────
+        # ── CLASH DETECTION TAB ──────────────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
             clash_tab_idx = len(tab_names) - 1
             with tabs[clash_tab_idx]:
                 render_clash_summary(support_df, title_suffix=" - All Data")
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v18.0 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics | Clash Detection")
+    st.sidebar.caption("Vizva Dashboard v18.1 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics | Clash Detection")
 
 
 # ═══════════════════════════════════════════════════════════════════
