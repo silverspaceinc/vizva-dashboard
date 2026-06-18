@@ -329,25 +329,20 @@ def daily_sentiment_agg(df):
 # ═══════════════════════════════════════════════════════════════════
 
 def add_start_time_columns(df):
-    """Add start_hour, start_hour_label, and _parsed_start columns.
-    Modifies df in-place and returns it."""
+    """Add start_hour, start_hour_label, and _parsed_start columns."""
     if "start_time" not in df.columns:
         return df
 
     df = df.copy()
 
-    # ── Parse start_time ─────────────────────────────────────────
     st_raw = df["start_time"].astype(str).str.strip()
     noon_s = st_raw.str.lower() == "noon"
     st_raw = st_raw.where(~noon_s, "12:00 PM")
-    # Try 12-hour format first
     start_parsed = pd.to_datetime(st_raw, errors="coerce", format="%I:%M %p")
-    # Fallback: 24-hour format
     mask_nat = start_parsed.isna() & st_raw.notna() & (st_raw != "") & (st_raw.str.lower() != "nan")
     if mask_nat.any():
         fallback1 = pd.to_datetime(st_raw[mask_nat], errors="coerce", format="%H:%M")
         start_parsed.loc[mask_nat] = fallback1
-    # Fallback: mixed format
     mask_nat2 = start_parsed.isna() & st_raw.notna() & (st_raw != "") & (st_raw.str.lower() != "nan")
     if mask_nat2.any():
         fallback2 = pd.to_datetime(st_raw[mask_nat2], errors="coerce", format="mixed")
@@ -355,16 +350,13 @@ def add_start_time_columns(df):
 
     df["start_hour"] = start_parsed.dt.hour
     df["start_hour_label"] = start_parsed.dt.strftime("%I %p")
-
-    # Store parsed datetime for clash detection (minutes-level precision)
     df["_parsed_start"] = start_parsed
 
     return df
 
 
 def render_start_time_insights(df, title_suffix=""):
-    """Render the Start Time Insights section: hourly distribution,
-    peak-hour KPIs, and mean interview start time."""
+    """Render the Start Time Insights section."""
     if "start_hour" not in df.columns:
         st.info("No start_time data available for time-of-day analysis.")
         return
@@ -376,7 +368,6 @@ def render_start_time_insights(df, title_suffix=""):
 
     st.subheader("Start Time Insights" + title_suffix)
 
-    # ── KPI row ──────────────────────────────────────────────────
     total_with_time = len(valid)
     hour_counts = valid["start_hour"].value_counts().sort_index()
     peak_hour = int(hour_counts.idxmax())
@@ -391,7 +382,6 @@ def render_start_time_insights(df, title_suffix=""):
     k_cols[2].metric("Interviews at Peak", peak_count)
     k_cols[3].metric("Mean Start Time", mean_label)
 
-    # ── Hourly distribution bar chart ────────────────────────────
     all_hours = list(range(0, 24))
     hour_labels = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0") for h in all_hours]
     counts = [int(hour_counts.get(h, 0)) for h in all_hours]
@@ -412,7 +402,6 @@ def render_start_time_insights(df, title_suffix=""):
     )
     st.plotly_chart(fig_hourly, use_container_width=True)
 
-    # ── Time-slot breakdown table ────────────────────────────────
     slots = {
         "Early Morning (6-9 AM)": (6, 9),
         "Morning (9 AM-12 PM)": (9, 12),
@@ -448,7 +437,6 @@ def render_monthly_start_time_trend(df, title_suffix=""):
 
     st.subheader("Monthly Start Time Trends" + title_suffix)
 
-    # ── Heatmap: month x hour ────────────────────────────────────
     pivot = valid.groupby(["month", "start_hour"]).size().reset_index(name="count")
     pivot_wide = pivot.pivot(index="start_hour", columns="month", values="count").fillna(0).astype(int)
     pivot_wide = pivot_wide.reindex(range(24), fill_value=0)
@@ -463,7 +451,6 @@ def render_monthly_start_time_trend(df, title_suffix=""):
     fig_heat.update_layout(height=550)
     st.plotly_chart(fig_heat, use_container_width=True)
 
-    # ── Monthly mean start time line chart ───────────────────────
     monthly_agg = valid.groupby("month").agg(
         interviews=("start_hour", "size"),
         mean_start_hour=("start_hour", "mean"),
@@ -501,20 +488,13 @@ def render_monthly_start_time_trend(df, title_suffix=""):
 
 # ═══════════════════════════════════════════════════════════════════
 #  SCHEDULING CLASH DETECTION
-#  Rule: same expert, same day, 2+ interviews within 30-min window
-#  A clash GROUP = cluster of interviews where each is within 30 min
-#  of at least one other in the group (connected component).
-#  A "2-interview clash" means exactly 2 interviews overlap.
-#  A "3-interview clash" means 3 interviews form a connected group.
 # ═══════════════════════════════════════════════════════════════════
 
 def _build_clash_groups(minutes_list):
     """Given a sorted list of (index, minutes) tuples, find connected
-    components where any two nodes within 30 min are connected.
-    Returns list of groups (each group = list of (index, minutes))."""
+    components where any two nodes within 30 min are connected."""
     if len(minutes_list) < 2:
         return []
-    # Build adjacency
     n = len(minutes_list)
     adj = {i: set() for i in range(n)}
     for i in range(n):
@@ -522,7 +502,6 @@ def _build_clash_groups(minutes_list):
             if abs(minutes_list[j][1] - minutes_list[i][1]) <= 30:
                 adj[i].add(j)
                 adj[j].add(i)
-    # Find connected components via BFS
     visited = set()
     groups = []
     for i in range(n):
@@ -548,11 +527,8 @@ def detect_expert_clashes(df):
     """Detect scheduling clash GROUPS for experts.
 
     Returns two DataFrames:
-      1) clash_groups_df — one row per clash group:
-           expert_name, date, month, group_size, interviews_str,
-           mean_start_minutes, mean_start_label, start_times_list
-      2) clash_pairs_df — one row per pair within a group:
-           expert_name, date, month, start_time_1, start_time_2, time_diff_min
+      1) clash_groups_df
+      2) clash_pairs_df
     """
     empty_groups = pd.DataFrame()
     empty_pairs = pd.DataFrame()
@@ -578,7 +554,6 @@ def detect_expert_clashes(df):
             sorted_grp["_start_minutes"].values,
             sorted_grp["_parsed_start"].dt.strftime("%I:%M %p").values
         )))
-        # Flatten to (original_pos, minutes)
         minutes_list = [(i, int(m)) for i, (m, _) in minutes_indexed]
         time_labels = {i: lbl for i, (_, lbl) in minutes_indexed}
 
@@ -603,7 +578,6 @@ def detect_expert_clashes(df):
                 "start_times_list": times,
             })
 
-            # Generate all pairs within this group
             for i in range(len(group)):
                 for j in range(i + 1, len(group)):
                     diff = abs(group[j][1] - group[i][1])
@@ -668,7 +642,7 @@ def render_clash_summary(df, title_suffix=""):
     k[3].metric("Days with Clashes", days_with_clashes)
     k[4].metric("Mean Clash Start Time", overall_mean_label)
 
-    # ── Clash Size Distribution (2-way, 3-way, 4-way+) ──────────
+    # ── Clash Size Distribution ──────────────────────────────────
     st.markdown("---")
     st.subheader("Clash Size Distribution" + title_suffix)
     st.caption("How many interviews overlap in each clash group")
@@ -716,11 +690,9 @@ def render_clash_summary(df, title_suffix=""):
 
     col_e1, col_e2 = st.columns(2)
     with col_e1:
-        # Stacked bar: experts x clash sizes
         pivot_es = expert_size_top.pivot_table(
             index="expert_name", columns="size_label", values="count", fill_value=0
         )
-        # Sort by total
         pivot_es["_total"] = pivot_es.sum(axis=1)
         pivot_es = pivot_es.sort_values("_total", ascending=True).drop(columns="_total")
 
@@ -745,7 +717,6 @@ def render_clash_summary(df, title_suffix=""):
         st.plotly_chart(fig_es, use_container_width=True)
 
     with col_e2:
-        # Expert total clashes + total interviews in clashes
         expert_agg = clash_groups.groupby("expert_name").agg(
             clash_groups_count=("group_size", "size"),
             total_interviews=("group_size", "sum"),
@@ -803,7 +774,6 @@ def render_clash_summary(df, title_suffix=""):
         st.plotly_chart(fig_ms, use_container_width=True)
 
     with col_m2:
-        # Monthly mean clash start time
         monthly_mean = clash_groups.groupby("month").agg(
             clash_groups_count=("group_size", "size"),
             mean_start=("mean_start_minutes", "mean"),
@@ -870,7 +840,7 @@ def render_clash_summary(df, title_suffix=""):
                                                   "total_interviews", "clash_days",
                                                   "mean_start_label"]]
         expert_agg_display.columns = ["Expert", "Clash Groups", "Interviews in Clashes",
-                                       "Days with Clashes", "Mean Clash Start Time"]
+                                      "Days with Clashes", "Mean Clash Start Time"]
         st.dataframe(expert_agg_display, use_container_width=True, hide_index=True)
 
     # ── Monthly summary table ────────────────────────────────────
@@ -885,7 +855,7 @@ def render_clash_summary(df, title_suffix=""):
             _mean_start_label_from_minutes
         )
         monthly_table.columns = ["Month", "Clash Groups", "Interviews in Clashes",
-                                  "Experts Affected", "Mean Start (min)", "Mean Clash Start Time"]
+                                 "Experts Affected", "Mean Start (min)", "Mean Clash Start Time"]
         st.dataframe(monthly_table[["Month", "Clash Groups", "Interviews in Clashes",
                                      "Experts Affected", "Mean Clash Start Time"]],
                      use_container_width=True, hide_index=True)
@@ -939,7 +909,6 @@ def render_today_clash_summary(df):
     k[2].metric("Experts Affected", experts_affected)
     k[3].metric("Mean Clash Start Time", mean_label)
 
-    # Size distribution
     size_counts = clash_groups["group_size"].value_counts().sort_index()
     size_parts = [str(int(v)) + "x " + str(int(s)) + "-interview" for s, v in size_counts.items()]
     st.caption("Clash breakdown: " + ", ".join(size_parts))
@@ -955,6 +924,356 @@ def render_today_clash_summary(df):
                 "group_size": "Interviews",
                 "interviews_str": "Start Times",
                 "mean_start_label": "Mean Start Time",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  BLOCKAGE DETECTION
+#  Rule: In any 30-minute bracket, ALL experts have at least one
+#  interview AND at least one expert has a clash in that bracket.
+#  This means zero capacity — no one is free and there's a conflict.
+# ═══════════════════════════════════════════════════════════════════
+
+def detect_blockages(df):
+    """Detect Blockage events.
+
+    A Blockage occurs in a 30-minute time bracket on a given day when:
+      1) Every unique expert (for that day) has >=1 interview starting
+         within that bracket.
+      2) At least one expert has a clash (2+ interviews) in that bracket.
+
+    Brackets slide in 30-min steps: 00:00-00:30, 00:30-01:00, ... 23:30-00:00
+
+    Returns a DataFrame with columns:
+        date, day_name, bracket_start_min, bracket_label,
+        total_experts_today, experts_in_bracket, experts_with_clash,
+        involved_experts (list), clash_experts (list),
+        mean_start_minutes, mean_start_label, month
+    """
+    empty = pd.DataFrame()
+
+    if "_parsed_start" not in df.columns or "expert_name" not in df.columns or "date" not in df.columns:
+        return empty
+
+    valid = df.dropna(subset=["_parsed_start", "expert_name", "date"]).copy()
+    if valid.empty:
+        return empty
+
+    valid["_day"] = valid["date"].dt.date
+    valid["_start_minutes"] = valid["_parsed_start"].dt.hour * 60 + valid["_parsed_start"].dt.minute
+
+    blockage_rows = []
+
+    for day, day_grp in valid.groupby("_day"):
+        all_experts_today = set(day_grp["expert_name"].unique())
+        n_experts = len(all_experts_today)
+        if n_experts < 2:
+            continue
+
+        for bracket_start in range(0, 1440, 30):
+            bracket_end = bracket_start + 30
+
+            in_bracket = day_grp[
+                (day_grp["_start_minutes"] >= bracket_start) &
+                (day_grp["_start_minutes"] < bracket_end)
+            ]
+
+            if in_bracket.empty:
+                continue
+
+            experts_in_bracket = set(in_bracket["expert_name"].unique())
+
+            if experts_in_bracket != all_experts_today:
+                continue
+
+            expert_counts = in_bracket.groupby("expert_name").size()
+            clash_experts = set(expert_counts[expert_counts >= 2].index)
+
+            if not clash_experts:
+                continue
+
+            bracket_h = bracket_start // 60
+            bracket_m = bracket_start % 60
+            bracket_label = datetime(2000, 1, 1, bracket_h, bracket_m).strftime("%I:%M %p")
+
+            mean_min = in_bracket["_start_minutes"].mean()
+            mean_h = int(mean_min // 60) % 24
+            mean_m = int(mean_min % 60)
+            mean_label = datetime(2000, 1, 1, mean_h, mean_m).strftime("%I:%M %p")
+
+            blockage_rows.append({
+                "date": pd.Timestamp(day),
+                "day_name": pd.Timestamp(day).day_name(),
+                "bracket_start_min": bracket_start,
+                "bracket_label": bracket_label,
+                "total_experts_today": n_experts,
+                "experts_in_bracket": len(experts_in_bracket),
+                "experts_with_clash": len(clash_experts),
+                "involved_experts": sorted(experts_in_bracket),
+                "clash_experts": sorted(clash_experts),
+                "mean_start_minutes": round(mean_min, 1),
+                "mean_start_label": mean_label,
+            })
+
+    if not blockage_rows:
+        return empty
+
+    blockage_df = pd.DataFrame(blockage_rows)
+    blockage_df["month"] = blockage_df["date"].dt.to_period("M").astype(str)
+    return blockage_df
+
+
+def render_today_blockage(df):
+    """Render Blockage indicator for Today's Snapshot."""
+    blockage_df = detect_blockages(df)
+
+    if blockage_df.empty:
+        st.success("No Blockage detected today — capacity is available.")
+        return
+
+    n = len(blockage_df)
+    st.error(
+        f"**BLOCKAGE DETECTED** — {n} time bracket{'s' if n > 1 else ''} "
+        f"where ALL experts are busy AND a clash exists. Zero available capacity!"
+    )
+
+    k = st.columns(4)
+    k[0].metric("Blockage Brackets", n)
+    k[1].metric("Experts (All Busy)", int(blockage_df["total_experts_today"].iloc[0]))
+    k[2].metric("Total Clash Experts", int(blockage_df["experts_with_clash"].sum()))
+    mean_min = blockage_df["mean_start_minutes"].mean()
+    k[3].metric("Mean Blockage Time", _mean_start_label_from_minutes(mean_min))
+
+    with st.expander("Blockage Details — Today"):
+        display = blockage_df[["bracket_label", "total_experts_today",
+                               "experts_with_clash", "mean_start_label"]].copy()
+        display.columns = ["Time Bracket", "Total Experts", "Experts with Clash",
+                           "Mean Start Time"]
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+        for _, row in blockage_df.iterrows():
+            st.caption(
+                f"**{row['bracket_label']}** — Clash experts: "
+                + ", ".join(row["clash_experts"])
+                + f" | All experts: " + ", ".join(row["involved_experts"])
+            )
+
+
+def render_blockage_summary(df, title_suffix=""):
+    """Full Blockage analytics: month-wise, expert-wise, time-wise."""
+    blockage_df = detect_blockages(df)
+
+    st.subheader("Blockage Analysis" + title_suffix)
+    st.caption(
+        "A **Blockage** = a 30-min bracket where ALL experts have interviews "
+        "AND at least one expert has a clash (2+ interviews). "
+        "Result: zero available capacity in that window."
+    )
+
+    if blockage_df.empty:
+        st.success("No Blockages detected" + title_suffix + ".")
+        return
+
+    # ── KPI row ──────────────────────────────────────────────────
+    total_blockages = len(blockage_df)
+    days_with_blockage = blockage_df["date"].dt.date.nunique()
+    months_with_blockage = blockage_df["month"].nunique()
+    total_clash_experts = int(blockage_df["experts_with_clash"].sum())
+    mean_min = blockage_df["mean_start_minutes"].mean()
+    mean_label = _mean_start_label_from_minutes(mean_min)
+
+    k = st.columns(5)
+    k[0].metric("Total Blockage Events", total_blockages)
+    k[1].metric("Days with Blockage", days_with_blockage)
+    k[2].metric("Months with Blockage", months_with_blockage)
+    k[3].metric("Total Clash Experts", total_clash_experts)
+    k[4].metric("Mean Blockage Time", mean_label)
+
+    # ── Month-wise Blockage Trend ────────────────────────────────
+    st.markdown("---")
+    st.subheader("Monthly Blockage Trend" + title_suffix)
+
+    monthly_b = blockage_df.groupby("month").agg(
+        blockage_count=("bracket_label", "size"),
+        days=("date", lambda x: x.dt.date.nunique()),
+        clash_experts=("experts_with_clash", "sum"),
+        mean_start=("mean_start_minutes", "mean"),
+    ).reset_index()
+    monthly_b["mean_start_label"] = monthly_b["mean_start"].apply(
+        _mean_start_label_from_minutes
+    )
+    monthly_b["mean_start_hour"] = (monthly_b["mean_start"] / 60).round(2)
+
+    col_mb1, col_mb2 = st.columns(2)
+    with col_mb1:
+        fig_mb = go.Figure(go.Bar(
+            x=monthly_b["month"], y=monthly_b["blockage_count"],
+            marker_color="#e74c3c",
+            text=monthly_b["blockage_count"], textposition="outside",
+        ))
+        fig_mb.update_layout(
+            title="Blockage Events by Month",
+            height=420,
+            xaxis_title="Month",
+            yaxis_title="Blockage Events",
+        )
+        st.plotly_chart(fig_mb, use_container_width=True)
+
+    with col_mb2:
+        fig_mm = go.Figure()
+        fig_mm.add_trace(go.Scatter(
+            x=monthly_b["month"],
+            y=monthly_b["mean_start_hour"],
+            mode="lines+markers+text",
+            text=monthly_b["mean_start_label"],
+            textposition="top center",
+            line=dict(color="#e74c3c", width=3),
+            marker=dict(size=10),
+        ))
+        fig_mm.update_layout(
+            title="Mean Blockage Time by Month",
+            height=420,
+            xaxis_title="Month",
+            yaxis_title="Hour of Day (24h)",
+            yaxis=dict(range=[
+                max(0, monthly_b["mean_start_hour"].min() - 2),
+                min(24, monthly_b["mean_start_hour"].max() + 2),
+            ]),
+        )
+        st.plotly_chart(fig_mm, use_container_width=True)
+
+    # ── Expert-wise Blockage Frequency ───────────────────────────
+    st.markdown("---")
+    st.subheader("Expert-wise Blockage Involvement" + title_suffix)
+    st.caption("How often each expert appears in a Blockage bracket (as busy or clashing)")
+
+    exploded = blockage_df.explode("involved_experts")
+    expert_blockage_counts = exploded.groupby("involved_experts").agg(
+        blockage_events=("bracket_label", "size"),
+        months=("month", "nunique"),
+    ).reset_index().rename(columns={"involved_experts": "expert_name"})
+    expert_blockage_counts = expert_blockage_counts.sort_values(
+        "blockage_events", ascending=False
+    )
+
+    exploded_clash = blockage_df.explode("clash_experts")
+    clash_expert_counts = exploded_clash.groupby("clash_experts").size().rename(
+        "as_clash_expert"
+    ).reset_index().rename(columns={"clash_experts": "expert_name"})
+
+    expert_blockage = expert_blockage_counts.merge(
+        clash_expert_counts, on="expert_name", how="left"
+    ).fillna(0)
+    expert_blockage["as_clash_expert"] = expert_blockage["as_clash_expert"].astype(int)
+
+    col_e1, col_e2 = st.columns(2)
+    with col_e1:
+        top = expert_blockage.head(15).sort_values("blockage_events")
+        fig_eb = go.Figure()
+        fig_eb.add_trace(go.Bar(
+            y=top["expert_name"], x=top["blockage_events"],
+            orientation="h", marker_color="#e74c3c",
+            text=top["blockage_events"], textposition="outside",
+            name="Blockage Brackets",
+        ))
+        fig_eb.update_layout(
+            title="Top 15 Experts in Blockage Events",
+            height=max(420, len(top) * 35),
+            xaxis_title="Blockage Events",
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(fig_eb, use_container_width=True)
+
+    with col_e2:
+        top2 = expert_blockage.head(15).sort_values("as_clash_expert")
+        fig_ec = go.Figure()
+        fig_ec.add_trace(go.Bar(
+            y=top2["expert_name"], x=top2["as_clash_expert"],
+            orientation="h", marker_color="#8e44ad",
+            text=top2["as_clash_expert"], textposition="outside",
+            name="As Clash Expert",
+        ))
+        fig_ec.update_layout(
+            title="Top 15 — Times as Clash Expert in Blockage",
+            height=max(420, len(top2) * 35),
+            xaxis_title="Times as Clash Expert",
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(fig_ec, use_container_width=True)
+
+    # ── Time-of-Day Blockage Distribution ────────────────────────
+    st.markdown("---")
+    st.subheader("Blockage Time-of-Day Distribution" + title_suffix)
+
+    blockage_hours = (blockage_df["bracket_start_min"] // 60).astype(int)
+    hour_counts = blockage_hours.value_counts().sort_index()
+
+    all_hours = list(range(0, 24))
+    hour_labels = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0") for h in all_hours]
+    counts = [int(hour_counts.get(h, 0)) for h in all_hours]
+    peak_h = int(hour_counts.idxmax()) if not hour_counts.empty else 0
+    bar_colors = ["#e74c3c" if h == peak_h else "#f39c12" for h in all_hours]
+
+    fig_bh = go.Figure(go.Bar(
+        x=hour_labels, y=counts,
+        marker_color=bar_colors,
+        text=counts, textposition="outside",
+    ))
+    fig_bh.update_layout(
+        title="Blockage Events by Hour of Day" + title_suffix,
+        height=420,
+        xaxis_title="Hour of Day",
+        yaxis_title="Blockage Events",
+        xaxis=dict(tickangle=-45),
+    )
+    st.plotly_chart(fig_bh, use_container_width=True)
+
+    # ── Expert x Month Heatmap ───────────────────────────────────
+    st.markdown("---")
+    st.subheader("Expert x Month Blockage Heatmap" + title_suffix)
+
+    exploded_monthly = exploded.groupby(["involved_experts", "month"]).size().reset_index(
+        name="count"
+    ).rename(columns={"involved_experts": "expert_name"})
+    pivot_em = exploded_monthly.pivot(
+        index="expert_name", columns="month", values="count"
+    ).fillna(0).astype(int)
+
+    if not pivot_em.empty:
+        fig_hm = px.imshow(
+            pivot_em, text_auto=True, aspect="auto",
+            color_continuous_scale="Reds",
+            title="Expert x Month Blockage Frequency",
+            labels=dict(x="Month", y="Expert", color="Blockages"),
+        )
+        fig_hm.update_layout(height=max(450, len(pivot_em) * 25))
+        st.plotly_chart(fig_hm, use_container_width=True)
+
+    # ── Detailed Blockage Table ──────────────────────────────────
+    with st.expander("Detailed Blockage Events" + title_suffix):
+        display_b = blockage_df.copy()
+        display_b["date"] = display_b["date"].dt.strftime("%Y-%m-%d")
+        display_b["involved_experts_str"] = display_b["involved_experts"].apply(
+            lambda x: ", ".join(x)
+        )
+        display_b["clash_experts_str"] = display_b["clash_experts"].apply(
+            lambda x: ", ".join(x)
+        )
+        st.dataframe(
+            display_b[["date", "day_name", "bracket_label", "total_experts_today",
+                        "experts_with_clash", "mean_start_label",
+                        "involved_experts_str", "clash_experts_str", "month"]].rename(columns={
+                "date": "Date",
+                "day_name": "Day",
+                "bracket_label": "Time Bracket",
+                "total_experts_today": "Total Experts",
+                "experts_with_clash": "Clash Experts",
+                "mean_start_label": "Mean Start Time",
+                "involved_experts_str": "All Experts",
+                "clash_experts_str": "Clashing Experts",
+                "month": "Month",
             }),
             use_container_width=True, hide_index=True,
         )
@@ -1520,20 +1839,19 @@ def transcript_analyzer_view():
 
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Overall Score", f"{ov_score:+.1f}%")
-            k2.metric("P(Positive)", f"{overall['p_positive']:.1f}%")
+            k2.metric("P(Negative)", f"{overall['p_negative']:.1f}%")
             k3.metric("P(Neutral)", f"{overall['p_neutral']:.1f}%")
-            k4.metric("P(Negative)", f"{overall['p_negative']:.1f}%")
+            k4.metric("P(Positive)", f"{overall['p_positive']:.1f}%")
 
             fig_donut = go.Figure(go.Pie(
-                labels=["Positive", "Neutral", "Negative"],
-                values=[overall["p_positive"], overall["p_neutral"], overall["p_negative"]],
-                hole=0.55,
-                marker=dict(colors=["#2ecc71", "#f39c12", "#e74c3c"]),
-                textinfo="label+percent",
+                labels=["Negative", "Neutral", "Positive"],
+                values=[overall["p_negative"], overall["p_neutral"], overall["p_positive"]],
+                hole=0.5,
+                marker=dict(colors=["#e74c3c", "#f39c12", "#2ecc71"]),
+                textinfo="label+value+percent",
             ))
             fig_donut.update_layout(
-                title="Probability Distribution",
-                height=350, showlegend=False,
+                title="Probability Distribution", height=380, showlegend=False,
                 annotations=[dict(text=f"{ov_score:+.1f}%", x=0.5, y=0.5,
                                   font_size=24, font_color=ov_color, showarrow=False)],
             )
@@ -1625,49 +1943,34 @@ def transcript_analyzer_view():
                         c_label = chunk["label"]
                         c_color = sentiment_color(c_score) if c_score is not None else "#999"
                         with st.expander(unit_name + " " + str(i + 1) + " — " + c_label +
-                                         (" (" + f"{c_score:+.1f}%" + ")" if c_score is not None else "")):
+                                          (" (" + f"{c_score:+.1f}%" + ")" if c_score is not None else "")):
                             st.markdown(chunk["full_text"])
                             if c_score is not None:
-                                st.markdown(
-                                    f"**Score:** {c_score:+.1f}% · "
-                                    f"P(pos) {chunk['p_positive']:.1f}% · "
-                                    f"P(neu) {chunk['p_neutral']:.1f}% · "
-                                    f"P(neg) {chunk['p_negative']:.1f}%"
+                                st.caption(
+                                    f"Score: {c_score:+.1f}% | "
+                                    f"P(neg): {chunk['p_negative']:.1f}% | "
+                                    f"P(neu): {chunk['p_neutral']:.1f}% | "
+                                    f"P(pos): {chunk['p_positive']:.1f}%"
                                 )
             else:
-                col_donut, col_info = st.columns(2)
-                with col_donut:
-                    st.plotly_chart(fig_donut, use_container_width=True)
-                with col_info:
-                    st.markdown(
-                        "The overall sentiment score is **" + f"{ov_score:+.1f}%" + "** (" + ov_label + ").\n\n"
-                        "- **P(Positive)**: " + f"{overall['p_positive']:.1f}%" + "\n"
-                        "- **P(Neutral)**: " + f"{overall['p_neutral']:.1f}%" + "\n"
-                        "- **P(Negative)**: " + f"{overall['p_negative']:.1f}%" + "\n\n"
-                        "Score = (P(positive) - P(negative)) x 100, range -100% to +100%."
-                    )
-
-    elif analyze_btn:
-        st.warning("Please paste some text before clicking Analyze.")
+                st.plotly_chart(fig_donut, use_container_width=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  MAIN APP
+#  MAIN
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
     title_col, dl_col = st.columns([4, 1])
     with title_col:
-        st.title("Vizva Support Dashboard")
+        st.title("Vizva Interview Dashboard")
 
-    try:
-        with st.spinner("Fetching latest data from API..."):
-            raw = fetch_all_data()
-            raw = normalize(raw)
-    except Exception as e:
-        st.error("Failed to fetch data: " + str(e))
+    raw = fetch_all_data()
+    if raw.empty:
+        st.error("No data returned from API.")
         st.stop()
 
+    raw = normalize(raw)
     raw = filter_current_year(raw)
     if raw.empty:
         st.error("No data found for current year.")
@@ -1746,6 +2049,12 @@ def main():
             st.sidebar.metric("⚠️ Total Clash Groups", len(clash_groups_check))
             st.sidebar.metric("Experts with Clashes", clash_groups_check["expert_name"].nunique())
 
+        # Blockage sidebar indicator
+        blockage_check = detect_blockages(support_df)
+        if not blockage_check.empty:
+            st.sidebar.metric("🚨 Total Blockages", len(blockage_check))
+            st.sidebar.metric("Days with Blockage", blockage_check["date"].dt.date.nunique())
+
     hist = hist_monthly_df(selected_support)
     live = live_monthly(support_df)
     if not hist.empty and not live.empty:
@@ -1760,15 +2069,15 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
-                                           "Daily Drill-Down", "Deep-Dive Analytics",
-                                           "Transcript Analyzer"],
+                                            "Daily Drill-Down", "Deep-Dive Analytics",
+                                            "Transcript Analyzer"],
                             label_visibility="collapsed")
 
     # ======= TRANSCRIPT ANALYZER =======
     if view == "Transcript Analyzer":
         transcript_analyzer_view()
         st.sidebar.markdown("---")
-        st.sidebar.caption("Vizva Dashboard v18.1 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics | Clash Detection")
+        st.sidebar.caption("Vizva Dashboard v19.0 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics | Clash Detection | Blockage")
         return
 
     # ======= TODAY =======
@@ -1789,23 +2098,29 @@ def main():
 
         kpi_row(kd)
 
-        # ── TODAY'S SENTIMENT KPI ────────────────────────────────
+        # ── TODAY'S SENTIMENT KPI ────────────────────────────────────
         if not today_df.empty:
             today_stats = get_sentiment_stats(today_df)
             if today_stats:
                 st.markdown("---")
                 render_sentiment_kpi(today_stats, title="Today's Feedback Sentiment")
 
-        # ── TODAY'S START TIME INSIGHTS ──────────────────────────
+        # ── TODAY'S START TIME INSIGHTS ──────────────────────────────
         if selected_support == "Interview Support" and not today_df.empty and "start_hour" in today_df.columns:
             st.markdown("---")
             render_start_time_insights(today_df, title_suffix=" - " + str(today))
 
-        # ── TODAY'S CLASH DETECTION ──────────────────────────────
+        # ── TODAY'S CLASH DETECTION ──────────────────────────────────
         if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
             st.markdown("---")
             st.subheader("Scheduling Clashes - " + str(today))
             render_today_clash_summary(today_df)
+
+        # ── TODAY'S BLOCKAGE DETECTION ───────────────────────────────
+        if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
+            st.markdown("---")
+            st.subheader("Blockage Indicator - " + str(today))
+            render_today_blockage(today_df)
 
         if not today_df.empty:
             c1, c2 = st.columns(2)
@@ -1831,11 +2146,11 @@ def main():
                 st.subheader("Round Breakdown - " + str(today))
                 round_charts(today_df, " - " + str(today))
 
-            # ── SENTIMENT DONUT + HISTOGRAM — TODAY ──────────────
+            # ── SENTIMENT DONUT + HISTOGRAM — TODAY ──────────────────
             st.markdown("---")
             render_sentiment_section(today_df, section_title="Sentiment Analysis - " + str(today))
 
-            # ── FEEDBACK WORD CLOUD — TODAY ──────────────────────
+            # ── FEEDBACK WORD CLOUD — TODAY ──────────────────────────
             st.markdown("---")
             feedback_texts = extract_feedback_texts(today_df)
             render_wordcloud_section(
@@ -1846,7 +2161,7 @@ def main():
             with st.expander("Raw Data (includes Sentiment Score)"):
                 st.dataframe(today_df, use_container_width=True, height=400)
 
-        # ── ABOUT TO MOVE TO MARKET ──────────────────────────────
+        # ── ABOUT TO MOVE TO MARKET ──────────────────────────────────
         st.markdown("---")
         st.subheader("About to Move to Market")
         st.caption("Resume Understanding candidates with pending status — ready to enter the market")
@@ -1888,7 +2203,7 @@ def main():
 
                 with st.expander("Full List - About to Move to Market"):
                     display_cols = [c for c in ["candidate_name", "expert_name",
-                                                "candidate_technology", "date", "task_status"]
+                                                 "candidate_technology", "date", "task_status"]
                                     if c in market_df.columns]
                     st.dataframe(market_df[display_cols] if display_cols else market_df,
                                  use_container_width=True, height=400)
@@ -1922,7 +2237,7 @@ def main():
         c[4].metric("Pending", int(latest["pending"]))
         c[5].metric("Candidates", int(latest["candidates"]))
 
-        # ── CURRENT MONTH SENTIMENT KPI ──────────────────────────
+        # ── CURRENT MONTH SENTIMENT KPI ──────────────────────────────
         current_month_data = support_df[support_df["date"].dt.to_period("M").astype(str) == current_month_str]
         if not current_month_data.empty:
             cm_stats = get_sentiment_stats(current_month_data)
@@ -1954,7 +2269,7 @@ def main():
 
         st.plotly_chart(trend_line(monthly, "total", "Total " + support_label + " per Month", "#8e44ad"), use_container_width=True)
 
-        # ── START TIME INSIGHTS — OVERALL ────────────────────────
+        # ── START TIME INSIGHTS — OVERALL ────────────────────────────
         if selected_support == "Interview Support" and "start_hour" in support_df.columns:
             st.markdown("---")
             render_start_time_insights(support_df, title_suffix=" - All Months")
@@ -1962,12 +2277,17 @@ def main():
             st.markdown("---")
             render_monthly_start_time_trend(support_df, title_suffix=" - " + support_label)
 
-        # ── CLASH DETECTION — OVERALL ────────────────────────────
+        # ── CLASH DETECTION — OVERALL ────────────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
             st.markdown("---")
             render_clash_summary(support_df, title_suffix=" - All Months")
 
-        # ── MONTHLY SENTIMENT TREND ──────────────────────────────
+        # ── BLOCKAGE ANALYSIS — OVERALL ──────────────────────────────
+        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
+            st.markdown("---")
+            render_blockage_summary(support_df, title_suffix=" - All Months")
+
+        # ── MONTHLY SENTIMENT TRENDS ─────────────────────────────────
         st.markdown("---")
         st.subheader("Monthly Sentiment Trends")
         sent_monthly = monthly_sentiment_trend(support_df)
@@ -1986,7 +2306,7 @@ def main():
         else:
             st.info("No sentiment data available for trend analysis.")
 
-        # ── MONTHLY (Interview Support Only) ─────────────────────
+        # ── MONTHLY (Interview Support Only) ─────────────────────────
         if selected_support == "Interview Support":
             st.markdown("---")
             st.subheader("Round-wise Monthly Breakdown")
@@ -2011,7 +2331,7 @@ def main():
                 me = month_exp[month_exp["month"] == sel_m2].sort_values("total", ascending=False)
                 st.dataframe(me, use_container_width=True)
 
-        # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────
+        # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────────
         st.markdown("---")
         st.subheader("Candidate-wise Monthly Counts (All Support Types)")
         cand_monthly = candidate_monthly_support(active_expert_df)
@@ -2045,7 +2365,7 @@ def main():
             kd["candidates"] = period["candidate_name"].nunique()
             kpi_row(kd)
 
-            # ── PERIOD SENTIMENT KPI ─────────────────────────────
+            # ── PERIOD SENTIMENT KPI ─────────────────────────────────
             period_stats = get_sentiment_stats(period)
             if period_stats:
                 render_sentiment_kpi(period_stats,
@@ -2062,7 +2382,7 @@ def main():
 
             st.plotly_chart(stacked_bar(dd_plot, x="day", title="Daily Stacked View"), use_container_width=True)
 
-            # ── DAILY SENTIMENT TREND LINE ───────────────────────
+            # ── DAILY SENTIMENT TREND LINE ───────────────────────────
             daily_sent = daily_sentiment_agg(period)
             if not daily_sent.empty:
                 st.markdown("---")
@@ -2103,7 +2423,7 @@ def main():
 
         st.sidebar.markdown("---")
         single = st.sidebar.date_input("Inspect single day", value=max_d,
-                                       min_value=min_d, max_value=max_d, key="single")
+                                        min_value=min_d, max_value=max_d, key="single")
         sdf = support_df[support_df["date"].dt.date == single]
         if not sdf.empty:
             st.subheader("Details - " + str(single))
@@ -2112,7 +2432,7 @@ def main():
             kd2["candidates"] = sdf["candidate_name"].nunique()
             kpi_row(kd2)
 
-            # ── SINGLE DAY SENTIMENT KPI ─────────────────────────
+            # ── SINGLE DAY SENTIMENT KPI ─────────────────────────────
             single_stats = get_sentiment_stats(sdf)
             if single_stats:
                 render_sentiment_kpi(single_stats, title="Sentiment - " + str(single))
@@ -2135,7 +2455,7 @@ def main():
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
 
-            # ── SINGLE DAY SENTIMENT DONUT + HISTOGRAM ───────────
+            # ── SINGLE DAY SENTIMENT DONUT + HISTOGRAM ───────────────
             if single_stats:
                 st.markdown("---")
                 col_d, col_h = st.columns(2)
@@ -2167,6 +2487,8 @@ def main():
             tab_names.append("Start Time")
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
             tab_names.append("Clash Detection")
+        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
+            tab_names.append("Blockage")
         tabs = st.tabs(tab_names)
 
         with tabs[0]:
@@ -2177,7 +2499,7 @@ def main():
                 ea = support_df.groupby("expert_name").agg(
                     Total=("task_status", "size"),
                     Completed=("task_status", lambda x: (x == "completed").sum()),
-                    Rescheduled=("task_status", lambda x: (x == "rescheduled").sum()),
+                    Rescheduled=("task_status", lambda x: (x== "rescheduled").sum()),
                     Cancelled=("task_status", lambda x: (x == "cancelled").sum()),
                     Pending=("task_status", lambda x: (x == "pending").sum()),
                     Candidates=("candidate_name", "nunique"),
@@ -2196,7 +2518,7 @@ def main():
                 ct = support_df[support_df["company_name"].isin(top)]
                 pv = ct.groupby(["company_name", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
-                                color_continuous_scale="Blues", title="Company x Task Heatmap")
+                                 color_continuous_scale="Blues", title="Company x Task Heatmap")
                 fig2.update_layout(height=500)
                 st.plotly_chart(fig2, use_container_width=True)
 
@@ -2210,7 +2532,7 @@ def main():
 
                 rt = support_df.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(rt, text_auto=True, aspect="auto",
-                                color_continuous_scale="Oranges", title="Round x Task Heatmap")
+                                 color_continuous_scale="Oranges", title="Round x Task Heatmap")
                 fig2.update_layout(height=400)
                 st.plotly_chart(fig2, use_container_width=True)
 
@@ -2224,7 +2546,7 @@ def main():
                 tmp["dow"] = tmp["date"].dt.day_name()
                 pv = tmp.groupby(["dow", "task_status"]).size().unstack(fill_value=0).reindex(order)
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
-                                color_continuous_scale="Purples", title="Day x Task Heatmap")
+                                 color_continuous_scale="Purples", title="Day x Task Heatmap")
                 fig2.update_layout(height=400)
                 st.plotly_chart(fig2, use_container_width=True)
 
@@ -2238,7 +2560,7 @@ def main():
 
                 st_task = all_case_df.groupby(["support_name", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(st_task, text_auto=True, aspect="auto",
-                                color_continuous_scale="Teal", title="Support Type x Task")
+                                 color_continuous_scale="Teal", title="Support Type x Task")
                 fig2.update_layout(height=350)
                 st.plotly_chart(fig2, use_container_width=True)
 
@@ -2282,27 +2604,31 @@ def main():
                 tt = support_df[support_df["candidate_technology"].isin(top_tech)]
                 pv = tt.groupby(["candidate_technology", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
-                                color_continuous_scale="Greens", title="Technology x Task Heatmap")
+                                 color_continuous_scale="Greens", title="Technology x Task Heatmap")
                 fig2.update_layout(height=500)
                 st.plotly_chart(fig2, use_container_width=True)
             else:
                 st.info("No technology column found.")
 
-        # ── START TIME ANALYSIS TAB ──────────────────────────────
-        if selected_support == "Interview Support" and "start_hour" in support_df.columns and len(tabs) > 7:
-            with tabs[7]:
+        # ── START TIME ANALYSIS TAB ──────────────────────────────────
+        if selected_support == "Interview Support" and "start_hour" in support_df.columns and "Start Time" in tab_names:
+            with tabs[tab_names.index("Start Time")]:
                 render_start_time_insights(support_df, title_suffix=" - All Data")
                 st.markdown("---")
                 render_monthly_start_time_trend(support_df, title_suffix="")
 
-        # ── CLASH DETECTION TAB ──────────────────────────────────
-        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
-            clash_tab_idx = len(tab_names) - 1
-            with tabs[clash_tab_idx]:
+        # ── CLASH DETECTION TAB ──────────────────────────────────────
+        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns and "Clash Detection" in tab_names:
+            with tabs[tab_names.index("Clash Detection")]:
                 render_clash_summary(support_df, title_suffix=" - All Data")
 
+        # ── BLOCKAGE TAB ─────────────────────────────────────────────
+        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns and "Blockage" in tab_names:
+            with tabs[tab_names.index("Blockage")]:
+                render_blockage_summary(support_df, title_suffix=" - All Data")
+
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v18.1 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics | Clash Detection")
+    st.sidebar.caption("Vizva Dashboard v19.0 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics | Clash Detection | Blockage")
 
 
 # ═══════════════════════════════════════════════════════════════════
