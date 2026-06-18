@@ -323,13 +323,13 @@ def daily_sentiment_agg(df):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  START TIME / INTERVIEW DURATION UTILITIES
+#  START TIME UTILITIES
 #  Treats "noon" (case-insensitive) as 12:00 PM
 #  Used ONLY when Interview Support is selected
 # ═══════════════════════════════════════════════════════════════════
 
 def add_start_time_columns(df):
-    """Add start_hour, start_hour_label, and interview_duration_min columns.
+    """Add start_hour and start_hour_label columns.
     Modifies df in-place and returns it."""
     if "start_time" not in df.columns:
         return df
@@ -340,54 +340,28 @@ def add_start_time_columns(df):
     st_raw = df["start_time"].astype(str).str.strip()
     noon_s = st_raw.str.lower() == "noon"
     st_raw = st_raw.where(~noon_s, "12:00 PM")
-    # Try multiple common time formats
+    # Try 12-hour format first
     start_parsed = pd.to_datetime(st_raw, errors="coerce", format="%I:%M %p")
-    # Fallback: try 24-hour format for unparsed values
+    # Fallback: 24-hour format
     mask_nat = start_parsed.isna() & st_raw.notna() & (st_raw != "") & (st_raw.str.lower() != "nan")
     if mask_nat.any():
         fallback1 = pd.to_datetime(st_raw[mask_nat], errors="coerce", format="%H:%M")
         start_parsed.loc[mask_nat] = fallback1
-    # Fallback: try mixed format parsing for anything still missing
+    # Fallback: mixed format
     mask_nat2 = start_parsed.isna() & st_raw.notna() & (st_raw != "") & (st_raw.str.lower() != "nan")
     if mask_nat2.any():
         fallback2 = pd.to_datetime(st_raw[mask_nat2], errors="coerce", format="mixed")
         start_parsed.loc[mask_nat2] = fallback2
 
     df["start_hour"] = start_parsed.dt.hour
-    df["start_hour_label"] = start_parsed.dt.strftime("%I %p")  # e.g. "02 PM"
-
-    # ── Parse end_time and compute duration ──────────────────────
-    if "end_time" in df.columns:
-        et_raw = df["end_time"].astype(str).str.strip()
-        noon_e = et_raw.str.lower() == "noon"
-        et_raw = et_raw.where(~noon_e, "12:00 PM")
-        end_parsed = pd.to_datetime(et_raw, errors="coerce", format="%I:%M %p")
-        # Fallback: 24-hour format
-        emask1 = end_parsed.isna() & et_raw.notna() & (et_raw != "") & (et_raw.str.lower() != "nan")
-        if emask1.any():
-            efb1 = pd.to_datetime(et_raw[emask1], errors="coerce", format="%H:%M")
-            end_parsed.loc[emask1] = efb1
-        # Fallback: mixed
-        emask2 = end_parsed.isna() & et_raw.notna() & (et_raw != "") & (et_raw.str.lower() != "nan")
-        if emask2.any():
-            efb2 = pd.to_datetime(et_raw[emask2], errors="coerce", format="mixed")
-            end_parsed.loc[emask2] = efb2
-
-        # Duration in minutes (only when both are valid)
-        duration = (end_parsed - start_parsed).dt.total_seconds() / 60.0
-        # Discard negatives and unreasonably long durations (> 480 min = 8 hrs)
-        duration = duration.where((duration > 0) & (duration <= 480), other=np.nan)
-        df["interview_duration_min"] = duration.round(1)
-    else:
-        df["interview_duration_min"] = np.nan
+    df["start_hour_label"] = start_parsed.dt.strftime("%I %p")
 
     return df
 
 
-
 def render_start_time_insights(df, title_suffix=""):
     """Render the Start Time Insights section: hourly distribution,
-    peak-hour KPIs, mean interview time, and duration histogram."""
+    peak-hour KPIs, and mean interview start time."""
     if "start_hour" not in df.columns:
         st.info("No start_time data available for time-of-day analysis.")
         return
@@ -408,16 +382,11 @@ def render_start_time_insights(df, title_suffix=""):
     mean_hour = valid["start_hour"].mean()
     mean_label = datetime(2000, 1, 1, int(mean_hour), int((mean_hour % 1) * 60)).strftime("%I:%M %p")
 
-    has_duration = valid["interview_duration_min"].notna().any() if "interview_duration_min" in valid.columns else False
-    avg_dur = round(valid["interview_duration_min"].mean(), 1) if has_duration else None
-
-    k_cols = st.columns(5 if has_duration else 4)
+    k_cols = st.columns(4)
     k_cols[0].metric("Interviews with Time", total_with_time)
     k_cols[1].metric("Peak Hour", peak_label)
     k_cols[2].metric("Interviews at Peak", peak_count)
     k_cols[3].metric("Mean Start Time", mean_label)
-    if has_duration:
-        k_cols[4].metric("Avg Duration", f"{avg_dur} min")
 
     # ── Hourly distribution bar chart ────────────────────────────
     all_hours = list(range(0, 24))
@@ -438,33 +407,7 @@ def render_start_time_insights(df, title_suffix=""):
         yaxis_title="Number of Interviews",
         xaxis=dict(tickangle=-45),
     )
-
-    # ── Duration histogram (if available) ────────────────────────
-    fig_dur = None
-    if has_duration:
-        dur_valid = valid["interview_duration_min"].dropna()
-        fig_dur = go.Figure(go.Histogram(
-            x=dur_valid, nbinsx=20,
-            marker_color="#9b59b6",
-            marker_line=dict(color="white", width=1),
-        ))
-        fig_dur.add_vline(x=dur_valid.mean(), line_dash="dot", line_color="#e74c3c",
-                          annotation_text=f"Avg: {dur_valid.mean():.0f} min")
-        fig_dur.update_layout(
-            title="Interview Duration Distribution" + title_suffix,
-            height=420,
-            xaxis_title="Duration (minutes)",
-            yaxis_title="Count",
-        )
-
-    if fig_dur:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.plotly_chart(fig_hourly, use_container_width=True)
-        with c2:
-            st.plotly_chart(fig_dur, use_container_width=True)
-    else:
-        st.plotly_chart(fig_hourly, use_container_width=True)
+    st.plotly_chart(fig_hourly, use_container_width=True)
 
     # ── Time-slot breakdown table ────────────────────────────────
     slots = {
@@ -490,8 +433,7 @@ def render_start_time_insights(df, title_suffix=""):
 
 
 def render_monthly_start_time_trend(df, title_suffix=""):
-    """Render a monthly x hour-of-day heatmap showing interview counts,
-    plus a monthly line chart of mean start time."""
+    """Render a monthly x hour-of-day heatmap and monthly mean start time line."""
     if "start_hour" not in df.columns or "date" not in df.columns:
         return
 
@@ -506,7 +448,6 @@ def render_monthly_start_time_trend(df, title_suffix=""):
     # ── Heatmap: month x hour ────────────────────────────────────
     pivot = valid.groupby(["month", "start_hour"]).size().reset_index(name="count")
     pivot_wide = pivot.pivot(index="start_hour", columns="month", values="count").fillna(0).astype(int)
-    # Ensure all hours 0-23 are present
     pivot_wide = pivot_wide.reindex(range(24), fill_value=0)
     pivot_wide.index = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0") for h in range(24)]
 
@@ -519,7 +460,7 @@ def render_monthly_start_time_trend(df, title_suffix=""):
     fig_heat.update_layout(height=550)
     st.plotly_chart(fig_heat, use_container_width=True)
 
-    # ── Monthly mean start time + count line chart ───────────────
+    # ── Monthly mean start time line chart ───────────────────────
     monthly_agg = valid.groupby("month").agg(
         interviews=("start_hour", "size"),
         mean_start_hour=("start_hour", "mean"),
@@ -529,71 +470,30 @@ def render_monthly_start_time_trend(df, title_suffix=""):
         lambda h: datetime(2000, 1, 1, int(h), int((h % 1) * 60)).strftime("%I:%M %p")
     )
 
-    # Monthly duration mean (if available)
-    has_dur = "interview_duration_min" in valid.columns and valid["interview_duration_min"].notna().any()
-    if has_dur:
-        dur_agg = valid.groupby("month")["interview_duration_min"].mean().round(1).rename("avg_duration_min")
-        monthly_agg = monthly_agg.merge(dur_agg, on="month", how="left")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        fig_count = go.Figure()
-        fig_count.add_trace(go.Bar(
-            x=monthly_agg["month"], y=monthly_agg["interviews"],
-            marker_color="#3498db",
-            text=monthly_agg["interviews"], textposition="outside",
-        ))
-        fig_count.update_layout(
-            title="Monthly Interview Count (with start_time)" + title_suffix,
-            height=400, xaxis_title="Month", yaxis_title="Interviews",
-        )
-        st.plotly_chart(fig_count, use_container_width=True)
-
-    with c2:
-        fig_mean = go.Figure()
-        fig_mean.add_trace(go.Scatter(
-            x=monthly_agg["month"],
-            y=monthly_agg["mean_start_hour"],
-            mode="lines+markers+text",
-            text=monthly_agg["mean_start_label"],
-            textposition="top center",
-            line=dict(color="#e67e22", width=3),
-            marker=dict(size=10),
-        ))
-        fig_mean.update_layout(
-            title="Mean Interview Start Time by Month" + title_suffix,
-            height=400, xaxis_title="Month",
-            yaxis_title="Hour of Day (24h)",
-            yaxis=dict(range=[
-                max(0, monthly_agg["mean_start_hour"].min() - 2),
-                min(24, monthly_agg["mean_start_hour"].max() + 2),
-            ]),
-        )
-        st.plotly_chart(fig_mean, use_container_width=True)
-
-    # ── Monthly avg duration trend (if available) ────────────────
-    if has_dur and "avg_duration_min" in monthly_agg.columns:
-        fig_dur_trend = go.Figure()
-        fig_dur_trend.add_trace(go.Scatter(
-            x=monthly_agg["month"],
-            y=monthly_agg["avg_duration_min"],
-            mode="lines+markers+text",
-            text=monthly_agg["avg_duration_min"].apply(lambda v: f"{v:.0f} min" if pd.notna(v) else ""),
-            textposition="top center",
-            line=dict(color="#9b59b6", width=3),
-            marker=dict(size=10),
-        ))
-        fig_dur_trend.update_layout(
-            title="Avg Interview Duration by Month" + title_suffix,
-            height=400, xaxis_title="Month", yaxis_title="Duration (minutes)",
-        )
-        st.plotly_chart(fig_dur_trend, use_container_width=True)
+    fig_mean = go.Figure()
+    fig_mean.add_trace(go.Scatter(
+        x=monthly_agg["month"],
+        y=monthly_agg["mean_start_hour"],
+        mode="lines+markers+text",
+        text=monthly_agg["mean_start_label"],
+        textposition="top center",
+        line=dict(color="#e67e22", width=3),
+        marker=dict(size=10),
+    ))
+    fig_mean.update_layout(
+        title="Mean Interview Start Time by Month" + title_suffix,
+        height=400, xaxis_title="Month",
+        yaxis_title="Hour of Day (24h)",
+        yaxis=dict(range=[
+            max(0, monthly_agg["mean_start_hour"].min() - 2),
+            min(24, monthly_agg["mean_start_hour"].max() + 2),
+        ]),
+    )
+    st.plotly_chart(fig_mean, use_container_width=True)
 
     with st.expander("Monthly Start Time Data" + title_suffix):
-        display_cols = ["month", "interviews", "mean_start_label"]
-        if has_dur and "avg_duration_min" in monthly_agg.columns:
-            display_cols.append("avg_duration_min")
-        st.dataframe(monthly_agg[display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(monthly_agg[["month", "interviews", "mean_start_label"]],
+                     use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1376,10 +1276,6 @@ def main():
             peak_h = int(valid_st.value_counts().idxmax())
             peak_lbl = datetime(2000, 1, 1, peak_h).strftime("%I:%M %p")
             st.sidebar.metric("Peak Interview Hour", peak_lbl)
-            if "interview_duration_min" in support_df.columns:
-                avg_d = support_df["interview_duration_min"].dropna()
-                if not avg_d.empty:
-                    st.sidebar.metric("Avg Duration", f"{avg_d.mean():.0f} min")
 
     hist = hist_monthly_df(selected_support)
     live = live_monthly(support_df)
@@ -1874,7 +1770,6 @@ def main():
         tab_names = ["Experts", "Companies", "Rounds",
                      "Day of Week", "All Support Types",
                      "Candidates", "Technology"]
-        # Add Start Time tab for Interview Support
         if selected_support == "Interview Support" and "start_hour" in support_df.columns:
             tab_names.append("Start Time Analysis")
 
