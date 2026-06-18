@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import requests
 import io
 import re
@@ -356,6 +356,9 @@ def add_start_time_columns(df):
     df["start_hour"] = start_parsed.dt.hour
     df["start_hour_label"] = start_parsed.dt.strftime("%I %p")
 
+    # Store parsed datetime for clash detection (minutes-level precision)
+    df["_parsed_start"] = start_parsed
+
     return df
 
 
@@ -494,6 +497,192 @@ def render_monthly_start_time_trend(df, title_suffix=""):
     with st.expander("Monthly Start Time Data" + title_suffix):
         st.dataframe(monthly_agg[["month", "interviews", "mean_start_label"]],
                      use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SCHEDULING CLASH DETECTION
+#  Rule: same expert, same day, 2+ interviews within 30-min window
+#  A clash = any pair where |start_time_A - start_time_B| <= 30 min
+# ═══════════════════════════════════════════════════════════════════
+
+def detect_expert_clashes(df):
+    """Detect scheduling clashes for experts.
+
+    Returns a DataFrame of clash pairs with columns:
+        expert_name, date, start_time_1, start_time_2,
+        time_diff_min, month
+    Each row represents one clashing pair of interviews.
+    """
+    if "_parsed_start" not in df.columns or "expert_name" not in df.columns or "date" not in df.columns:
+        return pd.DataFrame()
+
+    valid = df.dropna(subset=["_parsed_start", "expert_name", "date"]).copy()
+    if valid.empty:
+        return pd.DataFrame()
+
+    valid["_day"] = valid["date"].dt.date
+    # Extract time-of-day as total minutes since midnight for comparison
+    valid["_start_minutes"] = valid["_parsed_start"].dt.hour * 60 + valid["_parsed_start"].dt.minute
+
+    clash_rows = []
+    for (expert, day), grp in valid.groupby(["expert_name", "_day"]):
+        if len(grp) < 2:
+            continue
+        sorted_grp = grp.sort_values("_start_minutes")
+        minutes_list = sorted_grp["_start_minutes"].values
+        times_list = sorted_grp["_parsed_start"].dt.strftime("%I:%M %p").values
+        indices = sorted_grp.index.values
+
+        # Check all pairs (since group is typically small)
+        for i in range(len(sorted_grp)):
+            for j in range(i + 1, len(sorted_grp)):
+                diff = abs(int(minutes_list[j]) - int(minutes_list[i]))
+                if diff <= 30:
+                    clash_rows.append({
+                        "expert_name": expert,
+                        "date": day,
+                        "start_time_1": times_list[i],
+                        "start_time_2": times_list[j],
+                        "time_diff_min": diff,
+                    })
+
+    if not clash_rows:
+        return pd.DataFrame()
+
+    clash_df = pd.DataFrame(clash_rows)
+    clash_df["date"] = pd.to_datetime(clash_df["date"])
+    clash_df["month"] = clash_df["date"].dt.to_period("M").astype(str)
+    return clash_df
+
+
+def render_clash_summary(df, title_suffix=""):
+    """Render the Scheduling Clash Summary section.
+    df should be the Interview Support dataframe with _parsed_start column.
+    """
+    clash_df = detect_expert_clashes(df)
+
+    st.subheader("Scheduling Clash Detection" + title_suffix)
+    st.caption("A clash occurs when the same expert has 2+ interviews within a 30-minute window on the same day.")
+
+    if clash_df.empty:
+        st.success("No scheduling clashes detected" + title_suffix + ".")
+        return
+
+    # ── KPI row ──────────────────────────────────────────────────
+    total_clash_pairs = len(clash_df)
+    experts_with_clashes = clash_df["expert_name"].nunique()
+    days_with_clashes = clash_df["date"].dt.date.nunique()
+    # Count total interviews involved in clashes (unique times per expert per day)
+    interviews_in_clashes = 0
+    for (expert, day), grp in clash_df.groupby(["expert_name", clash_df["date"].dt.date]):
+        unique_times = set(grp["start_time_1"].tolist() + grp["start_time_2"].tolist())
+        interviews_in_clashes += len(unique_times)
+
+    k = st.columns(4)
+    k[0].metric("Clash Pairs", total_clash_pairs)
+    k[1].metric("Experts with Clashes", experts_with_clashes)
+    k[2].metric("Days with Clashes", days_with_clashes)
+    k[3].metric("Interviews in Clashes", interviews_in_clashes)
+
+    # ── Expert-wise clash summary ────────────────────────────────
+    expert_clash = clash_df.groupby("expert_name").agg(
+        clash_pairs=("expert_name", "size"),
+        clash_days=("date", lambda x: x.dt.date.nunique()),
+    ).reset_index().sort_values("clash_pairs", ascending=False)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fig = go.Figure(go.Bar(
+            y=expert_clash["expert_name"],
+            x=expert_clash["clash_pairs"],
+            orientation="h",
+            marker_color="#e74c3c",
+            text=expert_clash["clash_pairs"],
+            textposition="outside",
+        ))
+        fig.update_layout(
+            title="Clash Pairs by Expert" + title_suffix,
+            height=max(400, len(expert_clash) * 35),
+            yaxis=dict(autorange="reversed"),
+            xaxis_title="Number of Clash Pairs",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        # Monthly clash trend
+        monthly_clash = clash_df.groupby("month").agg(
+            clash_pairs=("month", "size"),
+            experts=("expert_name", "nunique"),
+        ).reset_index()
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Bar(
+            x=monthly_clash["month"],
+            y=monthly_clash["clash_pairs"],
+            marker_color="#e74c3c",
+            text=monthly_clash["clash_pairs"],
+            textposition="outside",
+            name="Clash Pairs",
+        ))
+        fig2.add_trace(go.Scatter(
+            x=monthly_clash["month"],
+            y=monthly_clash["experts"],
+            mode="lines+markers+text",
+            text=monthly_clash["experts"],
+            textposition="top center",
+            line=dict(color="#f39c12", width=2),
+            marker=dict(size=8),
+            name="Experts Affected",
+            yaxis="y2",
+        ))
+        fig2.update_layout(
+            title="Monthly Clash Trend" + title_suffix,
+            height=420,
+            yaxis=dict(title="Clash Pairs"),
+            yaxis2=dict(title="Experts Affected", overlaying="y", side="right"),
+            legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # ── Expert-wise clash table ──────────────────────────────────
+    with st.expander("Expert Clash Summary Table" + title_suffix):
+        st.dataframe(expert_clash, use_container_width=True, hide_index=True)
+
+    # ── Detailed clash pairs ─────────────────────────────────────
+    with st.expander("Detailed Clash Pairs" + title_suffix):
+        display_clash = clash_df.copy()
+        display_clash["date"] = display_clash["date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(
+            display_clash[["expert_name", "date", "start_time_1", "start_time_2", "time_diff_min", "month"]],
+            use_container_width=True, hide_index=True,
+        )
+
+
+def render_today_clash_summary(df):
+    """Render a compact clash summary for today's snapshot."""
+    clash_df = detect_expert_clashes(df)
+
+    if clash_df.empty:
+        st.success("No scheduling clashes today.")
+        return
+
+    total_pairs = len(clash_df)
+    experts_affected = clash_df["expert_name"].nunique()
+
+    k = st.columns(3)
+    k[0].metric("Clash Pairs Today", total_pairs)
+    k[1].metric("Experts Affected", experts_affected)
+    # List the expert names
+    expert_list = ", ".join(clash_df["expert_name"].unique().tolist())
+    k[2].metric("Clash Experts", expert_list if len(expert_list) < 40 else str(experts_affected) + " experts")
+
+    with st.expander("Today's Clash Details"):
+        display_clash = clash_df.copy()
+        display_clash["date"] = display_clash["date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(
+            display_clash[["expert_name", "date", "start_time_1", "start_time_2", "time_diff_min"]],
+            use_container_width=True, hide_index=True,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -988,7 +1177,7 @@ def round_charts(df, title_suffix=""):
     c1, c2 = st.columns(2)
     with c1:
         fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
-                              textinfo="label+value+percent"))
+                               textinfo="label+value+percent"))
         fig.update_layout(title="Round Distribution" + title_suffix, height=420)
         st.plotly_chart(fig, use_container_width=True)
     with c2:
@@ -1157,28 +1346,25 @@ def transcript_analyzer_view():
                     st.markdown("---")
                     st.subheader("Detailed " + unit_name + " Scores")
                     for i, chunk in enumerate(chunks):
+                        c_score = chunk["score"]
                         c_label = chunk["label"]
-                        score_str = f"{chunk['score']:+.1f}%" if chunk["score"] is not None else "N/A"
-
-                        with st.expander(
-                            unit_name + " " + str(i + 1) + ": " + c_label + " (" + score_str + ") — " + chunk["text"]
-                        ):
-                            if chunk["score"] is not None:
-                                mc = st.columns(4)
-                                mc[0].metric("Score", score_str)
-                                mc[1].metric("P(Positive)", f"{chunk['p_positive']:.1f}%")
-                                mc[2].metric("P(Neutral)", f"{chunk['p_neutral']:.1f}%")
-                                mc[3].metric("P(Negative)", f"{chunk['p_negative']:.1f}%")
-                            st.markdown("**Full text:**")
-                            st.text(chunk["full_text"])
-
+                        c_color = sentiment_color(c_score) if c_score is not None else "#999"
+                        with st.expander(unit_name + " " + str(i + 1) + " — " + c_label +
+                                         (" (" + f"{c_score:+.1f}%" + ")" if c_score is not None else "")):
+                            st.markdown(chunk["full_text"])
+                            if c_score is not None:
+                                st.markdown(
+                                    f"**Score:** {c_score:+.1f}% · "
+                                    f"P(pos) {chunk['p_positive']:.1f}% · "
+                                    f"P(neu) {chunk['p_neutral']:.1f}% · "
+                                    f"P(neg) {chunk['p_negative']:.1f}%"
+                                )
             else:
                 col_donut, col_info = st.columns(2)
                 with col_donut:
                     st.plotly_chart(fig_donut, use_container_width=True)
                 with col_info:
                     st.markdown(
-                        "### Interpretation\n\n"
                         "The overall sentiment score is **" + f"{ov_score:+.1f}%" + "** (" + ov_label + ").\n\n"
                         "- **P(Positive)**: " + f"{overall['p_positive']:.1f}%" + "\n"
                         "- **P(Neutral)**: " + f"{overall['p_neutral']:.1f}%" + "\n"
@@ -1277,6 +1463,14 @@ def main():
             peak_lbl = datetime(2000, 1, 1, peak_h).strftime("%I:%M %p")
             st.sidebar.metric("Peak Interview Hour", peak_lbl)
 
+    # ── Sidebar: Clash indicator for Interview Support ────────────
+    if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
+        clash_check = detect_expert_clashes(support_df)
+        if not clash_check.empty:
+            st.sidebar.markdown("---")
+            st.sidebar.metric("⚠️ Total Clash Pairs", len(clash_check))
+            st.sidebar.metric("Experts with Clashes", clash_check["expert_name"].nunique())
+
     hist = hist_monthly_df(selected_support)
     live = live_monthly(support_df)
     if not hist.empty and not live.empty:
@@ -1291,15 +1485,15 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
-                                  "Daily Drill-Down", "Deep-Dive Analytics",
-                                  "Transcript Analyzer"],
+                                           "Daily Drill-Down", "Deep-Dive Analytics",
+                                           "Transcript Analyzer"],
                             label_visibility="collapsed")
 
     # ======= TRANSCRIPT ANALYZER =======
     if view == "Transcript Analyzer":
         transcript_analyzer_view()
         st.sidebar.markdown("---")
-        st.sidebar.caption("Vizva Dashboard v17.0 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics")
+        st.sidebar.caption("Vizva Dashboard v18.0 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics | Clash Detection")
         return
 
     # ======= TODAY =======
@@ -1332,6 +1526,12 @@ def main():
             st.markdown("---")
             render_start_time_insights(today_df, title_suffix=" - " + str(today))
 
+        # ── TODAY'S CLASH DETECTION (Interview Support only) ──────
+        if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
+            st.markdown("---")
+            st.subheader("Scheduling Clashes - " + str(today))
+            render_today_clash_summary(today_df)
+
         if not today_df.empty:
             c1, c2 = st.columns(2)
             with c1:
@@ -1356,11 +1556,11 @@ def main():
                 st.subheader("Round Breakdown - " + str(today))
                 round_charts(today_df, " - " + str(today))
 
-            # ── SENTIMENT DONUT + HISTOGRAM — TODAY ───────────────
+            # ── SENTIMENT DONUT + HISTOGRAM — TODAY ──────────────
             st.markdown("---")
             render_sentiment_section(today_df, section_title="Sentiment Analysis - " + str(today))
 
-            # ── FEEDBACK WORD CLOUD — TODAY ───────────────────────
+            # ── FEEDBACK WORD CLOUD — TODAY ──────────────────────
             st.markdown("---")
             feedback_texts = extract_feedback_texts(today_df)
             render_wordcloud_section(
@@ -1455,6 +1655,7 @@ def main():
                 avg = cm_stats["avg"]
                 st.columns(6)[0].empty()  # spacer
                 sent_cols = st.columns(4)
+
                 sent_cols[0].metric("Avg Sentiment (This Month)", f"{avg:+.1f}%",
                                     delta=sentiment_label(avg),
                                     delta_color="normal" if avg >= 0 else "inverse")
@@ -1486,157 +1687,75 @@ def main():
             st.markdown("---")
             render_monthly_start_time_trend(support_df, title_suffix=" - " + support_label)
 
+        # ── CLASH DETECTION — OVERALL (Interview Support) ────────
+        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
+            st.markdown("---")
+            render_clash_summary(support_df, title_suffix=" - All Months")
+
         # ── MONTHLY SENTIMENT TREND ──────────────────────────────
         st.markdown("---")
-        st.subheader("Sentiment Trend Across Months")
-
+        st.subheader("Monthly Sentiment Trends")
         sent_monthly = monthly_sentiment_trend(support_df)
         if not sent_monthly.empty:
-            c1, c2 = st.columns(2)
-            with c1:
-                fig = render_sentiment_trend_chart(sent_monthly, "Monthly Avg Sentiment - " + support_label)
+            col_t, col_s = st.columns(2)
+            with col_t:
+                fig = render_sentiment_trend_chart(sent_monthly, "Monthly Avg Sentiment")
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
-            with c2:
+            with col_s:
                 fig = render_sentiment_stacked_bar(sent_monthly, "Monthly Sentiment Breakdown")
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
-
-            with st.expander("Monthly Sentiment Data"):
+            with st.expander("Sentiment Trend Data"):
                 st.dataframe(sent_monthly, use_container_width=True)
         else:
-            st.info("No feedback data available for sentiment trend.")
+            st.info("No sentiment data available for trend analysis.")
 
-        with st.expander("Monthly Data Table"):
-            st.dataframe(monthly, use_container_width=True)
-
-        # ── FEEDBACK ANALYSIS (Word Cloud + Sentiment per month) ──
-        st.markdown("---")
-        st.subheader("Feedback Analysis")
-
-        if "date" in support_df.columns:
-            fb_df = support_df.copy()
-            fb_df["month"] = fb_df["date"].dt.to_period("M").astype(str)
-            fb_months = sorted(fb_df["month"].unique())
-
-            fb_month_options = ["All Months"] + fb_months
-            sel_fb_month = st.selectbox(
-                "Select Month for Feedback Analysis",
-                fb_month_options,
-                index=len(fb_month_options) - 1,
-                key="fb_month_sel",
-            )
-
-            if sel_fb_month == "All Months":
-                fb_subset = fb_df
-            else:
-                fb_subset = fb_df[fb_df["month"] == sel_fb_month]
-
-            render_sentiment_section(fb_subset,
-                                     section_title="Sentiment - " + support_label + " - " + sel_fb_month)
-
-            st.markdown("")
-
-            feedback_texts = extract_feedback_texts(fb_subset)
-            render_wordcloud_section(
-                feedback_texts,
-                section_title="Feedback Word Cloud - " + support_label + " - " + sel_fb_month,
-            )
-
-        # -- ROUND WISE MONTHLY (Interview Support Only) --
-        if selected_support == "Interview Support" and "round_name" in support_df.columns:
+        # ── MONTHLY (Interview Support Only) ─────────────────────
+        if selected_support == "Interview Support":
             st.markdown("---")
             st.subheader("Round-wise Monthly Breakdown")
+            if "round_name" in support_df.columns:
+                support_df_copy = support_df.copy()
+                support_df_copy["month"] = support_df_copy["date"].dt.to_period("M").astype(str)
+                months_available = sorted(support_df_copy["month"].unique(), reverse=True)
+                sel_month = st.selectbox("Select Month", months_available, index=0, key="round_month")
+                month_data = support_df_copy[support_df_copy["month"] == sel_month]
+                if not month_data.empty:
+                    round_charts(month_data, " - " + sel_month)
+                    if "round_name" in month_data.columns:
+                        month_round_df = month_data.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
+                        st.dataframe(month_round_df, use_container_width=True)
 
-            month_round_df = support_df.copy()
-            month_round_df["month"] = month_round_df["date"].dt.to_period("M").astype(str)
-
-            round_months = sorted(month_round_df["month"].unique())
-            sel_round_month = st.selectbox("Select Month  ", round_months, index=len(round_months) - 1, key="round_month")
-
-            round_month_data = month_round_df[month_round_df["month"] == sel_round_month]
-
-            if not round_month_data.empty:
-                round_charts(round_month_data, " - " + sel_round_month)
-            else:
-                st.info("No data for " + sel_round_month)
-
-        # -- EXPERT WISE MONTHLY --
-        st.markdown("---")
-        st.subheader("Expert-wise Monthly Breakdown")
-
-        exp_monthly = expert_monthly(support_df)
-        if not exp_monthly.empty:
-            months_available = sorted(exp_monthly["month"].unique())
-            selected_month = st.selectbox("Select Month", months_available, index=len(months_available) - 1)
-
-            month_exp = exp_monthly[exp_monthly["month"] == selected_month].sort_values("total", ascending=False)
-
+            st.markdown("---")
+            st.subheader("Expert-wise Monthly Breakdown")
+            month_exp = expert_monthly(support_df)
             if not month_exp.empty:
-                fig = go.Figure()
-                for s in TASK_ORDER:
-                    if s in month_exp.columns:
-                        fig.add_trace(go.Bar(x=month_exp["expert_name"], y=month_exp[s],
-                                             name=TASK_LABEL[s], marker_color=CLR[s],
-                                             text=month_exp[s], textposition="inside"))
-                fig.update_layout(barmode="stack", title="Expert Counts - " + selected_month, height=500)
-                st.plotly_chart(fig, use_container_width=True)
+                sel_m2 = st.selectbox("Select Month", sorted(month_exp["month"].unique(), reverse=True),
+                                      index=0, key="exp_month")
+                me = month_exp[month_exp["month"] == sel_m2].sort_values("total", ascending=False)
+                st.dataframe(me, use_container_width=True)
 
-                st.dataframe(month_exp[["expert_name", "completed", "rescheduled", "cancelled",
-                                        "pending", "total", "candidates"]],
-                             use_container_width=True)
-
-            st.subheader("Expert Trend Across Months")
-            experts_list = sorted(exp_monthly["expert_name"].unique())
-            selected_expert = st.selectbox("Select Expert", experts_list)
-
-            expert_trend = exp_monthly[exp_monthly["expert_name"] == selected_expert].sort_values("month")
-            if not expert_trend.empty:
-                fig = go.Figure()
-                for s in TASK_ORDER:
-                    if s in expert_trend.columns:
-                        fig.add_trace(go.Scatter(x=expert_trend["month"], y=expert_trend[s],
-                                                 mode="lines+markers", name=TASK_LABEL[s],
-                                                 line=dict(color=CLR[s])))
-                fig.update_layout(title=selected_expert + " - Monthly Trend", height=400)
-                st.plotly_chart(fig, use_container_width=True)
-
-        # -- CANDIDATE WISE MONTHLY --
+        # ── CANDIDATE-WISE MONTHLY COUNTS (all support types) ────
         st.markdown("---")
         st.subheader("Candidate-wise Monthly Counts (All Support Types)")
-
         cand_monthly = candidate_monthly_support(active_expert_df)
         if not cand_monthly.empty:
-            cand_months = sorted(cand_monthly["month"].unique())
-            sel_cand_month = st.selectbox("Select Month ", cand_months, index=len(cand_months) - 1, key="cand_month")
+            sel_m3 = st.selectbox("Select Month", sorted(cand_monthly["month"].unique(), reverse=True),
+                                  index=0, key="cand_month")
+            cm = cand_monthly[cand_monthly["month"] == sel_m3].sort_values("total", ascending=False)
+            st.dataframe(cm, use_container_width=True)
 
-            cand_month_data = cand_monthly[cand_monthly["month"] == sel_cand_month].sort_values("total", ascending=False)
-
-            if not cand_month_data.empty:
-                support_colors = {"Interview Support": "#3498db", "Assessment Support": "#e67e22",
-                                  "Mock Interview": "#9b59b6", "Resume Understanding": "#1abc9c"}
-                fig = go.Figure()
-                for stype in SUPPORT_TYPES:
-                    if stype in cand_month_data.columns:
-                        fig.add_trace(go.Bar(x=cand_month_data["candidate_name"],
-                                             y=cand_month_data[stype],
-                                             name=stype, marker_color=support_colors.get(stype, "#95a5a6"),
-                                             text=cand_month_data[stype], textposition="inside"))
-                fig.update_layout(barmode="stack",
-                                  title="Candidate Counts - " + sel_cand_month,
-                                  height=500, xaxis_tickangle=-45)
-                st.plotly_chart(fig, use_container_width=True)
-
-                st.dataframe(cand_month_data, use_container_width=True)
-
-    # ======= DAILY =======
+    # ======= DAILY DRILL-DOWN =======
     elif view == "Daily Drill-Down":
         st.header("Daily Drill-Down - " + support_label)
-        min_d = support_df["date"].dt.date.min()
-        max_d = support_df["date"].dt.date.max()
-
-        ca, cb = st.sidebar.columns(2)
-        start = ca.date_input("From", value=max(min_d, date(2026, 5, 1)),
+        if "date" not in support_df.columns:
+            st.warning("No date column available.")
+            st.stop()
+        min_d = support_df["date"].min().date()
+        max_d = support_df["date"].max().date()
+        ca, cb = st.columns(2)
+        start = ca.date_input("From", value=max_d - timedelta(days=30),
                               min_value=min_d, max_value=max_d)
         end = cb.date_input("To", value=max_d, min_value=min_d, max_value=max_d)
 
@@ -1767,12 +1886,12 @@ def main():
     elif view == "Deep-Dive Analytics":
         st.header("Deep-Dive Analytics - " + support_label)
 
-        tab_names = ["Experts", "Companies", "Rounds",
-                     "Day of Week", "All Support Types",
-                     "Candidates", "Technology"]
+        # Build tab list dynamically
+        tab_names = ["Experts", "Companies", "Rounds", "Day of Week", "Cross-Support", "Candidates", "Technology"]
         if selected_support == "Interview Support" and "start_hour" in support_df.columns:
-            tab_names.append("Start Time Analysis")
-
+            tab_names.append("Start Time")
+        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
+            tab_names.append("Clash Detection")
         tabs = st.tabs(tab_names)
 
         with tabs[0]:
@@ -1810,7 +1929,7 @@ def main():
             if "round_name" in support_df.columns:
                 rc = support_df["round_name"].value_counts()
                 fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
-                                      textinfo="label+value+percent"))
+                                       textinfo="label+value+percent"))
                 fig.update_layout(title="Round Distribution", height=420)
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -1901,13 +2020,19 @@ def main():
                 st.markdown("---")
                 render_monthly_start_time_trend(support_df, title_suffix="")
 
+        # ── CLASH DETECTION TAB (Interview Support only) ─────────
+        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
+            clash_tab_idx = len(tab_names) - 1
+            with tabs[clash_tab_idx]:
+                render_clash_summary(support_df, title_suffix=" - All Data")
+
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v17.0 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics")
+    st.sidebar.caption("Vizva Dashboard v18.0 | API-powered | Active Experts Only | RoBERTa ONNX | Start Time Analytics | Clash Detection")
 
 
-# ================================================================
+# ═══════════════════════════════════════════════════════════════════
 # AUTHENTICATION LAYER
-# ================================================================
+# ═══════════════════════════════════════════════════════════════════
 
 def login():
     st.title("Vizva Secure Access")
