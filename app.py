@@ -403,7 +403,7 @@ def render_start_time_insights(df, title_suffix=""):
     st.plotly_chart(fig_hourly, use_container_width=True)
 
     slots = {
-        "Early Morning (6-9 AM)": (6, 9),
+        "Early Morning (7-9 AM)": (6, 9),
         "Morning (9 AM-12 PM)": (9, 12),
         "Afternoon (12-3 PM)": (12, 15),
         "Late Afternoon (3-6 PM)": (15, 18),
@@ -425,7 +425,7 @@ def render_start_time_insights(df, title_suffix=""):
 
 
 def render_monthly_start_time_trend(df, title_suffix=""):
-    """Render a monthly x hour-of-day heatmap and monthly mean start time line."""
+    """Render a monthly × hour-of-day heatmap and monthly mean start time line."""
     if "start_hour" not in df.columns or "date" not in df.columns:
         return
 
@@ -775,7 +775,6 @@ def render_clash_summary(df, title_suffix=""):
 
     with col_m2:
         monthly_mean = clash_groups.groupby("month").agg(
-            clash_groups_count=("group_size", "size"),
             mean_start=("mean_start_minutes", "mean"),
         ).reset_index()
         monthly_mean["mean_start_label"] = monthly_mean["mean_start"].apply(
@@ -805,24 +804,22 @@ def render_clash_summary(df, title_suffix=""):
         )
         st.plotly_chart(fig_mm, use_container_width=True)
 
-    # ── Clash Time-of-Day Distribution ───────────────────────────
+    # ── Time-of-Day Distribution ─────────────────────────────────
     st.markdown("---")
     st.subheader("Clash Time-of-Day Distribution" + title_suffix)
-    st.caption("Which hours of the day do clashes most frequently occur?")
 
     clash_hours = (clash_groups["mean_start_minutes"] // 60).astype(int)
-    hour_clash_counts = clash_hours.value_counts().sort_index()
-
+    hour_counts = clash_hours.value_counts().sort_index()
     all_hours = list(range(0, 24))
-    hour_labels_clash = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0") for h in all_hours]
-    counts_clash = [int(hour_clash_counts.get(h, 0)) for h in all_hours]
-    peak_clash_h = int(hour_clash_counts.idxmax()) if not hour_clash_counts.empty else 0
-    bar_colors_clash = ["#e74c3c" if h == peak_clash_h else "#f39c12" for h in all_hours]
+    hour_labels = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0") for h in all_hours]
+    counts = [int(hour_counts.get(h, 0)) for h in all_hours]
+    peak_h = int(hour_counts.idxmax()) if not hour_counts.empty else 0
+    bar_colors = ["#e74c3c" if h == peak_h else "#f39c12" for h in all_hours]
 
     fig_hour = go.Figure(go.Bar(
-        x=hour_labels_clash, y=counts_clash,
-        marker_color=bar_colors_clash,
-        text=counts_clash, textposition="outside",
+        x=hour_labels, y=counts,
+        marker_color=bar_colors,
+        text=counts, textposition="outside",
     ))
     fig_hour.update_layout(
         title="Clash Groups by Hour of Day" + title_suffix,
@@ -943,30 +940,25 @@ def detect_blockages(df):
     valid["_day"] = valid["date"].dt.date
     valid["_start_minutes"] = valid["_parsed_start"].dt.hour * 60 + valid["_parsed_start"].dt.minute
 
-    # Pre-compute the active expert pool (based on last 5 dates in the full dataset)
-    base_active = _get_active_experts(df)
+    global_active = _get_active_experts(valid)
+    if not global_active:
+        return empty
 
     blockage_rows = []
 
     for day_val, day_grp in valid.groupby("_day"):
-        # Active experts for this day = base pool + any new experts on this day
-        experts_on_day = set(day_grp["expert_name"].unique())
-        day_active = base_active | experts_on_day
-
-        if len(day_active) < 2:
-            continue
-
+        day_experts = set(day_grp["expert_name"].unique())
+        day_active = global_active | day_experts
         total_active = len(day_active)
 
-        # If any active expert has 0 interviews today, blockage is impossible
-        experts_with_interviews_today = experts_on_day
-        if len(day_active - experts_with_interviews_today) > 0:
+        if total_active == 0:
             continue
 
-        # Scan 30-minute brackets: 0, 30, 60, ..., 1410
-        for bracket_start in range(0, 1440, 30):
-            bracket_end = bracket_start + 30
+        min_start = int(day_grp["_start_minutes"].min())
+        max_start = int(day_grp["_start_minutes"].max())
 
+        for bracket_start in range(max(0, min_start - 30), min(max_start + 30, 24 * 60), 15):
+            bracket_end = bracket_start + 30
             in_bracket = day_grp[
                 (day_grp["_start_minutes"] >= bracket_start) &
                 (day_grp["_start_minutes"] < bracket_end)
@@ -1182,7 +1174,6 @@ def render_blockage_summary(df, title_suffix=""):
 
     blockage_hours = (blockages["bracket_start_min"] // 60).astype(int)
     hour_counts = blockage_hours.value_counts().sort_index()
-
     all_hours = list(range(0, 24))
     hour_labels = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0") for h in all_hours]
     counts = [int(hour_counts.get(h, 0)) for h in all_hours]
@@ -1604,16 +1595,26 @@ def day_of_week_chart(idf):
     return fig
 
 
+# ── CHANGED: round_charts now uses ONLY completed for pie ────────
 def round_charts(df, title_suffix=""):
     if "round_name" not in df.columns or df.empty:
         return
-    rc = df["round_name"].value_counts()
+
+    # ── Pie chart: ONLY completed interviews ─────────────────────
+    completed_df = df[df["task_status"] == "completed"] if "task_status" in df.columns else df
+    rc = completed_df["round_name"].value_counts()
+
     c1, c2 = st.columns(2)
     with c1:
-        fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
-                               textinfo="label+value+percent"))
-        fig.update_layout(title="Round Distribution" + title_suffix, height=420)
-        st.plotly_chart(fig, use_container_width=True)
+        if rc.empty:
+            st.info("No completed interviews for round distribution" + title_suffix)
+        else:
+            fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
+                                   textinfo="label+value+percent"))
+            fig.update_layout(title="Round Distribution (Completed Only)" + title_suffix, height=420)
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ── Stacked bar: all statuses for reference ──────────────────
     with c2:
         rt = df.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
         fig2 = go.Figure()
@@ -1690,7 +1691,7 @@ def main():
 
     st.sidebar.success("Showing " + str(len(support_df)) + " " + support_label + " rows")
 
-    # ── Sidebar: Overall sentiment gauge for selected support type ─
+    # ── Sidebar: Overall sentiment gauge for selected support type
     overall_stats = get_sentiment_stats(support_df)
     if overall_stats:
         avg = overall_stats["avg"]
@@ -1710,7 +1711,7 @@ def main():
             peak_lbl = datetime(2000, 1, 1, peak_h).strftime("%I:%M %p")
             st.sidebar.metric("Peak Interview Hour", peak_lbl)
 
-    # ── Sidebar: Clash indicator for Interview Support ────────────
+    # ── Sidebar: Clash indicator for Interview Support ───────────
     if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
         clash_groups_check, _ = detect_expert_clashes(support_df)
         if not clash_groups_check.empty:
@@ -1738,7 +1739,7 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
-                                            "Daily Drill-Down", "Deep-Dive Analytics"],
+                                             "Daily Drill-Down", "Deep-Dive Analytics"],
                             label_visibility="collapsed")
 
     # ======= TODAY =======
@@ -1988,9 +1989,114 @@ def main():
             month_exp = expert_monthly(support_df)
             if not month_exp.empty:
                 sel_m2 = st.selectbox("Select Month", sorted(month_exp["month"].unique(), reverse=True),
-                                      index=0, key="exp_month")
+                                                     index=0, key="exp_month")
                 me = month_exp[month_exp["month"] == sel_m2].sort_values("total", ascending=False)
                 st.dataframe(me, use_container_width=True)
+
+        # ── NEW: COMPLETED ROUNDS ANALYSIS & FINAL BY WHOM ───────
+        if selected_support == "Interview Support":
+            st.markdown("---")
+            st.subheader("Completed Rounds Analysis & Final Given By Whom")
+            st.caption("Shows only completed interviews — which rounds were completed, who gave the Final round, and their sentiment scores.")
+
+            if "round_name" in support_df.columns and "date" in support_df.columns:
+                completed_iv = support_df[support_df["task_status"] == "completed"].copy()
+                if completed_iv.empty:
+                    st.info("No completed interviews found.")
+                else:
+                    completed_iv["month"] = completed_iv["date"].dt.to_period("M").astype(str)
+
+                    # ── Monthly Completed Rounds KPI ─────────────
+                    months_avail_cr = sorted(completed_iv["month"].unique(), reverse=True)
+                    sel_cr_month = st.selectbox("Select Month", months_avail_cr, index=0, key="completed_rounds_month")
+                    cr_month_data = completed_iv[completed_iv["month"] == sel_cr_month]
+
+                    if cr_month_data.empty:
+                        st.info("No completed interviews in " + sel_cr_month)
+                    else:
+                        cr_cols = st.columns(3)
+                        cr_cols[0].metric("Completed Interviews", len(cr_month_data))
+                        cr_cols[1].metric("Unique Rounds", cr_month_data["round_name"].nunique())
+                        cr_cols[2].metric("Unique Experts", cr_month_data["expert_name"].nunique() if "expert_name" in cr_month_data.columns else 0)
+
+                        # ── Round Distribution (Completed Only) ──
+                        cr_round_counts = cr_month_data["round_name"].value_counts()
+                        cr_c1, cr_c2 = st.columns(2)
+                        with cr_c1:
+                            fig_cr = go.Figure(go.Pie(labels=cr_round_counts.index, values=cr_round_counts.values,
+                                                      hole=.4, textinfo="label+value+percent"))
+                            fig_cr.update_layout(title="Completed Rounds - " + sel_cr_month, height=420)
+                            st.plotly_chart(fig_cr, use_container_width=True)
+
+                        with cr_c2:
+                            if "expert_name" in cr_month_data.columns:
+                                re_pivot = cr_month_data.groupby(["round_name", "expert_name"]).size().reset_index(name="count")
+                                top_experts_cr = re_pivot.groupby("expert_name")["count"].sum().nlargest(10).index
+                                re_pivot_top = re_pivot[re_pivot["expert_name"].isin(top_experts_cr)]
+                                fig_re = go.Figure()
+                                for exp in sorted(top_experts_cr):
+                                    exp_data = re_pivot_top[re_pivot_top["expert_name"] == exp]
+                                    fig_re.add_trace(go.Bar(x=exp_data["round_name"], y=exp_data["count"],
+                                                            name=exp, text=exp_data["count"], textposition="inside"))
+                                fig_re.update_layout(barmode="stack", title="Rounds by Expert (Top 10) - " + sel_cr_month,
+                                                     height=420, legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
+                                st.plotly_chart(fig_re, use_container_width=True)
+
+                        # ── "Final" Round — Given By Whom ────────
+                        st.markdown("---")
+                        st.subheader("Final Round — Given By Whom (" + sel_cr_month + ")")
+                        final_mask = cr_month_data["round_name"].str.lower().str.contains("final", na=False)
+                        final_data = cr_month_data[final_mask]
+
+                        if final_data.empty:
+                            st.info("No 'Final' rounds found in completed interviews for " + sel_cr_month)
+                        else:
+                            fc = st.columns(3)
+                            fc[0].metric("Final Rounds Completed", len(final_data))
+                            fc[1].metric("Experts Who Gave Final", final_data["expert_name"].nunique() if "expert_name" in final_data.columns else 0)
+                            fc[2].metric("Candidates in Final", final_data["candidate_name"].nunique() if "candidate_name" in final_data.columns else 0)
+
+                            if "expert_name" in final_data.columns:
+                                final_by_expert = final_data["expert_name"].value_counts()
+                                fig_final = go.Figure(go.Bar(
+                                    y=final_by_expert.index, x=final_by_expert.values,
+                                    orientation="h", marker_color="#8e44ad",
+                                    text=final_by_expert.values, textposition="outside"
+                                ))
+                                fig_final.update_layout(title="Final Round — Expert Breakdown",
+                                                        height=max(400, len(final_by_expert) * 35),
+                                                        yaxis=dict(autorange="reversed"),
+                                                        xaxis_title="Final Rounds Given")
+                                st.plotly_chart(fig_final, use_container_width=True)
+
+                            # Sentiment for Final rounds
+                            final_stats = get_sentiment_stats(final_data)
+                            if final_stats:
+                                st.markdown("---")
+                                render_sentiment_kpi(final_stats, title="Sentiment — Final Round (" + sel_cr_month + ")")
+                                fcol1, fcol2 = st.columns(2)
+                                with fcol1:
+                                    fig = render_sentiment_donut(final_stats, "Final Round Sentiment Split")
+                                    if fig:
+                                        st.plotly_chart(fig, use_container_width=True)
+                                with fcol2:
+                                    fig = render_sentiment_histogram(final_data, "Final Round Score Distribution")
+                                    if fig:
+                                        st.plotly_chart(fig, use_container_width=True)
+
+                            # Detailed table
+                            with st.expander("Final Round Details - " + sel_cr_month):
+                                display_cols = [c for c in ["date", "candidate_name", "expert_name", "round_name",
+                                                            "company_name", "sentiment_score", "sentiment_label", "feedback"]
+                                                if c in final_data.columns]
+                                st.dataframe(final_data[display_cols] if display_cols else final_data,
+                                             use_container_width=True, hide_index=True)
+
+                        # ── Sentiment for ALL completed interviews in the month
+                        st.markdown("---")
+                        st.subheader("Sentiment — All Completed Interviews (" + sel_cr_month + ")")
+                        render_sentiment_section(cr_month_data,
+                                                 section_title="Completed Interview Sentiment - " + sel_cr_month)
 
         # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────
         st.markdown("---")
@@ -2030,7 +2136,7 @@ def main():
             period_stats = get_sentiment_stats(period)
             if period_stats:
                 render_sentiment_kpi(period_stats,
-                                     title="Feedback Sentiment (" + str(start) + " to " + str(end) + ")")
+                                    title="Feedback Sentiment (" + str(start) + " to " + str(end) + ")")
 
             dd_plot = dd.copy()
             dd_plot["day"] = pd.to_datetime(dd_plot["day"])
@@ -2057,86 +2163,81 @@ def main():
                     text=daily_sent["avg_sentiment"].apply(lambda v: f"{v:+.1f}%"),
                     textposition="top center",
                     line=dict(color="#8e44ad", width=2),
-                    marker=dict(size=10, color=d_colors, line=dict(width=1, color="white")),
+                    marker=dict(size=8, color=d_colors),
                 ))
                 fig_ds.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-                fig_ds.add_hline(y=20, line_dash="dot", line_color="#2ecc71", opacity=0.3)
-                fig_ds.add_hline(y=-20, line_dash="dot", line_color="#e74c3c", opacity=0.3)
-                fig_ds.update_layout(
-                    title="Daily Avg Sentiment (" + str(start) + " to " + str(end) + ")",
-                    height=420, yaxis_title="Avg Sentiment (%)",
-                    yaxis=dict(range=[
-                        min(-50, daily_sent["avg_sentiment"].min() - 15),
-                        max(50, daily_sent["avg_sentiment"].max() + 15)
-                    ]),
-                )
+                fig_ds.update_layout(title="Daily Avg Sentiment", height=400,
+                                     yaxis_title="Avg Sentiment (%)")
                 st.plotly_chart(fig_ds, use_container_width=True)
 
-            with st.expander("Daily Table"):
-                disp = dd.copy()
-                disp["day"] = pd.to_datetime(disp["day"]).dt.strftime("%Y-%m-%d")
-                st.dataframe(disp, use_container_width=True)
+            # ── SINGLE DAY DRILL-DOWN ────────────────────────────
+            st.markdown("---")
+            st.subheader("Single Day Details")
+            single = st.date_input("Select a day", value=max_d, min_value=min_d, max_value=max_d,
+                                   key="single_day")
+            sdf = support_df[support_df["date"].dt.date == single]
+            if not sdf.empty:
+                tc = sdf["task_status"].value_counts()
+                skd = {s: int(tc.get(s, 0)) for s in TASK_ORDER}
+                skd["candidates"] = sdf["candidate_name"].nunique()
+                kpi_row(skd)
 
-            if selected_support == "Interview Support" and "round_name" in period.columns and not period.empty:
-                st.markdown("---")
-                st.subheader("Round Breakdown (" + str(start) + " to " + str(end) + ")")
-                round_charts(period, " (" + str(start) + " to " + str(end) + ")")
+                # Single day sentiment
+                single_stats = get_sentiment_stats(sdf)
+                if single_stats:
+                    st.markdown("---")
+                    render_sentiment_kpi(single_stats, title="Sentiment - " + str(single))
 
-        st.sidebar.markdown("---")
-        single = st.sidebar.date_input("Inspect single day", value=max_d,
-                                        min_value=min_d, max_value=max_d, key="single")
-        sdf = support_df[support_df["date"].dt.date == single]
-        if not sdf.empty:
-            st.subheader("Details - " + str(single))
-            tc = sdf["task_status"].value_counts()
-            kd2 = {s: int(tc.get(s, 0)) for s in TASK_ORDER}
-            kd2["candidates"] = sdf["candidate_name"].nunique()
-            kpi_row(kd2)
+                # Start time insights for single day
+                if selected_support == "Interview Support" and "start_hour" in sdf.columns:
+                    st.markdown("---")
+                    render_start_time_insights(sdf, title_suffix=" - " + str(single))
 
-            # ── SINGLE DAY SENTIMENT KPI ─────────────────────────
-            single_stats = get_sentiment_stats(sdf)
-            if single_stats:
-                render_sentiment_kpi(single_stats, title="Sentiment - " + str(single))
+                # Clash detection for single day
+                if selected_support == "Interview Support" and "_parsed_start" in sdf.columns:
+                    st.markdown("---")
+                    st.subheader("Scheduling Clashes - " + str(single))
+                    render_today_clash_summary(sdf)
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.plotly_chart(donut(kd2, "Split - " + str(single)), use_container_width=True)
-            with c2:
-                fig = h_bar_by_task(sdf, "company_name", 10, "Companies - " + str(single))
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-
-            c3, c4 = st.columns(2)
-            with c3:
-                fig = h_bar_by_task(sdf, "candidate_name", 10, "Candidates - " + str(single))
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-            with c4:
-                fig = h_bar_by_task(sdf, "expert_name", 10, "Experts - " + str(single))
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-
-            # ── SINGLE DAY SENTIMENT DONUT + HISTOGRAM ───────────
-            if single_stats:
-                st.markdown("---")
-                col_d, col_h = st.columns(2)
-                with col_d:
-                    fig = render_sentiment_donut(single_stats, "Sentiment Split - " + str(single))
-                    if fig:
-                        st.plotly_chart(fig, use_container_width=True)
-                with col_h:
-                    fig = render_sentiment_histogram(sdf, "Score Distribution - " + str(single))
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.plotly_chart(donut(skd, "Task Split - " + str(single)), use_container_width=True)
+                with c2:
+                    fig = h_bar_by_task(sdf, "company_name", 10, "Companies - " + str(single))
                     if fig:
                         st.plotly_chart(fig, use_container_width=True)
 
-            if selected_support == "Interview Support" and "round_name" in sdf.columns:
-                st.markdown("---")
-                st.subheader("Round Breakdown - " + str(single))
-                round_charts(sdf, " - " + str(single))
+                c3, c4 = st.columns(2)
+                with c3:
+                    fig = h_bar_by_task(sdf, "candidate_name", 10, "Candidates - " + str(single))
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+                with c4:
+                    fig = h_bar_by_task(sdf, "expert_name", 10, "Experts - " + str(single))
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
 
-            st.dataframe(sdf, use_container_width=True)
-        elif single:
-            st.info("No " + support_label + " on " + str(single))
+                # ── SINGLE DAY SENTIMENT DONUT + HISTOGRAM ───────
+                if single_stats:
+                    st.markdown("---")
+                    col_d, col_h = st.columns(2)
+                    with col_d:
+                        fig = render_sentiment_donut(single_stats, "Sentiment Split - " + str(single))
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True)
+                    with col_h:
+                        fig = render_sentiment_histogram(sdf, "Score Distribution - " + str(single))
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True)
+
+                if selected_support == "Interview Support" and "round_name" in sdf.columns:
+                    st.markdown("---")
+                    st.subheader("Round Breakdown - " + str(single))
+                    round_charts(sdf, " - " + str(single))
+
+                st.dataframe(sdf, use_container_width=True)
+            elif single:
+                st.info("No " + support_label + " on " + str(single))
 
     # ======= DEEP DIVE =======
     elif view == "Deep-Dive Analytics":
@@ -2159,7 +2260,7 @@ def main():
             if "expert_name" in support_df.columns:
                 ea = support_df.groupby("expert_name").agg(
                     Total=("task_status", "size"),
-                    Completed=("task_status", lambda x: (x == "completed").sum()),
+                    Completed=("task_status", lambda x: (x== "completed").sum()),
                     Rescheduled=("task_status", lambda x: (x== "rescheduled").sum()),
                     Cancelled=("task_status", lambda x: (x == "cancelled").sum()),
                     Pending=("task_status", lambda x: (x == "pending").sum()),
@@ -2183,13 +2284,18 @@ def main():
                 fig2.update_layout(height=500)
                 st.plotly_chart(fig2, use_container_width=True)
 
+        # ── CHANGED: Deep-Dive Rounds tab uses completed only for pie
         with tabs[2]:
             if "round_name" in support_df.columns:
-                rc = support_df["round_name"].value_counts()
-                fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
-                                       textinfo="label+value+percent"))
-                fig.update_layout(title="Round Distribution", height=420)
-                st.plotly_chart(fig, use_container_width=True)
+                completed_only = support_df[support_df["task_status"] == "completed"] if "task_status" in support_df.columns else support_df
+                rc = completed_only["round_name"].value_counts()
+                if rc.empty:
+                    st.info("No completed interviews for round distribution.")
+                else:
+                    fig = go.Figure(go.Pie(labels=rc.index, values=rc.values, hole=.4,
+                                           textinfo="label+value+percent"))
+                    fig.update_layout(title="Round Distribution (Completed Only)", height=420)
+                    st.plotly_chart(fig, use_container_width=True)
 
                 rt = support_df.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(rt, text_auto=True, aspect="auto",
@@ -2292,43 +2398,35 @@ def main():
     st.sidebar.caption("Vizva Dashboard v20.0 | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage")
 
 
-
 # ═══════════════════════════════════════════════════════════════════
 # AUTHENTICATION LAYER
 # ═══════════════════════════════════════════════════════════════════
 
 def login():
-    st.title("Vizva Secure Access")
-    with st.container():
-        user = st.text_input("Username")
-        pw = st.text_input("Password", type="password")
-        if st.button("Login"):
-            if user == st.secrets["VIZVA_USERNAME"] and pw == st.secrets["VIZVA_PASSWORD"]:
-                st.session_state["authenticated"] = True
-                st.session_state["login_time"] = datetime.now()
-                st.rerun()
-            else:
-                st.error("Invalid Username or Password")
+    st.title("Vizva Secure Login")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        valid_user = st.secrets.get("LOGIN_USER", "admin")
+        valid_pass = st.secrets.get("LOGIN_PASS", "admin")
+        if username == valid_user and password == valid_pass:
+            st.session_state["authenticated"] = True
+            st.session_state["login_time"] = datetime.now()
+            st.rerun()
+        else:
+            st.error("Invalid credentials")
 
 
-def check_timeout():
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+if st.session_state["authenticated"]:
     if "login_time" in st.session_state:
         delta = datetime.now() - st.session_state["login_time"]
         if delta.total_seconds() > 3600:
             st.session_state["authenticated"] = False
-            st.warning("Session expired. Please log in again.")
             st.rerun()
-
-
-if __name__ == "__main__":
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-
-    if not st.session_state["authenticated"]:
-        login()
-    else:
-        check_timeout()
-        if st.sidebar.button("Logout"):
-            st.session_state["authenticated"] = False
-            st.rerun()
-        main()
+    main()
+else:
+    login()
