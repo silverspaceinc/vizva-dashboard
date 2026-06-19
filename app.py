@@ -1671,8 +1671,12 @@ def transcript_analyzer_view():
 
             overall = roberta_score_text(transcript)
             ov_score = overall["score"]
+            if ov_score is None:
+                st.error("Sentiment analysis failed. The RoBERTa ONNX model could not be loaded. Please ensure 'optimum' and 'onnxruntime' are installed.")
+                return
             ov_color = sentiment_color(ov_score)
             ov_label = sentiment_label(ov_score)
+
 
             st.markdown("---")
             st.subheader("Overall Sentiment: " + ov_label + " (" + f"{ov_score:+.1f}%" + ")")
