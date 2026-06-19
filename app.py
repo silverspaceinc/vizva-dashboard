@@ -2408,9 +2408,15 @@ def login():
     password = st.text_input("Password", type="password")
 
     if st.button("Login"):
-        valid_user = st.secrets.get("LOGIN_USER", "admin")
-        valid_pass = st.secrets.get("LOGIN_PASS", "admin")
-        if username == valid_user and password == valid_pass:
+        try:
+            valid_user = st.secrets["LOGIN_USER"]
+            valid_pass = st.secrets["LOGIN_PASS"]
+        except KeyError:
+            st.error("Login secrets (LOGIN_USER / LOGIN_PASS) not configured. "
+                     "Please add them to your Streamlit secrets.")
+            return
+
+        if username.strip() == valid_user.strip() and password == valid_pass:
             st.session_state["authenticated"] = True
             st.session_state["login_time"] = datetime.now()
             st.rerun()
@@ -2430,3 +2436,4 @@ if st.session_state["authenticated"]:
     main()
 else:
     login()
+
