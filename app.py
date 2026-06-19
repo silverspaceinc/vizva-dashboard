@@ -2409,8 +2409,8 @@ def login():
 
     if st.button("Login"):
         try:
-            valid_user = st.secrets["LOGIN_USER"]
-            valid_pass = st.secrets["LOGIN_PASS"]
+            valid_user = st.secrets["VIZVA_USERNAME"]
+            valid_pass = st.secrets["VIZVA_PASSWORD"]
         except KeyError:
             st.error("Login secrets (LOGIN_USER / LOGIN_PASS) not configured. "
                      "Please add them to your Streamlit secrets.")
