@@ -2110,7 +2110,7 @@ def main():
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
                                             "Daily Drill-Down", "Deep-Dive Analytics",
-                                            "Schedule View"],label_visibility="collapsed")
+                                            "Schedule View"], label_visibility="collapsed")
 
     # ======= TODAY =======
     if view == "Todays Snapshot":
@@ -2275,9 +2275,8 @@ def main():
             cm_stats = get_sentiment_stats(current_month_data)
             if cm_stats:
                 avg = cm_stats["avg"]
-                st.columns(6)[0].empty()  # spacer
+                st.columns(6)[0].empty()
                 sent_cols = st.columns(4)
-
                 sent_cols[0].metric("Avg Sentiment (This Month)", f"{avg:+.1f}%",
                                     delta=sentiment_label(avg),
                                     delta_color="normal" if avg >= 0 else "inverse")
@@ -2305,7 +2304,6 @@ def main():
         if selected_support == "Interview Support" and "start_hour" in support_df.columns:
             st.markdown("---")
             render_start_time_insights(support_df, title_suffix=" - All Months")
-
             st.markdown("---")
             render_monthly_start_time_trend(support_df, title_suffix=" - " + support_label)
 
@@ -2363,7 +2361,7 @@ def main():
                 me = month_exp[month_exp["month"] == sel_m2].sort_values("total", ascending=False)
                 st.dataframe(me, use_container_width=True)
 
-        # ── NEW: COMPLETED ROUNDS ANALYSIS & FINAL BY WHOM ───────
+        # ── COMPLETED ROUNDS ANALYSIS & FINAL BY WHOM ────────────
         if selected_support == "Interview Support":
             st.markdown("---")
             st.subheader("Completed Rounds Analysis & Final Given By Whom")
@@ -2375,8 +2373,6 @@ def main():
                     st.info("No completed interviews found.")
                 else:
                     completed_iv["month"] = completed_iv["date"].dt.to_period("M").astype(str)
-
-                    # ── Monthly Completed Rounds KPI ─────────────
                     months_avail_cr = sorted(completed_iv["month"].unique(), reverse=True)
                     sel_cr_month = st.selectbox("Select Month", months_avail_cr, index=0, key="completed_rounds_month")
                     cr_month_data = completed_iv[completed_iv["month"] == sel_cr_month]
@@ -2389,7 +2385,6 @@ def main():
                         cr_cols[1].metric("Unique Rounds", cr_month_data["round_name"].nunique())
                         cr_cols[2].metric("Unique Experts", cr_month_data["expert_name"].nunique() if "expert_name" in cr_month_data.columns else 0)
 
-                        # ── Round Distribution (Completed Only) ──
                         cr_round_counts = cr_month_data["round_name"].value_counts()
                         cr_c1, cr_c2 = st.columns(2)
                         with cr_c1:
@@ -2397,7 +2392,6 @@ def main():
                                                       hole=.4, textinfo="label+value+percent"))
                             fig_cr.update_layout(title="Completed Rounds - " + sel_cr_month, height=420)
                             st.plotly_chart(fig_cr, use_container_width=True)
-
                         with cr_c2:
                             if "expert_name" in cr_month_data.columns:
                                 re_pivot = cr_month_data.groupby(["round_name", "expert_name"]).size().reset_index(name="count")
@@ -2412,7 +2406,6 @@ def main():
                                                      height=420, legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
                                 st.plotly_chart(fig_re, use_container_width=True)
 
-                        # ── "Final" Round — Given By Whom ────────
                         st.markdown("---")
                         st.subheader("Final Round — Given By Whom (" + sel_cr_month + ")")
                         final_mask = cr_month_data["round_name"].str.lower().str.contains("final", na=False)
@@ -2439,7 +2432,6 @@ def main():
                                                         xaxis_title="Final Rounds Given")
                                 st.plotly_chart(fig_final, use_container_width=True)
 
-                            # Sentiment for Final rounds
                             final_stats = get_sentiment_stats(final_data)
                             if final_stats:
                                 st.markdown("---")
@@ -2454,7 +2446,6 @@ def main():
                                     if fig:
                                         st.plotly_chart(fig, use_container_width=True)
 
-                            # Detailed table
                             with st.expander("Final Round Details - " + sel_cr_month):
                                 display_cols = [c for c in ["date", "candidate_name", "expert_name", "round_name",
                                                             "company_name", "sentiment_score", "sentiment_label", "feedback"]
@@ -2462,7 +2453,6 @@ def main():
                                 st.dataframe(final_data[display_cols] if display_cols else final_data,
                                              use_container_width=True, hide_index=True)
 
-                        # ── Sentiment for ALL completed interviews in the month
                         st.markdown("---")
                         st.subheader("Sentiment — All Completed Interviews (" + sel_cr_month + ")")
                         render_sentiment_section(cr_month_data,
@@ -2478,7 +2468,7 @@ def main():
             cm = cand_monthly[cand_monthly["month"] == sel_m3].sort_values("total", ascending=False)
             st.dataframe(cm, use_container_width=True)
 
-        # ====== DAILY DRILL-DOWN ======
+    # ====== DAILY DRILL-DOWN ======
     elif view == "Daily Drill-Down":
         st.header("Daily Drill-Down - " + support_label)
         if "date" not in support_df.columns:
@@ -2502,18 +2492,18 @@ def main():
             kd["candidates"] = period["candidate_name"].nunique()
             kpi_row(kd)
 
-            # ── PERIOD SENTIMENT KPI ─────────────────────────────────
+            # ── PERIOD SENTIMENT KPI ─────────────────────────────
             period_stats = get_sentiment_stats(period)
             if period_stats:
                 render_sentiment_kpi(period_stats,
                                      title="Feedback Sentiment (" + str(start) + " to " + str(end) + ")")
 
-            # ── DAILY STACKED BAR (kept) ─────────────────────────────
+            # ── DAILY STACKED BAR (kept) ─────────────────────────
             dd_plot = dd.copy()
             dd_plot["day"] = pd.to_datetime(dd_plot["day"])
             st.plotly_chart(stacked_bar(dd_plot, x="day", title="Daily Stacked View"), use_container_width=True)
 
-            # ── PERIOD SENTIMENT DONUT + HISTOGRAM ───────────────────
+            # ── PERIOD SENTIMENT DONUT + HISTOGRAM ───────────────
             if period_stats:
                 st.markdown("---")
                 st.subheader("Sentiment Analysis (" + str(start) + " to " + str(end) + ")")
@@ -2529,7 +2519,7 @@ def main():
                     if fig:
                         st.plotly_chart(fig, use_container_width=True)
 
-            # ── DAILY SENTIMENT TREND LINE ───────────────────────────
+            # ── DAILY SENTIMENT TREND LINE ───────────────────────
             daily_sent = daily_sentiment_agg(period)
             if not daily_sent.empty:
                 st.markdown("---")
@@ -2550,7 +2540,7 @@ def main():
                                      yaxis_title="Avg Sentiment (%)")
                 st.plotly_chart(fig_ds, use_container_width=True)
 
-            # ── EXPERT / COMPANY / CANDIDATE BARS (period) ───────────
+            # ── EXPERT / COMPANY / CANDIDATE BARS (period) ───────
             st.markdown("---")
             st.subheader("Period Breakdown (" + str(start) + " to " + str(end) + ")")
             p_c1, p_c2 = st.columns(2)
@@ -2575,7 +2565,7 @@ def main():
                 st.plotly_chart(donut(kd, "Task Split (" + str(start) + " to " + str(end) + ")"),
                                 use_container_width=True)
 
-            # ── ROUND INSIGHTS (Interview Support, completed only) ───
+            # ── ROUND INSIGHTS (Interview Support, completed only) ─
             if selected_support == "Interview Support" and "round_name" in period.columns:
                 st.markdown("---")
                 st.subheader("Round Distribution — Completed Only (" + str(start) + " to " + str(end) + ")")
@@ -2605,7 +2595,6 @@ def main():
                                                  height=420, legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
                             st.plotly_chart(fig_re, use_container_width=True)
 
-                    # Round × Task heatmap (all statuses — reference)
                     if "task_status" in period.columns:
                         rt = period.groupby(["round_name", "task_status"]).size().unstack(fill_value=0)
                         fig_rt = px.imshow(rt, text_auto=True, aspect="auto",
@@ -2613,7 +2602,7 @@ def main():
                         fig_rt.update_layout(height=400)
                         st.plotly_chart(fig_rt, use_container_width=True)
 
-            # ── COMPLETED ROUNDS & FINAL GIVEN BY WHOM (period) ──────
+            # ── COMPLETED ROUNDS & FINAL GIVEN BY WHOM (period) ──
             if selected_support == "Interview Support" and "round_name" in period.columns and "date" in period.columns:
                 completed_p = period[period["task_status"] == "completed"].copy() if "task_status" in period.columns else period.copy()
                 if not completed_p.empty:
@@ -2645,7 +2634,6 @@ def main():
                                                     xaxis_title="Final Rounds Given")
                             st.plotly_chart(fig_final, use_container_width=True)
 
-                        # Sentiment for Final rounds
                         final_stats = get_sentiment_stats(final_data)
                         if final_stats:
                             st.markdown("---")
@@ -2661,7 +2649,6 @@ def main():
                                 if fig:
                                     st.plotly_chart(fig, use_container_width=True)
 
-                        # Detailed table
                         with st.expander("Final Round Details - " + str(start) + " to " + str(end)):
                             display_cols = [c for c in ["date", "candidate_name", "expert_name", "round_name",
                                                         "company_name", "sentiment_score", "sentiment_label", "feedback"]
@@ -2669,24 +2656,23 @@ def main():
                             st.dataframe(final_data[display_cols] if display_cols else final_data,
                                          use_container_width=True, hide_index=True)
 
-                    # Sentiment for ALL completed interviews in period
                     st.markdown("---")
                     st.subheader("Sentiment — All Completed Interviews (" + str(start) + " to " + str(end) + ")")
                     render_sentiment_section(completed_p,
                                             section_title="Completed Interview Sentiment - " + str(start) + " to " + str(end))
 
-            # ── START TIME INSIGHTS (period) ─────────────────────────
+            # ── START TIME INSIGHTS (period) ─────────────────────
             if selected_support == "Interview Support" and "start_hour" in period.columns:
                 st.markdown("---")
                 render_start_time_insights(period, title_suffix=" - " + str(start) + " to " + str(end))
 
-            # ── CLASH DETECTION (period) ─────────────────────────────
+            # ── CLASH DETECTION (period) ─────────────────────────
             if selected_support == "Interview Support" and "_parsed_start" in period.columns:
                 st.markdown("---")
                 st.subheader("Scheduling Clashes (" + str(start) + " to " + str(end) + ")")
                 render_today_clash_summary(period)
 
-            # ── TECHNOLOGY BREAKDOWN (period) ────────────────────────
+            # ── TECHNOLOGY BREAKDOWN (period) ────────────────────
             if "candidate_technology" in period.columns:
                 st.markdown("---")
                 fig = h_bar_by_task(period, "candidate_technology", 15,
@@ -2706,18 +2692,15 @@ def main():
             skd["candidates"] = sdf["candidate_name"].nunique()
             kpi_row(skd)
 
-            # Single day sentiment
             single_stats = get_sentiment_stats(sdf)
             if single_stats:
                 st.markdown("---")
                 render_sentiment_kpi(single_stats, title="Sentiment - " + str(single))
 
-            # Start time insights for single day
             if selected_support == "Interview Support" and "start_hour" in sdf.columns:
                 st.markdown("---")
                 render_start_time_insights(sdf, title_suffix=" - " + str(single))
 
-            # Clash detection for single day
             if selected_support == "Interview Support" and "_parsed_start" in sdf.columns:
                 st.markdown("---")
                 st.subheader("Scheduling Clashes - " + str(single))
@@ -2741,7 +2724,6 @@ def main():
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
 
-            # ── SINGLE DAY SENTIMENT DONUT + HISTOGRAM ───────
             if single_stats:
                 st.markdown("---")
                 col_d, col_h = st.columns(2)
@@ -2763,102 +2745,10 @@ def main():
         elif single:
             st.info("No " + support_label + " on " + str(single))
 
-
-            # ── DAILY SENTIMENT TREND LINE ───────────────────────
-            daily_sent = daily_sentiment_agg(period)
-            if not daily_sent.empty:
-                st.markdown("---")
-                st.subheader("Daily Sentiment Trend")
-                d_colors = [sentiment_color(v) for v in daily_sent["avg_sentiment"]]
-                fig_ds = go.Figure()
-                fig_ds.add_trace(go.Scatter(
-                    x=pd.to_datetime(daily_sent["day"]),
-                    y=daily_sent["avg_sentiment"],
-                    mode="lines+markers+text",
-                    text=daily_sent["avg_sentiment"].apply(lambda v: f"{v:+.1f}%"),
-                    textposition="top center",
-                    line=dict(color="#8e44ad", width=2),
-                    marker=dict(size=8, color=d_colors),
-                ))
-                fig_ds.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-                fig_ds.update_layout(title="Daily Avg Sentiment", height=400,
-                                     yaxis_title="Avg Sentiment (%)")
-                st.plotly_chart(fig_ds, use_container_width=True)
-
-            # ── SINGLE DAY DRILL-DOWN ────────────────────────────
-            st.markdown("---")
-            st.subheader("Single Day Details")
-            single = st.date_input("Select a day", value=max_d, min_value=min_d, max_value=max_d,
-                                   key="single_day")
-            sdf = support_df[support_df["date"].dt.date == single]
-            if not sdf.empty:
-                tc = sdf["task_status"].value_counts()
-                skd = {s: int(tc.get(s, 0)) for s in TASK_ORDER}
-                skd["candidates"] = sdf["candidate_name"].nunique()
-                kpi_row(skd)
-
-                # Single day sentiment
-                single_stats = get_sentiment_stats(sdf)
-                if single_stats:
-                    st.markdown("---")
-                    render_sentiment_kpi(single_stats, title="Sentiment - " + str(single))
-
-                # Start time insights for single day
-                if selected_support == "Interview Support" and "start_hour" in sdf.columns:
-                    st.markdown("---")
-                    render_start_time_insights(sdf, title_suffix=" - " + str(single))
-
-                # Clash detection for single day
-                if selected_support == "Interview Support" and "_parsed_start" in sdf.columns:
-                    st.markdown("---")
-                    st.subheader("Scheduling Clashes - " + str(single))
-                    render_today_clash_summary(sdf)
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.plotly_chart(donut(skd, "Task Split - " + str(single)), use_container_width=True)
-                with c2:
-                    fig = h_bar_by_task(sdf, "company_name", 10, "Companies - " + str(single))
-                    if fig:
-                        st.plotly_chart(fig, use_container_width=True)
-
-                c3, c4 = st.columns(2)
-                with c3:
-                    fig = h_bar_by_task(sdf, "candidate_name", 10, "Candidates - " + str(single))
-                    if fig:
-                        st.plotly_chart(fig, use_container_width=True)
-                with c4:
-                    fig = h_bar_by_task(sdf, "expert_name", 10, "Experts - " + str(single))
-                    if fig:
-                        st.plotly_chart(fig, use_container_width=True)
-
-                # ── SINGLE DAY SENTIMENT DONUT + HISTOGRAM ───────
-                if single_stats:
-                    st.markdown("---")
-                    col_d, col_h = st.columns(2)
-                    with col_d:
-                        fig = render_sentiment_donut(single_stats, "Sentiment Split - " + str(single))
-                        if fig:
-                            st.plotly_chart(fig, use_container_width=True)
-                    with col_h:
-                        fig = render_sentiment_histogram(sdf, "Score Distribution - " + str(single))
-                        if fig:
-                            st.plotly_chart(fig, use_container_width=True)
-
-                if selected_support == "Interview Support" and "round_name" in sdf.columns:
-                    st.markdown("---")
-                    st.subheader("Round Breakdown - " + str(single))
-                    round_charts(sdf, " - " + str(single))
-
-                st.dataframe(sdf, use_container_width=True)
-            elif single:
-                st.info("No " + support_label + " on " + str(single))
-
     # ======= DEEP DIVE =======
     elif view == "Deep-Dive Analytics":
         st.header("Deep-Dive Analytics - " + support_label)
 
-        # Build tab list dynamically
         tab_names = ["Experts", "Companies", "Rounds", "Day of Week", "Cross-Support", "Candidates", "Technology"]
         if selected_support == "Interview Support" and "start_hour" in support_df.columns:
             tab_names.append("Start Time")
@@ -2875,8 +2765,8 @@ def main():
             if "expert_name" in support_df.columns:
                 ea = support_df.groupby("expert_name").agg(
                     Total=("task_status", "size"),
-                    Completed=("task_status", lambda x: (x== "completed").sum()),
-                    Rescheduled=("task_status", lambda x: (x== "rescheduled").sum()),
+                    Completed=("task_status", lambda x: (x == "completed").sum()),
+                    Rescheduled=("task_status", lambda x: (x == "rescheduled").sum()),
                     Cancelled=("task_status", lambda x: (x == "cancelled").sum()),
                     Pending=("task_status", lambda x: (x == "pending").sum()),
                     Candidates=("candidate_name", "nunique"),
@@ -2899,7 +2789,6 @@ def main():
                 fig2.update_layout(height=500)
                 st.plotly_chart(fig2, use_container_width=True)
 
-        # ── CHANGED: Deep-Dive Rounds tab uses completed only for pie
         with tabs[2]:
             if "round_name" in support_df.columns:
                 completed_only = support_df[support_df["task_status"] == "completed"] if "task_status" in support_df.columns else support_df
@@ -2992,28 +2881,26 @@ def main():
             else:
                 st.info("No technology column found.")
 
-        # ── START TIME ANALYSIS TAB ──────────────────────────────
         if selected_support == "Interview Support" and "start_hour" in support_df.columns and "Start Time" in tab_names:
             with tabs[tab_names.index("Start Time")]:
                 render_start_time_insights(support_df, title_suffix=" - All Data")
                 st.markdown("---")
                 render_monthly_start_time_trend(support_df, title_suffix="")
 
-        # ── CLASH DETECTION TAB ──────────────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns and "Clash Detection" in tab_names:
             with tabs[tab_names.index("Clash Detection")]:
                 render_clash_summary(support_df, title_suffix=" - All Data")
 
-        # ── BLOCKAGE TAB ─────────────────────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns and "Blockage" in tab_names:
             with tabs[tab_names.index("Blockage")]:
                 render_blockage_summary(support_df, title_suffix=" - All Data")
-        # ====== SCHEDULE VIEW ======
-        elif view == "Schedule View":
-            render_schedule_view(all_case_df, active_expert_df)
+
+    # ====== SCHEDULE VIEW ======
+    elif view == "Schedule View":
+        render_schedule_view(all_case_df, active_expert_df)
+
     st.sidebar.markdown("---")
     st.sidebar.caption("Vizva Dashboard v20.0 | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage")
-
 
 # ═══════════════════════════════════════════════════════════════════
 # AUTHENTICATION LAYER
@@ -3029,8 +2916,9 @@ def login():
             valid_user = st.secrets["VIZVA_USERNAME"]
             valid_pass = st.secrets["VIZVA_PASSWORD"]
         except KeyError:
-            st.error("Login secrets (LOGIN_USER / LOGIN_PASS) not configured. "
-                     "Please add them to your Streamlit secrets.")
+            st.error("Login secrets (VIZVA_USERNAME / VIZVA_PASSWORD) not configured. "
+         "Please add them to your Streamlit secrets.")
+
             return
 
         if username.strip() == valid_user.strip() and password == valid_pass:
