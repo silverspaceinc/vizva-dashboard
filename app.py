@@ -1669,7 +1669,11 @@ def build_schedule_data(all_data, selected_date):
     if all_data.empty or "date" not in all_data.columns:
         return pd.DataFrame()
 
-    day_df = all_data[all_data["date"].dt.date == selected_date].copy()
+    day_df = all_data[
+        (all_data["date"].dt.date == selected_date) &
+        (all_data["support_name"].str.lower() == "interview support")
+    ].copy()
+
     if day_df.empty:
         return pd.DataFrame()
 
@@ -1957,12 +1961,8 @@ def render_schedule_view(all_data, active_expert_df):
         st.warning("⚠️ **" + str(clash_count) + " interview(s) have clashes** across **" +
                    str(experts_with_clash) + " expert(s)**. Look for red borders in the timeline.")
 
-    # Support type breakdown
-    st.markdown("---")
-    sup_cols = st.columns(4)
-    for i, stype in enumerate(SUPPORT_TYPES):
-        cnt = int((sched["support_name"].str.lower() == stype.lower()).sum())
-        sup_cols[i].metric(stype, cnt)
+   # Support type note
+    st.caption("Showing Interview Support only")
 
     # ── GANTT CHART ──────────────────────────────────────────────
     st.markdown("---")
