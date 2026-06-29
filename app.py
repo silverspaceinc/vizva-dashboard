@@ -2992,8 +2992,7 @@ def main():
                 render_blockage_summary(support_df, title_suffix=" - All Data")
         # ====== SCHEDULE VIEW ======
         elif view == "Schedule View":
-            render_schedule_view(active_expert_df, active_expert_df)
-
+            render_schedule_view(all_case_df, active_expert_df)
     st.sidebar.markdown("---")
     st.sidebar.caption("Vizva Dashboard v20.0 | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage")
 
