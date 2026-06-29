@@ -1915,6 +1915,24 @@ def render_schedule_view(all_data, active_expert_df):
     # Use ALL data (all support types) for schedule view
     sched = build_schedule_data(all_data, selected_date)
 
+    # DEBUG — remove later
+    day_all = all_data[all_data["date"].dt.date == selected_date] if "date" in all_data.columns else pd.DataFrame()
+    with st.expander("🔍 Debug Info (remove later)"):
+        st.write("all_data shape:", all_data.shape)
+        st.write("all_data columns:", list(all_data.columns))
+        st.write("Records on selected date:", len(day_all))
+        if not day_all.empty:
+            st.write("start_time present:", "start_time" in day_all.columns)
+            st.write("end_time present:", "end_time" in day_all.columns)
+            if "start_time" in day_all.columns:
+                st.write("start_time sample values:", day_all["start_time"].head(10).tolist())
+            if "support_name" in day_all.columns:
+                st.write("support types on this date:", day_all["support_name"].unique().tolist())
+            if "task_status" in day_all.columns:
+                st.write("statuses:", day_all["task_status"].value_counts().to_dict())
+        st.write("sched shape:", sched.shape if not sched.empty else "EMPTY")
+
+
     # ── KPI row ──────────────────────────────────────────────────
     if sched.empty:
         st.info("No interviews with valid time data on " + str(selected_date))
