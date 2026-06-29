@@ -1625,6 +1625,358 @@ def round_charts(df, title_suffix=""):
         fig2.update_layout(barmode="stack", title="Round x Task" + title_suffix, height=420)
         st.plotly_chart(fig2, use_container_width=True)
 
+# ═══════════════════════════════════════════════════════════════════
+#  SCHEDULE VIEW — Gantt-style daily timeline per expert
+# ═══════════════════════════════════════════════════════════════════
+
+def _parse_time_to_minutes(val):
+    """Convert a time string to minutes since midnight. 'noon' → 720."""
+    if not isinstance(val, str) or not val.strip():
+        return None
+    v = val.strip()
+    if v.lower() == "noon":
+        return 720
+    for fmt in ("%I:%M %p", "%H:%M", "%I:%M%p", "%I %p"):
+        try:
+            t = datetime.strptime(v, fmt)
+            return t.hour * 60 + t.minute
+        except ValueError:
+            continue
+    try:
+        t = pd.to_datetime(v, errors="coerce")
+        if pd.notna(t):
+            return t.hour * 60 + t.minute
+    except Exception:
+        pass
+    return None
+
+
+def _minutes_to_label(m):
+    """Convert minutes since midnight to 'HH:MM AM/PM' label."""
+    h = int(m // 60) % 24
+    mi = int(m % 60)
+    return datetime(2000, 1, 1, h, mi).strftime("%I:%M %p")
+
+
+def build_schedule_data(all_data, selected_date):
+    """Build a DataFrame of interview slots for the Gantt chart.
+
+    Returns a DataFrame with columns:
+      expert_name, candidate_name, company_name, round_name, support_name,
+      task_status, start_min, end_min, start_label, end_label, duration,
+      has_clash (bool)
+    """
+    if all_data.empty or "date" not in all_data.columns:
+        return pd.DataFrame()
+
+    day_df = all_data[all_data["date"].dt.date == selected_date].copy()
+    if day_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, r in day_df.iterrows():
+        expert = r.get("expert_name", "Unknown")
+        candidate = r.get("candidate_name", "")
+        company = r.get("company_name", "")
+        round_name = r.get("round_name", "")
+        support = r.get("support_name", "")
+        status = r.get("task_status", "pending")
+
+        # Parse start time
+        start_raw = r.get("start_time", None)
+        start_min = _parse_time_to_minutes(str(start_raw)) if pd.notna(start_raw) else None
+
+        # Parse end time
+        end_raw = r.get("end_time", None)
+        end_min = _parse_time_to_minutes(str(end_raw)) if pd.notna(end_raw) else None
+
+        # If no start time at all, skip this row
+        if start_min is None:
+            continue
+
+        # Default duration: 30 minutes if no end time
+        if end_min is None or end_min <= start_min:
+            end_min = start_min + 30
+
+        duration = end_min - start_min
+
+        rows.append({
+            "expert_name": expert,
+            "candidate_name": candidate,
+            "company_name": company,
+            "round_name": round_name,
+            "support_name": support,
+            "task_status": status,
+            "start_min": start_min,
+            "end_min": end_min,
+            "start_label": _minutes_to_label(start_min),
+            "end_label": _minutes_to_label(end_min),
+            "duration": duration,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    sched = pd.DataFrame(rows)
+
+    # Detect clashes per expert (overlapping intervals)
+    sched["has_clash"] = False
+    for expert, grp in sched.groupby("expert_name"):
+        if len(grp) < 2:
+            continue
+        idxs = grp.index.tolist()
+        for i in range(len(idxs)):
+            for j in range(i + 1, len(idxs)):
+                s1, e1 = sched.loc[idxs[i], "start_min"], sched.loc[idxs[i], "end_min"]
+                s2, e2 = sched.loc[idxs[j], "start_min"], sched.loc[idxs[j], "end_min"]
+                if s1 < e2 and s2 < e1:  # overlap
+                    sched.loc[idxs[i], "has_clash"] = True
+                    sched.loc[idxs[j], "has_clash"] = True
+
+    return sched
+
+
+def render_schedule_gantt(sched, selected_date):
+    """Render the Gantt-style timeline chart."""
+    if sched.empty:
+        st.info("No interviews with valid time data for " + str(selected_date))
+        return
+
+    # Build a base datetime for plotly (using a reference date)
+    ref = datetime(2000, 1, 1)
+    sched = sched.copy()
+    sched["start_dt"] = sched["start_min"].apply(lambda m: ref + timedelta(minutes=int(m)))
+    sched["end_dt"] = sched["end_min"].apply(lambda m: ref + timedelta(minutes=int(m)))
+
+    # Sort experts by earliest start
+    expert_order = sched.groupby("expert_name")["start_min"].min().sort_values().index.tolist()
+
+    # Build hover text
+    sched["hover"] = (
+        "<b>" + sched["candidate_name"].fillna("") + "</b><br>"
+        + "Company: " + sched["company_name"].fillna("") + "<br>"
+        + "Round: " + sched["round_name"].fillna("") + "<br>"
+        + "Support: " + sched["support_name"].fillna("") + "<br>"
+        + "Status: " + sched["task_status"].fillna("") + "<br>"
+        + "Time: " + sched["start_label"] + " - " + sched["end_label"] + "<br>"
+        + "Duration: " + sched["duration"].astype(str) + " min"
+        + sched["has_clash"].apply(lambda x: "<br><b>⚠️ CLASH</b>" if x else "")
+    )
+
+    # Color by status
+    status_colors = {
+        "completed": "#2ecc71",
+        "rescheduled": "#f39c12",
+        "cancelled": "#e74c3c",
+        "pending": "#3498db",
+    }
+
+    fig = go.Figure()
+
+    for _, row in sched.iterrows():
+        base_color = status_colors.get(row["task_status"], "#95a5a6")
+        # Clash border
+        line_dict = dict(color="#ff0000", width=3) if row["has_clash"] else dict(color="white", width=1)
+
+        fig.add_trace(go.Bar(
+            y=[row["expert_name"]],
+            x=[(row["end_dt"] - row["start_dt"]).total_seconds() * 1000],  # ms for timedelta
+            base=[row["start_dt"]],
+            orientation="h",
+            marker=dict(color=base_color, line=line_dict),
+            hovertext=row["hover"],
+            hoverinfo="text",
+            showlegend=False,
+            width=0.6,
+        ))
+
+    # Add legend traces for statuses
+    for status, color in status_colors.items():
+        fig.add_trace(go.Bar(
+            y=[None], x=[None],
+            marker=dict(color=color),
+            name=TASK_LABEL.get(status, status.title()),
+            showlegend=True,
+        ))
+    # Clash legend
+    fig.add_trace(go.Bar(
+        y=[None], x=[None],
+        marker=dict(color="#95a5a6", line=dict(color="#ff0000", width=3)),
+        name="⚠️ Clash (red border)",
+        showlegend=True,
+    ))
+
+    # Determine time range
+    min_start = sched["start_min"].min()
+    max_end = sched["end_min"].max()
+    range_start = ref + timedelta(minutes=max(0, int(min_start) - 30))
+    range_end = ref + timedelta(minutes=min(1440, int(max_end) + 30))
+
+    fig.update_layout(
+        title="Expert Schedule — " + str(selected_date) + " (EDT)",
+        height=max(500, len(expert_order) * 55),
+        xaxis=dict(
+            type="date",
+            tickformat="%I:%M %p",
+            range=[range_start, range_end],
+            title="Time (EDT)",
+            dtick=30 * 60 * 1000,  # 30-minute ticks
+        ),
+        yaxis=dict(
+            categoryorder="array",
+            categoryarray=expert_order[::-1],
+            title="Expert",
+        ),
+        barmode="overlay",
+        legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
+        hovermode="closest",
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_availability_summary(sched, selected_date):
+    """Show expert availability — free slots between interviews."""
+    if sched.empty:
+        return
+
+    st.subheader("Expert Availability — " + str(selected_date) + " (EDT)")
+    st.caption("Free gaps between scheduled interviews (working hours: 8 AM – 10 PM EDT)")
+
+    work_start = 8 * 60   # 8 AM
+    work_end = 22 * 60     # 10 PM
+
+    avail_rows = []
+    for expert, grp in sched.groupby("expert_name"):
+        intervals = sorted(zip(grp["start_min"], grp["end_min"]))
+        # Merge overlapping intervals
+        merged = [intervals[0]]
+        for s, e in intervals[1:]:
+            if s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+
+        # Find free slots within working hours
+        free_slots = []
+        prev_end = work_start
+        for s, e in merged:
+            gap_start = max(prev_end, work_start)
+            gap_end = min(s, work_end)
+            if gap_end > gap_start and (gap_end - gap_start) >= 15:  # at least 15 min gap
+                free_slots.append(_minutes_to_label(gap_start) + " – " + _minutes_to_label(gap_end) +
+                                  " (" + str(int(gap_end - gap_start)) + " min)")
+            prev_end = max(prev_end, e)
+
+        # After last interview
+        if prev_end < work_end and (work_end - prev_end) >= 15:
+            free_slots.append(_minutes_to_label(prev_end) + " – " + _minutes_to_label(work_end) +
+                              " (" + str(int(work_end - prev_end)) + " min)")
+
+        total_busy = sum(e - s for s, e in merged)
+        total_interviews = len(grp)
+        has_clash = grp["has_clash"].any()
+
+        avail_rows.append({
+            "Expert": expert,
+            "Interviews": total_interviews,
+            "Busy Time": str(int(total_busy)) + " min",
+            "Clashes": "⚠️ Yes" if has_clash else "No",
+            "Free Slots": " | ".join(free_slots) if free_slots else "No free slots",
+        })
+
+    avail_df = pd.DataFrame(avail_rows).sort_values("Interviews", ascending=False)
+    st.dataframe(avail_df, use_container_width=True, hide_index=True)
+
+
+def render_schedule_view(all_data, active_expert_df):
+    """Main renderer for the Schedule View page."""
+    st.header("Schedule View")
+    st.caption("Select any date to see all interviews across all support types, organized by expert timeline (EDT)")
+
+    if "date" not in all_data.columns:
+        st.warning("No date column available in data.")
+        return
+
+    valid_dates = all_data["date"].dropna()
+    if valid_dates.empty:
+        st.warning("No valid dates found.")
+        return
+
+    min_d = valid_dates.min().date()
+    max_d = valid_dates.max().date()
+
+    # Allow selecting any date including future
+    selected_date = st.date_input("Select Date", value=date.today(),
+                                   min_value=min_d,
+                                   max_value=max_d + timedelta(days=90),
+                                   key="schedule_date")
+
+    # Use ALL data (all support types) for schedule view
+    sched = build_schedule_data(all_data, selected_date)
+
+    # ── KPI row ──────────────────────────────────────────────────
+    if sched.empty:
+        st.info("No interviews with valid time data on " + str(selected_date))
+        # Still show count of interviews without time
+        day_all = all_data[all_data["date"].dt.date == selected_date]
+        if not day_all.empty:
+            st.caption(str(len(day_all)) + " interview(s) found but none have valid start_time.")
+        return
+
+    k = st.columns(6)
+    k[0].metric("Total Interviews", len(sched))
+    k[1].metric("Experts", sched["expert_name"].nunique())
+    k[2].metric("Completed", int((sched["task_status"] == "completed").sum()))
+    k[3].metric("Pending", int((sched["task_status"] == "pending").sum()))
+    k[4].metric("Rescheduled", int((sched["task_status"] == "rescheduled").sum()))
+    k[5].metric("Cancelled", int((sched["task_status"] == "cancelled").sum()))
+
+    # Clash KPI
+    clash_count = int(sched["has_clash"].sum())
+    experts_with_clash = sched[sched["has_clash"]]["expert_name"].nunique()
+    if clash_count > 0:
+        st.warning("⚠️ **" + str(clash_count) + " interview(s) have clashes** across **" +
+                   str(experts_with_clash) + " expert(s)**. Look for red borders in the timeline.")
+
+    # Support type breakdown
+    st.markdown("---")
+    sup_cols = st.columns(4)
+    for i, stype in enumerate(SUPPORT_TYPES):
+        cnt = int((sched["support_name"].str.lower() == stype.lower()).sum())
+        sup_cols[i].metric(stype, cnt)
+
+    # ── GANTT CHART ──────────────────────────────────────────────
+    st.markdown("---")
+    render_schedule_gantt(sched, selected_date)
+
+    # ── AVAILABILITY SUMMARY ─────────────────────────────────────
+    st.markdown("---")
+    render_availability_summary(sched, selected_date)
+
+    # ── CLASH DETAILS ────────────────────────────────────────────
+    clash_df = sched[sched["has_clash"]].copy()
+    if not clash_df.empty:
+        st.markdown("---")
+        st.subheader("Clash Details — " + str(selected_date))
+        clash_display = clash_df[["expert_name", "candidate_name", "company_name",
+                                   "round_name", "support_name", "task_status",
+                                   "start_label", "end_label", "duration"]].copy()
+        clash_display.columns = ["Expert", "Candidate", "Company", "Round", "Support",
+                                  "Status", "Start", "End", "Duration (min)"]
+        st.dataframe(clash_display.sort_values(["Expert", "Start"]),
+                     use_container_width=True, hide_index=True)
+
+    # ── FULL SCHEDULE TABLE ──────────────────────────────────────
+    with st.expander("Full Schedule Table — " + str(selected_date)):
+        table_cols = [c for c in ["expert_name", "candidate_name", "company_name",
+                                   "round_name", "support_name", "task_status",
+                                   "start_label", "end_label", "duration", "has_clash"]
+                      if c in sched.columns]
+        display = sched[table_cols].copy()
+        display.columns = [c.replace("_", " ").title() for c in table_cols]
+        st.dataframe(display.sort_values(["Expert Name", "Start Label"]),
+                     use_container_width=True, hide_index=True)
 
 # ═══════════════════════════════════════════════════════════════════
 #  MAIN
@@ -1739,8 +2091,8 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
-                                             "Daily Drill-Down", "Deep-Dive Analytics"],
-                            label_visibility="collapsed")
+                                            "Daily Drill-Down", "Deep-Dive Analytics",
+                                            "Schedule View"],label_visibility="collapsed")
 
     # ======= TODAY =======
     if view == "Todays Snapshot":
@@ -2638,6 +2990,9 @@ def main():
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns and "Blockage" in tab_names:
             with tabs[tab_names.index("Blockage")]:
                 render_blockage_summary(support_df, title_suffix=" - All Data")
+        # ====== SCHEDULE VIEW ======
+        elif view == "Schedule View":
+            render_schedule_view(active_expert_df, active_expert_df)
 
     st.sidebar.markdown("---")
     st.sidebar.caption("Vizva Dashboard v20.0 | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage")
