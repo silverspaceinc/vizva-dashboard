@@ -2437,7 +2437,10 @@ def main():
                 support_df_copy = support_df.copy()
                 support_df_copy["month"] = support_df_copy["date"].dt.to_period("M").astype(str)
                 months_available = sorted(support_df_copy["month"].unique(), reverse=True)
-                sel_month = st.selectbox("Select Month", months_available, index=0, key="round_month")
+                current_m = date.today().strftime("%Y-%m")
+                default_idx = months_available.index(current_m) if current_m in months_available else 0
+                sel_month = st.selectbox("Select Month", months_available, index=default_idx, key="round_month")
+
                 month_data = support_df_copy[support_df_copy["month"] == sel_month]
                 if not month_data.empty:
                     round_charts(month_data, " - " + sel_month)
@@ -2449,8 +2452,11 @@ def main():
             st.subheader("Expert-wise Monthly Breakdown")
             month_exp = expert_monthly(support_df)
             if not month_exp.empty:
-                sel_m2 = st.selectbox("Select Month", sorted(month_exp["month"].unique(), reverse=True),
-                                                     index=0, key="exp_month")
+                exp_months = sorted(month_exp["month"].unique(), reverse=True)
+                current_m = date.today().strftime("%Y-%m")
+                default_idx2 = exp_months.index(current_m) if current_m in exp_months else 0
+                sel_m2 = st.selectbox("Select Month", exp_months, index=default_idx2, key="exp_month")
+
                 me = month_exp[month_exp["month"] == sel_m2].sort_values("total", ascending=False)
                 st.dataframe(me, use_container_width=True)
 
@@ -2556,8 +2562,11 @@ def main():
         st.subheader("Candidate-wise Monthly Counts (All Support Types)")
         cand_monthly = candidate_monthly_support(active_expert_df)
         if not cand_monthly.empty:
-            sel_m3 = st.selectbox("Select Month", sorted(cand_monthly["month"].unique(), reverse=True),
-                                  index=0, key="cand_month")
+            cand_months = sorted(cand_monthly["month"].unique(), reverse=True)
+            current_m = date.today().strftime("%Y-%m")
+            default_idx3 = cand_months.index(current_m) if current_m in cand_months else 0
+            sel_m3 = st.selectbox("Select Month", cand_months, index=default_idx3, key="cand_month")
+
             cm = cand_monthly[cand_monthly["month"] == sel_m3].sort_values("total", ascending=False)
             st.dataframe(cm, use_container_width=True)
 
