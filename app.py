@@ -2014,8 +2014,7 @@ def render_schedule_view(all_data, active_expert_df):
 
     # ── AVAILABILITY SUMMARY ─────────────────────────────────────
     st.markdown("---")
-    render_availability_summary(sched, selected_date)
-
+    render_availability_summary(sched, selected_date, all_expert_names)
     # ── CLASH DETAILS ────────────────────────────────────────────
     clash_df = sched[sched["has_clash"]].copy()
     if not clash_df.empty:
