@@ -1741,33 +1741,18 @@ def build_schedule_data(all_data, selected_date):
 
 
 def render_schedule_gantt(sched, selected_date):
-    """Render the Gantt-style timeline chart."""
+    """Render the Gantt-style timeline chart with merged hover for overlapping slots."""
     if sched.empty:
         st.info("No interviews with valid time data for " + str(selected_date))
         return
 
-    # Build a base datetime for plotly (using a reference date)
     ref = datetime(2000, 1, 1)
     sched = sched.copy()
     sched["start_dt"] = sched["start_min"].apply(lambda m: ref + timedelta(minutes=int(m)))
     sched["end_dt"] = sched["end_min"].apply(lambda m: ref + timedelta(minutes=int(m)))
 
-    # Sort experts by earliest start
     expert_order = sched.groupby("expert_name")["start_min"].min().sort_values().index.tolist()
 
-    # Build hover text
-    sched["hover"] = (
-        "<b>" + sched["candidate_name"].fillna("") + "</b><br>"
-        + "Company: " + sched["company_name"].fillna("") + "<br>"
-        + "Round: " + sched["round_name"].fillna("") + "<br>"
-        + "Support: " + sched["support_name"].fillna("") + "<br>"
-        + "Status: " + sched["task_status"].fillna("") + "<br>"
-        + "Time: " + sched["start_label"] + " - " + sched["end_label"] + "<br>"
-        + "Duration: " + sched["duration"].astype(str) + " min"
-        + sched["has_clash"].apply(lambda x: "<br><b>⚠️ CLASH</b>" if x else "")
-    )
-
-    # Color by status
     status_colors = {
         "completed": "#2ecc71",
         "rescheduled": "#f39c12",
@@ -1777,24 +1762,104 @@ def render_schedule_gantt(sched, selected_date):
 
     fig = go.Figure()
 
-    for _, row in sched.iterrows():
-        base_color = status_colors.get(row["task_status"], "#95a5a6")
-        # Clash border
-        line_dict = dict(color="#ff0000", width=3) if row["has_clash"] else dict(color="white", width=1)
+    # Group overlapping interviews per expert so hover shows ALL of them
+    for expert in expert_order:
+        expert_df = sched[sched["expert_name"] == expert].sort_values("start_min")
 
-        fig.add_trace(go.Bar(
-            y=[row["expert_name"]],
-            x=[(row["end_dt"] - row["start_dt"]).total_seconds() * 1000],  # ms for timedelta
-            base=[row["start_dt"]],
-            orientation="h",
-            marker=dict(color=base_color, line=line_dict),
-            hovertext=row["hover"],
-            hoverinfo="text",
-            showlegend=False,
-            width=0.6,
-        ))
+        # Build clusters of overlapping intervals
+        clusters = []
+        for _, row in expert_df.iterrows():
+            placed = False
+            for cluster in clusters:
+                # Check if this row overlaps with any row in the cluster
+                for c_row in cluster:
+                    if row["start_min"] < c_row["end_min"] and c_row["start_min"] < row["end_min"]:
+                        cluster.append(row)
+                        placed = True
+                        break
+                if placed:
+                    break
+            if not placed:
+                clusters.append([row])
 
-    # Add legend traces for statuses
+        for cluster in clusters:
+            if len(cluster) == 1:
+                # Single interview — render normally
+                row = cluster[0]
+                base_color = status_colors.get(row["task_status"], "#95a5a6")
+                line_dict = dict(color="#ff0000", width=3) if row["has_clash"] else dict(color="white", width=1)
+
+                hover = (
+                    "<b>" + str(row["candidate_name"] or "") + "</b><br>"
+                    + "Company: " + str(row["company_name"] or "") + "<br>"
+                    + "Round: " + str(row["round_name"] or "") + "<br>"
+                    + "Status: " + str(row["task_status"] or "") + "<br>"
+                    + "Time: " + row["start_label"] + " – " + row["end_label"] + "<br>"
+                    + "Duration: " + str(row["duration"]) + " min"
+                )
+
+                fig.add_trace(go.Bar(
+                    y=[expert],
+                    x=[(row["end_dt"] - row["start_dt"]).total_seconds() * 1000],
+                    base=[row["start_dt"]],
+                    orientation="h",
+                    marker=dict(color=base_color, line=line_dict),
+                    hovertext=hover,
+                    hoverinfo="text",
+                    showlegend=False,
+                    width=0.6,
+                ))
+            else:
+                # Multiple overlapping interviews — render one bar with merged hover
+                min_start = min(r["start_min"] for r in cluster)
+                max_end = max(r["end_min"] for r in cluster)
+                start_dt = ref + timedelta(minutes=int(min_start))
+                end_dt = ref + timedelta(minutes=int(max_end))
+
+                # Build combined hover text
+                hover_parts = ["<b>⚠️ " + str(len(cluster)) + " OVERLAPPING INTERVIEWS</b><br><br>"]
+                for idx, row in enumerate(cluster):
+                    hover_parts.append(
+                        "<b>" + str(idx + 1) + ". " + str(row["candidate_name"] or "") + "</b><br>"
+                        + "   Company: " + str(row["company_name"] or "") + "<br>"
+                        + "   Round: " + str(row["round_name"] or "") + "<br>"
+                        + "   Status: " + str(row["task_status"] or "") + "<br>"
+                        + "   Time: " + row["start_label"] + " – " + row["end_label"] + "<br>"
+                        + "   Duration: " + str(row["duration"]) + " min<br><br>"
+                    )
+
+                # Use the color of the first interview but with red clash border
+                base_color = status_colors.get(cluster[0]["task_status"], "#95a5a6")
+
+                fig.add_trace(go.Bar(
+                    y=[expert],
+                    x=[(end_dt - start_dt).total_seconds() * 1000],
+                    base=[start_dt],
+                    orientation="h",
+                    marker=dict(color=base_color, line=dict(color="#ff0000", width=3)),
+                    hovertext="".join(hover_parts),
+                    hoverinfo="text",
+                    showlegend=False,
+                    width=0.6,
+                ))
+
+                # Also render individual bars within the cluster (thinner, for visual distinction)
+                for row in cluster:
+                    bar_color = status_colors.get(row["task_status"], "#95a5a6")
+                    fig.add_trace(go.Bar(
+                        y=[expert],
+                        x=[(row["end_dt"] - row["start_dt"]).total_seconds() * 1000],
+                        base=[row["start_dt"]],
+                        orientation="h",
+                        marker=dict(color=bar_color, line=dict(color="#ff0000", width=2),
+                                    opacity=0.7),
+                        hovertext="".join(hover_parts),  # Same merged hover on each
+                        hoverinfo="text",
+                        showlegend=False,
+                        width=0.3,  # Thinner bars stacked visually
+                    ))
+
+    # Legend traces
     for status, color in status_colors.items():
         fig.add_trace(go.Bar(
             y=[None], x=[None],
@@ -1802,7 +1867,6 @@ def render_schedule_gantt(sched, selected_date):
             name=TASK_LABEL.get(status, status.title()),
             showlegend=True,
         ))
-    # Clash legend
     fig.add_trace(go.Bar(
         y=[None], x=[None],
         marker=dict(color="#95a5a6", line=dict(color="#ff0000", width=3)),
@@ -1810,7 +1874,6 @@ def render_schedule_gantt(sched, selected_date):
         showlegend=True,
     ))
 
-    # Determine time range
     min_start = sched["start_min"].min()
     max_end = sched["end_min"].max()
     range_start = ref + timedelta(minutes=max(0, int(min_start) - 30))
@@ -1824,7 +1887,7 @@ def render_schedule_gantt(sched, selected_date):
             tickformat="%I:%M %p",
             range=[range_start, range_end],
             title="Time (EDT)",
-            dtick=30 * 60 * 1000,  # 30-minute ticks
+            dtick=30 * 60 * 1000,
         ),
         yaxis=dict(
             categoryorder="array",
@@ -1837,6 +1900,7 @@ def render_schedule_gantt(sched, selected_date):
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
 
 
 def render_availability_summary(sched, selected_date):
