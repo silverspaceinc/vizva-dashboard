@@ -1934,7 +1934,7 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
 def render_schedule_view(all_data, active_expert_df):
     """Main renderer for the Schedule View page."""
     st.header("Schedule View")
-    st.caption("Select any date to see all interviews across all support types, organized by expert timeline (EDT)")
+    st.caption("Select any date to see Interview Support interviews organized by expert timeline (EDT)")
 
     if "date" not in all_data.columns:
         st.warning("No date column available in data.")
@@ -1948,34 +1948,13 @@ def render_schedule_view(all_data, active_expert_df):
     min_d = valid_dates.min().date()
     max_d = valid_dates.max().date()
 
-    # Allow selecting any date including future
     selected_date = st.date_input("Select Date", value=date.today(),
                                    min_value=min_d,
                                    max_value=max_d + timedelta(days=90),
                                    key="schedule_date")
 
-    # Use ALL data (all support types) for schedule view
     sched = build_schedule_data(all_data, selected_date)
 
-    # DEBUG — remove later
-    day_all = all_data[all_data["date"].dt.date == selected_date] if "date" in all_data.columns else pd.DataFrame()
-    with st.expander("🔍 Debug Info (remove later)"):
-        st.write("all_data shape:", all_data.shape)
-        st.write("all_data columns:", list(all_data.columns))
-        st.write("Records on selected date:", len(day_all))
-        if not day_all.empty:
-            st.write("start_time present:", "start_time" in day_all.columns)
-            st.write("end_time present:", "end_time" in day_all.columns)
-            if "start_time" in day_all.columns:
-                st.write("start_time sample values:", day_all["start_time"].head(10).tolist())
-            if "support_name" in day_all.columns:
-                st.write("support types on this date:", day_all["support_name"].unique().tolist())
-            if "task_status" in day_all.columns:
-                st.write("statuses:", day_all["task_status"].value_counts().to_dict())
-        st.write("sched shape:", sched.shape if not sched.empty else "EMPTY")
-
-
-    # ── KPI row ──────────────────────────────────────────────────
     # Get ALL active expert names (excluding HCR, Self)
     EXCLUDE_EXPERTS = {"hcr", "self"}
     all_expert_names = sorted([
@@ -1984,13 +1963,18 @@ def render_schedule_view(all_data, active_expert_df):
     ]) if "expert_name" in active_expert_df.columns else []
 
     if sched.empty:
-        st.info("No interviews with valid time data on " + str(selected_date))
-        # Still show count of interviews without time
+        st.info("No Interview Support interviews with valid time data on " + str(selected_date))
         day_all = all_data[all_data["date"].dt.date == selected_date]
         if not day_all.empty:
-            st.caption(str(len(day_all)) + " interview(s) found but none have valid start_time.")
+            st.caption(str(len(day_all)) + " record(s) found but none have valid start_time.")
+        if all_expert_names:
+            st.markdown("---")
+            render_schedule_gantt(sched, selected_date, all_expert_names)
+            st.markdown("---")
+            render_availability_summary(sched, selected_date, all_expert_names)
         return
 
+    # ── KPI row ──────────────────────────────────────────────────
     k = st.columns(6)
     k[0].metric("Total Interviews", len(sched))
     k[1].metric("Experts", sched["expert_name"].nunique())
@@ -1999,95 +1983,112 @@ def render_schedule_view(all_data, active_expert_df):
     k[4].metric("Rescheduled", int((sched["task_status"] == "rescheduled").sum()))
     k[5].metric("Cancelled", int((sched["task_status"] == "cancelled").sum()))
 
-    # Clash KPI
     clash_count = int(sched["has_clash"].sum())
     experts_with_clash = sched[sched["has_clash"]]["expert_name"].nunique()
     if clash_count > 0:
         st.warning("⚠️ **" + str(clash_count) + " interview(s) have clashes** across **" +
                    str(experts_with_clash) + " expert(s)**. Look for red borders in the timeline.")
 
-   # Support type note
     st.caption("Showing Interview Support only")
 
     # ── GANTT CHART ──────────────────────────────────────────────
     st.markdown("---")
-    # Get ALL active expert names for full timeline display
-    EXCLUDE_EXPERTS = {"hcr", "self"}
-    all_expert_names = sorted([
-        e for e in active_expert_df["expert_name"].dropna().unique()
-        if e.strip().lower() not in EXCLUDE_EXPERTS]) if "expert_name" in active_expert_df.columns else []
     render_schedule_gantt(sched, selected_date, all_expert_names)
 
+    # ── AVAILABILITY SUMMARY ─────────────────────────────────────
+    st.markdown("---")
+    render_availability_summary(sched, selected_date, all_expert_names)
+
+    # ── CLASH DETAILS ────────────────────────────────────────────
+    clash_df = sched[sched["has_clash"]].copy()
+    if not clash_df.empty:
+        st.markdown("---")
+        st.subheader("Clash Details — " + str(selected_date))
+        clash_display = clash_df[["expert_name", "candidate_name", "company_name",
+                                   "round_name", "support_name", "task_status",
+                                   "start_label", "end_label", "duration"]].copy()
+        clash_display.columns = ["Expert", "Candidate", "Company", "Round", "Support",
+                                  "Status", "Start", "End", "Duration (min)"]
+        st.dataframe(clash_display.sort_values(["Expert", "Start"]),
+                     use_container_width=True, hide_index=True)
+
+    # ── FULL SCHEDULE TABLE ──────────────────────────────────────
+    with st.expander("Full Schedule Table — " + str(selected_date)):
+        table_cols = [c for c in ["expert_name", "candidate_name", "company_name",
+                                   "round_name", "support_name", "task_status",
+                                   "start_label", "end_label", "duration", "has_clash"]
+                      if c in sched.columns]
+        display = sched[table_cols].copy()
+        display.columns = [c.replace("_", " ").title() for c in table_cols]
+        st.dataframe(display.sort_values(["Expert Name", "Start Label"]),
+                     use_container_width=True, hide_index=True)
 
     # ── AVAILABILITY SUMMARY ─────────────────────────────────────
-    def render_availability_summary(sched, selected_date, all_expert_names=None):
-        """Show expert availability — free slots between interviews."""
-        st.subheader("Expert Availability — " + str(selected_date) + " (EDT)")
-        st.caption("Free gaps between scheduled interviews (working hours: 8 AM – 10 PM EDT)")
-    
-        work_start = 8 * 60   # 8 AM
-        work_end = 22 * 60     # 10 PM
-    
-        avail_rows = []
-    
-        if not sched.empty:
-            for expert, grp in sched.groupby("expert_name"):
-                intervals = sorted(zip(grp["start_min"], grp["end_min"]))
-                # Merge overlapping intervals
-                merged = [intervals[0]]
-                for s, e in intervals[1:]:
-                    if s <= merged[-1][1]:
-                        merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-                    else:
-                        merged.append((s, e))
-    
-                # Find free slots within working hours
-                free_slots = []
-                prev_end = work_start
-                for s, e in merged:
-                    gap_start = max(prev_end, work_start)
-                    gap_end = min(s, work_end)
-                    if gap_end > gap_start and (gap_end - gap_start) >= 15:
-                        free_slots.append(_minutes_to_label(gap_start) + " – " + _minutes_to_label(gap_end) +
-                                          " (" + str(int(gap_end - gap_start)) + " min)")
-                    prev_end = max(prev_end, e)
-    
-                # After last interview
-                if prev_end < work_end and (work_end - prev_end) >= 15:
-                    free_slots.append(_minutes_to_label(prev_end) + " – " + _minutes_to_label(work_end) +
-                                      " (" + str(int(work_end - prev_end)) + " min)")
-    
-                total_busy = sum(e - s for s, e in merged)
-                total_interviews = len(grp)
-                has_clash = grp["has_clash"].any()
-    
+def render_availability_summary(sched, selected_date, all_expert_names=None):
+    """Show expert availability — free slots between interviews."""
+    st.subheader("Expert Availability — " + str(selected_date) + " (EDT)")
+    st.caption("Free gaps between scheduled interviews (working hours: 8 AM – 10 PM EDT)")
+
+    work_start = 8 * 60
+    work_end = 22 * 60
+
+    avail_rows = []
+
+    if not sched.empty:
+        for expert, grp in sched.groupby("expert_name"):
+            intervals = sorted(zip(grp["start_min"], grp["end_min"]))
+            merged = [intervals[0]]
+            for s, e in intervals[1:]:
+                if s <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                else:
+                    merged.append((s, e))
+
+            free_slots = []
+            prev_end = work_start
+            for s, e in merged:
+                gap_start = max(prev_end, work_start)
+                gap_end = min(s, work_end)
+                if gap_end > gap_start and (gap_end - gap_start) >= 15:
+                    free_slots.append(_minutes_to_label(gap_start) + " – " + _minutes_to_label(gap_end) +
+                                      " (" + str(int(gap_end - gap_start)) + " min)")
+                prev_end = max(prev_end, e)
+
+            if prev_end < work_end and (work_end - prev_end) >= 15:
+                free_slots.append(_minutes_to_label(prev_end) + " – " + _minutes_to_label(work_end) +
+                                  " (" + str(int(work_end - prev_end)) + " min)")
+
+            total_busy = sum(e - s for s, e in merged)
+            total_interviews = len(grp)
+            has_clash = grp["has_clash"].any()
+
+            avail_rows.append({
+                "Expert": expert,
+                "Interviews": total_interviews,
+                "Busy Time": str(int(total_busy)) + " min",
+                "Clashes": "⚠️ Yes" if has_clash else "No",
+                "Free Slots": " | ".join(free_slots) if free_slots else "No free slots",
+            })
+
+    if all_expert_names:
+        experts_in_sched = set(sched["expert_name"].unique()) if not sched.empty else set()
+        for expert in sorted(all_expert_names):
+            if expert not in experts_in_sched:
                 avail_rows.append({
                     "Expert": expert,
-                    "Interviews": total_interviews,
-                    "Busy Time": str(int(total_busy)) + " min",
-                    "Clashes": "⚠️ Yes" if has_clash else "No",
-                    "Free Slots": " | ".join(free_slots) if free_slots else "No free slots",
+                    "Interviews": 0,
+                    "Busy Time": "0 min",
+                    "Clashes": "No",
+                    "Free Slots": "Fully available (8:00 AM – 10:00 PM EDT)",
                 })
-    
-        # Add experts with zero interviews
-        if all_expert_names:
-            experts_in_sched = set(sched["expert_name"].unique()) if not sched.empty else set()
-            for expert in sorted(all_expert_names):
-                if expert not in experts_in_sched:
-                    avail_rows.append({
-                        "Expert": expert,
-                        "Interviews": 0,
-                        "Busy Time": "0 min",
-                        "Clashes": "No",
-                        "Free Slots": "Fully available (8:00 AM – 10:00 PM EDT)",
-                    })
-    
-        if not avail_rows:
-            st.info("No expert data available.")
-            return
+
+    if not avail_rows:
+        st.info("No expert data available.")
+        return
 
     avail_df = pd.DataFrame(avail_rows).sort_values("Interviews", ascending=False)
     st.dataframe(avail_df, use_container_width=True, hide_index=True)
+
 
     # ── CLASH DETAILS ────────────────────────────────────────────
     clash_df = sched[sched["has_clash"]].copy()
