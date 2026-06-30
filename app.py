@@ -2089,31 +2089,6 @@ def render_availability_summary(sched, selected_date, all_expert_names=None):
     avail_df = pd.DataFrame(avail_rows).sort_values("Interviews", ascending=False)
     st.dataframe(avail_df, use_container_width=True, hide_index=True)
 
-
-    # ── CLASH DETAILS ────────────────────────────────────────────
-    clash_df = sched[sched["has_clash"]].copy()
-    if not clash_df.empty:
-        st.markdown("---")
-        st.subheader("Clash Details — " + str(selected_date))
-        clash_display = clash_df[["expert_name", "candidate_name", "company_name",
-                                   "round_name", "support_name", "task_status",
-                                   "start_label", "end_label", "duration"]].copy()
-        clash_display.columns = ["Expert", "Candidate", "Company", "Round", "Support",
-                                  "Status", "Start", "End", "Duration (min)"]
-        st.dataframe(clash_display.sort_values(["Expert", "Start"]),
-                     use_container_width=True, hide_index=True)
-
-    # ── FULL SCHEDULE TABLE ──────────────────────────────────────
-    with st.expander("Full Schedule Table — " + str(selected_date)):
-        table_cols = [c for c in ["expert_name", "candidate_name", "company_name",
-                                   "round_name", "support_name", "task_status",
-                                   "start_label", "end_label", "duration", "has_clash"]
-                      if c in sched.columns]
-        display = sched[table_cols].copy()
-        display.columns = [c.replace("_", " ").title() for c in table_cols]
-        st.dataframe(display.sort_values(["Expert Name", "Start Label"]),
-                     use_container_width=True, hide_index=True)
-
 # ═══════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════
