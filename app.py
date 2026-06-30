@@ -2551,6 +2551,238 @@ def main():
                                                 if c in final_data.columns]
                                 st.dataframe(final_data[display_cols] if display_cols else final_data,
                                              use_container_width=True, hide_index=True)
+                                                # ── TECHNICAL / CODING ROUND — GIVEN BY WHOM ─────
+                        st.markdown("---")
+                        st.subheader("Technical / Coding Round — Given By Whom (" + sel_cr_month + ")")
+                        tech_mask = cr_month_data["round_name"].str.lower().str.contains("technical|coding", na=False)
+                        tech_data = cr_month_data[tech_mask]
+
+                        if tech_data.empty:
+                            st.info("No 'Technical / Coding' rounds found in completed interviews for " + sel_cr_month)
+                        else:
+                            tc_cols = st.columns(3)
+                            tc_cols[0].metric("Technical/Coding Rounds Completed", len(tech_data))
+                            tc_cols[1].metric("Experts Who Gave Technical/Coding",
+                                              tech_data["expert_name"].nunique() if "expert_name" in tech_data.columns else 0)
+                            tc_cols[2].metric("Candidates in Technical/Coding",
+                                              tech_data["candidate_name"].nunique() if "candidate_name" in tech_data.columns else 0)
+
+                            if "expert_name" in tech_data.columns:
+                                tech_by_expert = tech_data["expert_name"].value_counts()
+                                fig_tech = go.Figure(go.Bar(
+                                    y=tech_by_expert.index, x=tech_by_expert.values,
+                                    orientation="h", marker_color="#2980b9",
+                                    text=tech_by_expert.values, textposition="outside"
+                                ))
+                                fig_tech.update_layout(title="Technical/Coding Round — Expert Breakdown",
+                                                       height=max(400, len(tech_by_expert) * 35),
+                                                       yaxis=dict(autorange="reversed"),
+                                                       xaxis_title="Technical/Coding Rounds Given")
+                                st.plotly_chart(fig_tech, use_container_width=True)
+
+                            tech_stats = get_sentiment_stats(tech_data)
+                            if tech_stats:
+                                st.markdown("---")
+                                render_sentiment_kpi(tech_stats,
+                                                     title="Sentiment — Technical/Coding Round (" + sel_cr_month + ")")
+                                tcol1, tcol2 = st.columns(2)
+                                with tcol1:
+                                    fig = render_sentiment_donut(tech_stats, "Technical/Coding Sentiment Split")
+                                    if fig:
+                                        st.plotly_chart(fig, use_container_width=True)
+                                with tcol2:
+                                    fig = render_sentiment_histogram(tech_data, "Technical/Coding Score Distribution")
+                                    if fig:
+                                        st.plotly_chart(fig, use_container_width=True)
+
+                            with st.expander("Technical/Coding Round Details - " + sel_cr_month):
+                                display_cols = [c for c in ["date", "candidate_name", "expert_name", "round_name",
+                                                            "company_name", "sentiment_score", "sentiment_label", "feedback"]
+                                                if c in tech_data.columns]
+                                st.dataframe(tech_data[display_cols] if display_cols else tech_data,
+                                             use_container_width=True, hide_index=True)
+
+                        # ── FINALS + TECHNICAL/CODING MONTHLY TOTALS ─────
+                        st.markdown("---")
+                        st.subheader("Finals + Technical/Coding — Monthly Totals")
+                        st.caption("Month-wise count of Final and Technical/Coding rounds from completed interviews only")
+
+                        ft_mask = completed_iv["round_name"].str.lower().str.contains("final|technical|coding", na=False)
+                        ft_all = completed_iv[ft_mask].copy()
+
+                        if ft_all.empty:
+                            st.info("No Final or Technical/Coding rounds found in completed interviews.")
+                        else:
+                            ft_all["round_type"] = ft_all["round_name"].apply(
+                                lambda r: "Final" if "final" in str(r).lower()
+                                else "Technical/Coding" if any(k in str(r).lower() for k in ["technical", "coding"])
+                                else "Other"
+                            )
+                            ft_monthly = ft_all.groupby(["month", "round_type"]).size().unstack(fill_value=0).reset_index()
+
+                            fig_ft = go.Figure()
+                            if "Final" in ft_monthly.columns:
+                                fig_ft.add_trace(go.Bar(x=ft_monthly["month"], y=ft_monthly["Final"],
+                                                        name="Final", marker_color="#8e44ad",
+                                                        text=ft_monthly["Final"], textposition="inside"))
+                            if "Technical/Coding" in ft_monthly.columns:
+                                fig_ft.add_trace(go.Bar(x=ft_monthly["month"], y=ft_monthly["Technical/Coding"],
+                                                        name="Technical/Coding", marker_color="#2980b9",
+                                                        text=ft_monthly["Technical/Coding"], textposition="inside"))
+                            fig_ft.update_layout(barmode="stack",
+                                                 title="Monthly Finals + Technical/Coding Rounds (Completed Only)",
+                                                 height=420, yaxis_title="Rounds",
+                                                 legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
+                            st.plotly_chart(fig_ft, use_container_width=True)
+
+                            with st.expander("Monthly Finals + Technical/Coding Data"):
+                                st.dataframe(ft_monthly, use_container_width=True, hide_index=True)
+
+                        # ── CONVERSION KPI: INTERVIEWS PER FINAL+TECHNICAL ──
+                        st.markdown("---")
+                        st.subheader("Interview Conversion Rate — " + sel_cr_month)
+                        st.caption(
+                            "Total Completed Interviews ÷ (Finals + Technical/Coding) = "
+                            "how many interviews it takes on average to reach a Final or Technical/Coding round. "
+                            "Lower is better."
+                        )
+
+                        total_completed_month = len(cr_month_data)
+                        final_count_month = len(cr_month_data[cr_month_data["round_name"].str.lower().str.contains("final", na=False)])
+                        tech_count_month = len(cr_month_data[cr_month_data["round_name"].str.lower().str.contains("technical|coding", na=False)])
+                        ft_total_month = final_count_month + tech_count_month
+
+                        conv_cols = st.columns(5)
+                        conv_cols[0].metric("Total Completed", total_completed_month)
+                        conv_cols[1].metric("Final Rounds", final_count_month)
+                        conv_cols[2].metric("Technical/Coding Rounds", tech_count_month)
+                        conv_cols[3].metric("Finals + Technical/Coding", ft_total_month)
+                        if ft_total_month > 0:
+                            ratio = round(total_completed_month / ft_total_month, 2)
+                            conv_cols[4].metric("Interviews per Final+Tech", f"{ratio:.2f}",
+                                                delta="Lower is better", delta_color="inverse")
+                        else:
+                            conv_cols[4].metric("Interviews per Final+Tech", "N/A")
+
+                        # ── MONTHLY CONVERSION TREND ─────────────────
+                        st.markdown("---")
+                        st.subheader("Monthly Conversion Trend")
+                        st.caption("Completed Interviews ÷ (Finals + Technical/Coding) per month — lower means faster conversion")
+
+                        conv_rows = []
+                        for m in sorted(completed_iv["month"].unique()):
+                            m_data = completed_iv[completed_iv["month"] == m]
+                            m_total = len(m_data)
+                            m_final = len(m_data[m_data["round_name"].str.lower().str.contains("final", na=False)])
+                            m_tech = len(m_data[m_data["round_name"].str.lower().str.contains("technical|coding", na=False)])
+                            m_ft = m_final + m_tech
+                            m_ratio = round(m_total / m_ft, 2) if m_ft > 0 else None
+                            conv_rows.append({
+                                "Month": m,
+                                "Completed": m_total,
+                                "Finals": m_final,
+                                "Technical/Coding": m_tech,
+                                "Finals+Tech": m_ft,
+                                "Ratio": m_ratio,
+                            })
+                        conv_df = pd.DataFrame(conv_rows)
+
+                        valid_conv = conv_df.dropna(subset=["Ratio"])
+                        if not valid_conv.empty:
+                            fig_conv = go.Figure()
+                            fig_conv.add_trace(go.Scatter(
+                                x=valid_conv["Month"], y=valid_conv["Ratio"],
+                                mode="lines+markers+text",
+                                text=valid_conv["Ratio"].apply(lambda v: f"{v:.2f}"),
+                                textposition="top center",
+                                line=dict(color="#e67e22", width=3),
+                                marker=dict(size=10),
+                                name="Interviews per Final+Tech",
+                            ))
+                            fig_conv.add_trace(go.Bar(
+                                x=valid_conv["Month"], y=valid_conv["Finals+Tech"],
+                                name="Finals+Tech Count", marker_color="#8e44ad", opacity=0.3,
+                                text=valid_conv["Finals+Tech"], textposition="outside",
+                                yaxis="y2",
+                            ))
+                            fig_conv.update_layout(
+                                title="Monthly Conversion: Interviews per Final+Technical Round",
+                                height=450,
+                                yaxis=dict(title="Ratio (lower = better)", side="left"),
+                                yaxis2=dict(title="Finals+Tech Count", side="right", overlaying="y"),
+                                legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
+                            )
+                            st.plotly_chart(fig_conv, use_container_width=True)
+
+                        with st.expander("Monthly Conversion Data"):
+                            st.dataframe(conv_df, use_container_width=True, hide_index=True)
+
+                        # ── EXPERT-WISE CONVERSION KPI ───────────────
+                        st.markdown("---")
+                        st.subheader("Expert-wise Conversion Rate — " + sel_cr_month)
+                        st.caption(
+                            "Each expert's Completed Interviews ÷ (Finals + Technical/Coding). "
+                            "Lower ratio = expert reaches advanced rounds faster."
+                        )
+
+                        if "expert_name" in cr_month_data.columns:
+                            expert_conv_rows = []
+                            for expert in sorted(cr_month_data["expert_name"].unique()):
+                                e_data = cr_month_data[cr_month_data["expert_name"] == expert]
+                                e_total = len(e_data)
+                                e_final = len(e_data[e_data["round_name"].str.lower().str.contains("final", na=False)])
+                                e_tech = len(e_data[e_data["round_name"].str.lower().str.contains("technical|coding", na=False)])
+                                e_ft = e_final + e_tech
+                                e_ratio = round(e_total / e_ft, 2) if e_ft > 0 else None
+                                expert_conv_rows.append({
+                                    "Expert": expert,
+                                    "Completed": e_total,
+                                    "Finals": e_final,
+                                    "Technical/Coding": e_tech,
+                                    "Finals+Tech": e_ft,
+                                    "Ratio": e_ratio,
+                                })
+                            expert_conv_df = pd.DataFrame(expert_conv_rows)
+
+                            # Show KPI cards for top/bottom performers
+                            valid_expert_conv = expert_conv_df.dropna(subset=["Ratio"])
+                            if not valid_expert_conv.empty:
+                                best = valid_expert_conv.loc[valid_expert_conv["Ratio"].idxmin()]
+                                worst = valid_expert_conv.loc[valid_expert_conv["Ratio"].idxmax()]
+                                avg_ratio = round(valid_expert_conv["Ratio"].mean(), 2)
+
+                                perf_cols = st.columns(3)
+                                perf_cols[0].metric("Best Converter", str(best["Expert"]),
+                                                    delta=f"{best['Ratio']:.2f} ratio", delta_color="inverse")
+                                perf_cols[1].metric("Needs Improvement", str(worst["Expert"]),
+                                                    delta=f"{worst['Ratio']:.2f} ratio", delta_color="normal")
+                                perf_cols[2].metric("Team Average", f"{avg_ratio:.2f}")
+
+                            # Bar chart of expert conversion ratios
+                            valid_sorted = valid_expert_conv.sort_values("Ratio", ascending=True) if not valid_expert_conv.empty else pd.DataFrame()
+                            if not valid_sorted.empty:
+                                bar_colors = ["#2ecc71" if r <= avg_ratio else "#e74c3c"
+                                              for r in valid_sorted["Ratio"]] if not valid_expert_conv.empty else []
+                                fig_ec = go.Figure(go.Bar(
+                                    y=valid_sorted["Expert"], x=valid_sorted["Ratio"],
+                                    orientation="h", marker_color=bar_colors,
+                                    text=valid_sorted["Ratio"].apply(lambda v: f"{v:.2f}"),
+                                    textposition="outside",
+                                ))
+                                fig_ec.add_vline(x=avg_ratio, line_dash="dash", line_color="#f39c12",
+                                                 annotation_text=f"Avg: {avg_ratio:.2f}")
+                                fig_ec.update_layout(
+                                    title="Expert Conversion Rate — Interviews per Final+Technical (" + sel_cr_month + ")",
+                                    height=max(450, len(valid_sorted) * 35),
+                                    xaxis_title="Ratio (lower = better)",
+                                    yaxis=dict(autorange="reversed"),
+                                )
+                                st.plotly_chart(fig_ec, use_container_width=True)
+
+                            with st.expander("Expert Conversion Data — " + sel_cr_month):
+                                st.dataframe(expert_conv_df.sort_values("Ratio", ascending=True, na_position="last"),
+                                             use_container_width=True, hide_index=True)
+
 
                         st.markdown("---")
                         st.subheader("Sentiment — All Completed Interviews (" + sel_cr_month + ")")
