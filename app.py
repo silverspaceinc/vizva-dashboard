@@ -2089,8 +2089,6 @@ def render_schedule_view(all_data, active_expert_df):
     avail_df = pd.DataFrame(avail_rows).sort_values("Interviews", ascending=False)
     st.dataframe(avail_df, use_container_width=True, hide_index=True)
 
-    st.markdown("---")
-    render_availability_summary(sched, selected_date, all_expert_names)
     # ── CLASH DETAILS ────────────────────────────────────────────
     clash_df = sched[sched["has_clash"]].copy()
     if not clash_df.empty:
