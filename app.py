@@ -2020,6 +2020,75 @@ def render_schedule_view(all_data, active_expert_df):
 
 
     # ── AVAILABILITY SUMMARY ─────────────────────────────────────
+    def render_availability_summary(sched, selected_date, all_expert_names=None):
+    """Show expert availability — free slots between interviews."""
+    st.subheader("Expert Availability — " + str(selected_date) + " (EDT)")
+    st.caption("Free gaps between scheduled interviews (working hours: 8 AM – 10 PM EDT)")
+
+    work_start = 8 * 60   # 8 AM
+    work_end = 22 * 60     # 10 PM
+
+    avail_rows = []
+
+    if not sched.empty:
+        for expert, grp in sched.groupby("expert_name"):
+            intervals = sorted(zip(grp["start_min"], grp["end_min"]))
+            # Merge overlapping intervals
+            merged = [intervals[0]]
+            for s, e in intervals[1:]:
+                if s <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                else:
+                    merged.append((s, e))
+
+            # Find free slots within working hours
+            free_slots = []
+            prev_end = work_start
+            for s, e in merged:
+                gap_start = max(prev_end, work_start)
+                gap_end = min(s, work_end)
+                if gap_end > gap_start and (gap_end - gap_start) >= 15:
+                    free_slots.append(_minutes_to_label(gap_start) + " – " + _minutes_to_label(gap_end) +
+                                      " (" + str(int(gap_end - gap_start)) + " min)")
+                prev_end = max(prev_end, e)
+
+            # After last interview
+            if prev_end < work_end and (work_end - prev_end) >= 15:
+                free_slots.append(_minutes_to_label(prev_end) + " – " + _minutes_to_label(work_end) +
+                                  " (" + str(int(work_end - prev_end)) + " min)")
+
+            total_busy = sum(e - s for s, e in merged)
+            total_interviews = len(grp)
+            has_clash = grp["has_clash"].any()
+
+            avail_rows.append({
+                "Expert": expert,
+                "Interviews": total_interviews,
+                "Busy Time": str(int(total_busy)) + " min",
+                "Clashes": "⚠️ Yes" if has_clash else "No",
+                "Free Slots": " | ".join(free_slots) if free_slots else "No free slots",
+            })
+
+    # Add experts with zero interviews
+    if all_expert_names:
+        experts_in_sched = set(sched["expert_name"].unique()) if not sched.empty else set()
+        for expert in sorted(all_expert_names):
+            if expert not in experts_in_sched:
+                avail_rows.append({
+                    "Expert": expert,
+                    "Interviews": 0,
+                    "Busy Time": "0 min",
+                    "Clashes": "No",
+                    "Free Slots": "Fully available (8:00 AM – 10:00 PM EDT)",
+                })
+
+    if not avail_rows:
+        st.info("No expert data available.")
+        return
+
+    avail_df = pd.DataFrame(avail_rows).sort_values("Interviews", ascending=False)
+    st.dataframe(avail_df, use_container_width=True, hide_index=True)
+
     st.markdown("---")
     render_availability_summary(sched, selected_date, all_expert_names)
     # ── CLASH DETAILS ────────────────────────────────────────────
