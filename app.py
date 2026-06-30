@@ -2030,7 +2030,10 @@ def render_schedule_view(all_data, active_expert_df):
 
     # ── GANTT CHART ──────────────────────────────────────────────
     st.markdown("---")
-    render_schedule_gantt(sched, selected_date)
+    # Get ALL active expert names for full timeline display
+    all_expert_names = sorted(active_expert_df["expert_name"].dropna().unique()) if "expert_name" in active_expert_df.columns else []
+    render_schedule_gantt(sched, selected_date, all_expert_names)
+
 
     # ── AVAILABILITY SUMMARY ─────────────────────────────────────
     st.markdown("---")
