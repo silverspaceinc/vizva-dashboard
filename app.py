@@ -2023,7 +2023,7 @@ def render_schedule_view(all_data, active_expert_df):
         st.dataframe(display.sort_values(["Expert Name", "Start Label"]),
                      use_container_width=True, hide_index=True)
 
-    # ── AVAILABILITY SUMMARY ─────────────────────────────────────
+# ── AVAILABILITY SUMMARY ─────────────────────────────────────
 def render_availability_summary(sched, selected_date, all_expert_names=None):
     """Show expert availability — free slots between interviews."""
     st.subheader("Expert Availability — " + str(selected_date) + " (EDT)")
