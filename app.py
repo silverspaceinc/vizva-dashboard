@@ -1740,18 +1740,30 @@ def build_schedule_data(all_data, selected_date):
     return sched
 
 
-def render_schedule_gantt(sched, selected_date):
+def render_schedule_gantt(sched, selected_date, all_expert_names=None):
     """Render the Gantt-style timeline chart with merged hover for overlapping slots."""
-    if sched.empty:
-        st.info("No interviews with valid time data for " + str(selected_date))
+
+    # Experts with interviews — sorted by earliest start
+    if not sched.empty:
+        sched = sched.copy()
+        ref = datetime(2000, 1, 1)
+        sched["start_dt"] = sched["start_min"].apply(lambda m: ref + timedelta(minutes=int(m)))
+        sched["end_dt"] = sched["end_min"].apply(lambda m: ref + timedelta(minutes=int(m)))
+        experts_with_interviews = sched.groupby("expert_name")["start_min"].min().sort_values().index.tolist()
+    else:
+        ref = datetime(2000, 1, 1)
+        experts_with_interviews = []
+
+    # ALL active experts (including those with zero interviews)
+    if all_expert_names:
+        experts_without = [e for e in all_expert_names if e not in experts_with_interviews]
+        expert_order = experts_with_interviews + sorted(experts_without)
+    else:
+        expert_order = experts_with_interviews
+
+    if not expert_order:
+        st.info("No experts found for " + str(selected_date))
         return
-
-    ref = datetime(2000, 1, 1)
-    sched = sched.copy()
-    sched["start_dt"] = sched["start_min"].apply(lambda m: ref + timedelta(minutes=int(m)))
-    sched["end_dt"] = sched["end_min"].apply(lambda m: ref + timedelta(minutes=int(m)))
-
-    expert_order = sched.groupby("expert_name")["start_min"].min().sort_values().index.tolist()
 
     status_colors = {
         "completed": "#2ecc71",
@@ -1762,102 +1774,114 @@ def render_schedule_gantt(sched, selected_date):
 
     fig = go.Figure()
 
-    # Group overlapping interviews per expert so hover shows ALL of them
-    for expert in expert_order:
-        expert_df = sched[sched["expert_name"] == expert].sort_values("start_min")
+    if not sched.empty:
+        for expert in experts_with_interviews:
+            expert_df = sched[sched["expert_name"] == expert].sort_values("start_min")
 
-        # Build clusters of overlapping intervals
-        clusters = []
-        for _, row in expert_df.iterrows():
-            placed = False
-            for cluster in clusters:
-                # Check if this row overlaps with any row in the cluster
-                for c_row in cluster:
-                    if row["start_min"] < c_row["end_min"] and c_row["start_min"] < row["end_min"]:
-                        cluster.append(row)
-                        placed = True
+            # Build clusters of overlapping intervals
+            clusters = []
+            for _, row in expert_df.iterrows():
+                row_dict = row.to_dict()
+                placed = False
+                for cluster in clusters:
+                    for c_row in cluster:
+                        if row_dict["start_min"] < c_row["end_min"] and c_row["start_min"] < row_dict["end_min"]:
+                            cluster.append(row_dict)
+                            placed = True
+                            break
+                    if placed:
                         break
-                if placed:
-                    break
-            if not placed:
-                clusters.append([row])
+                if not placed:
+                    clusters.append([row_dict])
 
-        for cluster in clusters:
-            if len(cluster) == 1:
-                # Single interview — render normally
-                row = cluster[0]
-                base_color = status_colors.get(row["task_status"], "#95a5a6")
-                line_dict = dict(color="#ff0000", width=3) if row["has_clash"] else dict(color="white", width=1)
+            for cluster in clusters:
+                if len(cluster) == 1:
+                    row = cluster[0]
+                    base_color = status_colors.get(row["task_status"], "#95a5a6")
+                    line_dict = dict(color="#ff0000", width=3) if row["has_clash"] else dict(color="white", width=1)
 
-                hover = (
-                    "<b>" + str(row["candidate_name"] or "") + "</b><br>"
-                    + "Company: " + str(row["company_name"] or "") + "<br>"
-                    + "Round: " + str(row["round_name"] or "") + "<br>"
-                    + "Status: " + str(row["task_status"] or "") + "<br>"
-                    + "Time: " + row["start_label"] + " – " + row["end_label"] + "<br>"
-                    + "Duration: " + str(row["duration"]) + " min"
-                )
-
-                fig.add_trace(go.Bar(
-                    y=[expert],
-                    x=[(row["end_dt"] - row["start_dt"]).total_seconds() * 1000],
-                    base=[row["start_dt"]],
-                    orientation="h",
-                    marker=dict(color=base_color, line=line_dict),
-                    hovertext=hover,
-                    hoverinfo="text",
-                    showlegend=False,
-                    width=0.6,
-                ))
-            else:
-                # Multiple overlapping interviews — render one bar with merged hover
-                min_start = min(r["start_min"] for r in cluster)
-                max_end = max(r["end_min"] for r in cluster)
-                start_dt = ref + timedelta(minutes=int(min_start))
-                end_dt = ref + timedelta(minutes=int(max_end))
-
-                # Build combined hover text
-                hover_parts = ["<b>⚠️ " + str(len(cluster)) + " OVERLAPPING INTERVIEWS</b><br><br>"]
-                for idx, row in enumerate(cluster):
-                    hover_parts.append(
-                        "<b>" + str(idx + 1) + ". " + str(row["candidate_name"] or "") + "</b><br>"
-                        + "   Company: " + str(row["company_name"] or "") + "<br>"
-                        + "   Round: " + str(row["round_name"] or "") + "<br>"
-                        + "   Status: " + str(row["task_status"] or "") + "<br>"
-                        + "   Time: " + row["start_label"] + " – " + row["end_label"] + "<br>"
-                        + "   Duration: " + str(row["duration"]) + " min<br><br>"
+                    hover = (
+                        "<b>" + str(row.get("candidate_name", "") or "") + "</b><br>"
+                        + "Company: " + str(row.get("company_name", "") or "") + "<br>"
+                        + "Round: " + str(row.get("round_name", "") or "") + "<br>"
+                        + "Status: " + str(row.get("task_status", "") or "") + "<br>"
+                        + "Time: " + str(row["start_label"]) + " – " + str(row["end_label"]) + "<br>"
+                        + "Duration: " + str(row["duration"]) + " min"
                     )
 
-                # Use the color of the first interview but with red clash border
-                base_color = status_colors.get(cluster[0]["task_status"], "#95a5a6")
-
-                fig.add_trace(go.Bar(
-                    y=[expert],
-                    x=[(end_dt - start_dt).total_seconds() * 1000],
-                    base=[start_dt],
-                    orientation="h",
-                    marker=dict(color=base_color, line=dict(color="#ff0000", width=3)),
-                    hovertext="".join(hover_parts),
-                    hoverinfo="text",
-                    showlegend=False,
-                    width=0.6,
-                ))
-
-                # Also render individual bars within the cluster (thinner, for visual distinction)
-                for row in cluster:
-                    bar_color = status_colors.get(row["task_status"], "#95a5a6")
                     fig.add_trace(go.Bar(
                         y=[expert],
                         x=[(row["end_dt"] - row["start_dt"]).total_seconds() * 1000],
                         base=[row["start_dt"]],
                         orientation="h",
-                        marker=dict(color=bar_color, line=dict(color="#ff0000", width=2),
-                                    opacity=0.7),
-                        hovertext="".join(hover_parts),  # Same merged hover on each
+                        marker=dict(color=base_color, line=line_dict),
+                        hovertext=hover,
                         hoverinfo="text",
                         showlegend=False,
-                        width=0.3,  # Thinner bars stacked visually
+                        width=0.6,
                     ))
+                else:
+                    min_start = min(r["start_min"] for r in cluster)
+                    max_end = max(r["end_min"] for r in cluster)
+                    start_dt = ref + timedelta(minutes=int(min_start))
+                    end_dt = ref + timedelta(minutes=int(max_end))
+
+                    hover_parts = ["<b>⚠️ " + str(len(cluster)) + " OVERLAPPING INTERVIEWS</b><br><br>"]
+                    for idx, row in enumerate(cluster):
+                        hover_parts.append(
+                            "<b>" + str(idx + 1) + ". " + str(row.get("candidate_name", "") or "") + "</b><br>"
+                            + "   Company: " + str(row.get("company_name", "") or "") + "<br>"
+                            + "   Round: " + str(row.get("round_name", "") or "") + "<br>"
+                            + "   Status: " + str(row.get("task_status", "") or "") + "<br>"
+                            + "   Time: " + str(row["start_label"]) + " – " + str(row["end_label"]) + "<br>"
+                            + "   Duration: " + str(row["duration"]) + " min<br><br>"
+                        )
+
+                    base_color = status_colors.get(cluster[0]["task_status"], "#95a5a6")
+                    merged_hover = "".join(hover_parts)
+
+                    fig.add_trace(go.Bar(
+                        y=[expert],
+                        x=[(end_dt - start_dt).total_seconds() * 1000],
+                        base=[start_dt],
+                        orientation="h",
+                        marker=dict(color=base_color, line=dict(color="#ff0000", width=3)),
+                        hovertext=merged_hover,
+                        hoverinfo="text",
+                        showlegend=False,
+                        width=0.6,
+                    ))
+
+                    for row in cluster:
+                        bar_color = status_colors.get(row["task_status"], "#95a5a6")
+                        fig.add_trace(go.Bar(
+                            y=[expert],
+                            x=[(row["end_dt"] - row["start_dt"]).total_seconds() * 1000],
+                            base=[row["start_dt"]],
+                            orientation="h",
+                            marker=dict(color=bar_color, line=dict(color="#ff0000", width=2),
+                                        opacity=0.7),
+                            hovertext=merged_hover,
+                            hoverinfo="text",
+                            showlegend=False,
+                            width=0.3,
+                        ))
+
+    # Add invisible traces for experts with NO interviews (so they appear on y-axis)
+    experts_on_chart = set(experts_with_interviews)
+    for expert in expert_order:
+        if expert not in experts_on_chart:
+            fig.add_trace(go.Bar(
+                y=[expert],
+                x=[0],
+                base=[ref + timedelta(hours=8)],
+                orientation="h",
+                marker=dict(color="rgba(0,0,0,0)"),
+                hovertext="No interviews scheduled",
+                hoverinfo="text",
+                showlegend=False,
+                width=0.6,
+            ))
 
     # Legend traces
     for status, color in status_colors.items():
@@ -1874,14 +1898,20 @@ def render_schedule_gantt(sched, selected_date):
         showlegend=True,
     ))
 
-    min_start = sched["start_min"].min()
-    max_end = sched["end_min"].max()
-    range_start = ref + timedelta(minutes=max(0, int(min_start) - 30))
-    range_end = ref + timedelta(minutes=min(1440, int(max_end) + 30))
+    # Time range
+    if not sched.empty:
+        min_start_val = sched["start_min"].min()
+        max_end_val = sched["end_min"].max()
+    else:
+        min_start_val = 8 * 60
+        max_end_val = 18 * 60
+
+    range_start = ref + timedelta(minutes=max(0, int(min_start_val) - 30))
+    range_end = ref + timedelta(minutes=min(1440, int(max_end_val) + 30))
 
     fig.update_layout(
         title="Expert Schedule — " + str(selected_date) + " (EDT)",
-        height=max(500, len(expert_order) * 55),
+        height=max(500, len(expert_order) * 45),
         xaxis=dict(
             type="date",
             tickformat="%I:%M %p",
@@ -1900,62 +1930,6 @@ def render_schedule_gantt(sched, selected_date):
     )
 
     st.plotly_chart(fig, use_container_width=True)
-
-
-
-def render_availability_summary(sched, selected_date):
-    """Show expert availability — free slots between interviews."""
-    if sched.empty:
-        return
-
-    st.subheader("Expert Availability — " + str(selected_date) + " (EDT)")
-    st.caption("Free gaps between scheduled interviews (working hours: 8 AM – 10 PM EDT)")
-
-    work_start = 8 * 60   # 8 AM
-    work_end = 22 * 60     # 10 PM
-
-    avail_rows = []
-    for expert, grp in sched.groupby("expert_name"):
-        intervals = sorted(zip(grp["start_min"], grp["end_min"]))
-        # Merge overlapping intervals
-        merged = [intervals[0]]
-        for s, e in intervals[1:]:
-            if s <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-            else:
-                merged.append((s, e))
-
-        # Find free slots within working hours
-        free_slots = []
-        prev_end = work_start
-        for s, e in merged:
-            gap_start = max(prev_end, work_start)
-            gap_end = min(s, work_end)
-            if gap_end > gap_start and (gap_end - gap_start) >= 15:  # at least 15 min gap
-                free_slots.append(_minutes_to_label(gap_start) + " – " + _minutes_to_label(gap_end) +
-                                  " (" + str(int(gap_end - gap_start)) + " min)")
-            prev_end = max(prev_end, e)
-
-        # After last interview
-        if prev_end < work_end and (work_end - prev_end) >= 15:
-            free_slots.append(_minutes_to_label(prev_end) + " – " + _minutes_to_label(work_end) +
-                              " (" + str(int(work_end - prev_end)) + " min)")
-
-        total_busy = sum(e - s for s, e in merged)
-        total_interviews = len(grp)
-        has_clash = grp["has_clash"].any()
-
-        avail_rows.append({
-            "Expert": expert,
-            "Interviews": total_interviews,
-            "Busy Time": str(int(total_busy)) + " min",
-            "Clashes": "⚠️ Yes" if has_clash else "No",
-            "Free Slots": " | ".join(free_slots) if free_slots else "No free slots",
-        })
-
-    avail_df = pd.DataFrame(avail_rows).sort_values("Interviews", ascending=False)
-    st.dataframe(avail_df, use_container_width=True, hide_index=True)
-
 
 def render_schedule_view(all_data, active_expert_df):
     """Main renderer for the Schedule View page."""
