@@ -1976,6 +1976,13 @@ def render_schedule_view(all_data, active_expert_df):
 
 
     # ── KPI row ──────────────────────────────────────────────────
+    # Get ALL active expert names (excluding HCR, Self)
+    EXCLUDE_EXPERTS = {"hcr", "self"}
+    all_expert_names = sorted([
+        e for e in active_expert_df["expert_name"].dropna().unique()
+        if e.strip().lower() not in EXCLUDE_EXPERTS
+    ]) if "expert_name" in active_expert_df.columns else []
+
     if sched.empty:
         st.info("No interviews with valid time data on " + str(selected_date))
         # Still show count of interviews without time
