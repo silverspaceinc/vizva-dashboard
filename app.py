@@ -2090,6 +2090,545 @@ def render_availability_summary(sched, selected_date, all_expert_names=None):
     st.dataframe(avail_df, use_container_width=True, hide_index=True)
 
 # ═══════════════════════════════════════════════════════════════════
+#  ASSESSMENT CONVERSION ANALYTICS
+#  Tracks which assessments led to interviews within 60 days
+#  using fuzzy company name matching (cosine similarity on char n-grams)
+# ═══════════════════════════════════════════════════════════════════
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine
+
+@st.cache_data(ttl=600)
+def _build_company_similarity_cache(company_list_a, company_list_b, threshold=0.55):
+    """Build a mapping of company_a -> best matching company_b using TF-IDF cosine similarity."""
+    if not company_list_a or not company_list_b:
+        return {}
+
+    def _clean(name):
+        name = str(name).lower().strip()
+        name = re.sub(r'[^a-z0-9\s]', '', name)
+        name = re.sub(r'\b(inc|llc|ltd|corp|corporation|pvt|private|limited|the|group|services|technologies|technology|consulting|solutions)\b', '', name)
+        name = re.sub(r'\s+', ' ', name).strip()
+        return name
+
+    cleaned_a = [_clean(c) for c in company_list_a]
+    cleaned_b = [_clean(c) for c in company_list_b]
+
+    all_names = cleaned_a + cleaned_b
+    vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 4), min_df=1)
+    tfidf_matrix = vectorizer.fit_transform(all_names)
+
+    tfidf_a = tfidf_matrix[:len(cleaned_a)]
+    tfidf_b = tfidf_matrix[len(cleaned_a):]
+
+    sim_matrix = sklearn_cosine(tfidf_a, tfidf_b)
+
+    mapping = {}
+    for i, comp_a in enumerate(company_list_a):
+        best_idx = sim_matrix[i].argmax()
+        best_score = sim_matrix[i][best_idx]
+        if best_score >= threshold:
+            mapping[comp_a] = (company_list_b[best_idx], round(float(best_score), 3))
+        else:
+            mapping[comp_a] = (None, round(float(best_score), 3))
+
+    return mapping
+
+
+def compute_assessment_conversions(all_data, window_days=60, similarity_threshold=0.55):
+    """Compute assessment-to-interview conversions.
+
+    For each assessment record, check if there's an interview with the same
+    candidate + similar company within `window_days` of the assessment date.
+
+    Returns a DataFrame with one row per assessment, columns:
+      All original assessment columns plus:
+      converted (0/1), matched_interview_date, matched_company,
+      match_score, days_to_interview, interview_round, interview_expert,
+      interview_status, assessment_month
+    """
+    if all_data.empty or "support_name" not in all_data.columns:
+        return pd.DataFrame()
+
+    assessments = all_data[all_data["support_name"].str.lower() == "assessment support"].copy()
+    interviews = all_data[all_data["support_name"].str.lower() == "interview support"].copy()
+
+    if assessments.empty:
+        return pd.DataFrame()
+
+    if "date" not in assessments.columns or "candidate_name" not in assessments.columns:
+        return pd.DataFrame()
+
+    assessments = assessments.dropna(subset=["date", "candidate_name"]).copy()
+    interviews = interviews.dropna(subset=["date", "candidate_name"]).copy() if not interviews.empty else pd.DataFrame()
+
+    assessments["assessment_month"] = assessments["date"].dt.to_period("M").astype(str)
+
+    # Get unique company names from both sides
+    assess_companies = assessments["company_name"].dropna().unique().tolist() if "company_name" in assessments.columns else []
+    interview_companies = interviews["company_name"].dropna().unique().tolist() if not interviews.empty and "company_name" in interviews.columns else []
+
+    # Build company similarity mapping
+    company_map = _build_company_similarity_cache(
+        tuple(assess_companies), tuple(interview_companies), similarity_threshold
+    ) if assess_companies and interview_companies else {}
+
+    # Process each assessment
+    result_rows = []
+    for _, assess_row in assessments.iterrows():
+        candidate = assess_row.get("candidate_name", "")
+        company = assess_row.get("company_name", "")
+        assess_date = assess_row["date"]
+        expert = assess_row.get("expert_name", "")
+
+        converted = 0
+        matched_interview_date = None
+        matched_company = None
+        match_score = None
+        days_to_interview = None
+        interview_round = None
+        interview_expert = None
+        interview_status = None
+
+        if not interviews.empty and candidate:
+            # Filter interviews for same candidate
+            cand_interviews = interviews[
+                interviews["candidate_name"].str.lower().str.strip() == str(candidate).lower().strip()
+            ]
+
+            if not cand_interviews.empty and company:
+                # Get matching company names
+                mapped = company_map.get(company, (None, 0))
+                matched_comp_name = mapped[0]
+                comp_score = mapped[1]
+
+                if matched_comp_name:
+                    # Filter by matched company
+                    comp_interviews = cand_interviews[
+                        cand_interviews["company_name"].str.lower().str.strip() == matched_comp_name.lower().strip()
+                    ]
+                else:
+                    # Try exact match as fallback
+                    comp_interviews = cand_interviews[
+                        cand_interviews["company_name"].str.lower().str.strip() == str(company).lower().strip()
+                    ]
+                    comp_score = 1.0 if not comp_interviews.empty else comp_score
+
+                if not comp_interviews.empty:
+                    # Check within window
+                    window_end = assess_date + timedelta(days=window_days)
+                    within_window = comp_interviews[
+                        (comp_interviews["date"] >= assess_date) &
+                        (comp_interviews["date"] <= window_end)
+                    ]
+
+                    if not within_window.empty:
+                        converted = 1
+                        first_interview = within_window.sort_values("date").iloc[0]
+                        matched_interview_date = first_interview["date"]
+                        matched_company = first_interview.get("company_name", "")
+                        match_score = comp_score
+                        days_to_interview = (matched_interview_date - assess_date).days
+                        interview_round = first_interview.get("round_name", "")
+                        interview_expert = first_interview.get("expert_name", "")
+                        interview_status = first_interview.get("task_status", "")
+
+        row = assess_row.to_dict()
+        row.update({
+            "converted": converted,
+            "matched_interview_date": matched_interview_date,
+            "matched_company": matched_company,
+            "match_score": match_score,
+            "days_to_interview": days_to_interview,
+            "interview_round": interview_round,
+            "interview_expert": interview_expert,
+            "interview_status": interview_status,
+            "assessment_month": assess_row["date"].to_period("M"),
+        })
+        result_rows.append(row)
+
+    result = pd.DataFrame(result_rows)
+    result["assessment_month"] = result["date"].dt.to_period("M").astype(str)
+    return result
+
+
+def render_assessment_conversion_kpi(conv_df, title_suffix=""):
+    """Render the main conversion KPI row."""
+    if conv_df.empty:
+        st.info("No assessment data available for conversion analysis" + title_suffix + ".")
+        return
+
+    total = len(conv_df)
+    converted = int(conv_df["converted"].sum())
+    not_converted = total - converted
+    pct = round(converted / total * 100, 1) if total > 0 else 0
+    avg_days = conv_df.loc[conv_df["converted"] == 1, "days_to_interview"].mean()
+    avg_days_str = f"{avg_days:.1f} days" if pd.notna(avg_days) else "N/A"
+    unique_candidates = conv_df["candidate_name"].nunique() if "candidate_name" in conv_df.columns else 0
+    unique_companies = conv_df["company_name"].nunique() if "company_name" in conv_df.columns else 0
+    unique_experts = conv_df["expert_name"].nunique() if "expert_name" in conv_df.columns else 0
+
+    k = st.columns(7)
+    k[0].metric("Total Assessments", total)
+    k[1].metric("Converted to Interview", converted)
+    k[2].metric("Not Converted", not_converted)
+    k[3].metric("Conversion Rate", f"{pct}%",
+                delta="Higher is better", delta_color="normal")
+    k[4].metric("Avg Days to Interview", avg_days_str)
+    k[5].metric("Candidates", unique_candidates)
+    k[6].metric("Companies", unique_companies)
+
+
+def render_assessment_conversion_charts(conv_df, title_suffix=""):
+    """Render the full set of assessment conversion charts."""
+    if conv_df.empty:
+        return
+
+    total = len(conv_df)
+    converted = int(conv_df["converted"].sum())
+    not_converted = total - converted
+    pct = round(converted / total * 100, 1) if total > 0 else 0
+
+    # ── Conversion Donut ─────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Assessment Conversion Overview" + title_suffix)
+
+    ov_c1, ov_c2 = st.columns(2)
+    with ov_c1:
+        fig_donut = go.Figure(go.Pie(
+            labels=["Converted", "Not Converted"],
+            values=[converted, not_converted],
+            hole=0.5,
+            marker=dict(colors=["#2ecc71", "#e74c3c"]),
+            textinfo="label+value+percent",
+        ))
+        fig_donut.update_layout(title="Conversion Split" + title_suffix, height=400, showlegend=False)
+        st.plotly_chart(fig_donut, use_container_width=True)
+
+    with ov_c2:
+        # Days to interview distribution
+        converted_df = conv_df[conv_df["converted"] == 1]
+        if not converted_df.empty and "days_to_interview" in converted_df.columns:
+            valid_days = converted_df["days_to_interview"].dropna()
+            if not valid_days.empty:
+                fig_hist = go.Figure(go.Histogram(
+                    x=valid_days, nbinsx=15,
+                    marker_color="#3498db",
+                    marker_line=dict(color="white", width=1),
+                ))
+                avg_d = valid_days.mean()
+                fig_hist.add_vline(x=avg_d, line_dash="dash", line_color="#e74c3c",
+                                   annotation_text=f"Avg: {avg_d:.1f} days")
+                fig_hist.update_layout(title="Days to Interview Distribution" + title_suffix,
+                                       height=400, xaxis_title="Days", yaxis_title="Count")
+                st.plotly_chart(fig_hist, use_container_width=True)
+            else:
+                st.info("No days-to-interview data available.")
+        else:
+            st.info("No converted assessments to show distribution.")
+
+    # ── Monthly Conversion Trend ─────────────────────────────────
+    st.markdown("---")
+    st.subheader("Monthly Assessment Conversion Trend" + title_suffix)
+
+    monthly_conv = conv_df.groupby("assessment_month").agg(
+        total=("converted", "size"),
+        converted=("converted", "sum"),
+    ).reset_index()
+    monthly_conv["pct"] = (monthly_conv["converted"] / monthly_conv["total"] * 100).round(1)
+    monthly_conv["not_converted"] = monthly_conv["total"] - monthly_conv["converted"]
+
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        fig_mc = go.Figure()
+        fig_mc.add_trace(go.Bar(x=monthly_conv["assessment_month"], y=monthly_conv["converted"],
+                                name="Converted", marker_color="#2ecc71",
+                                text=monthly_conv["converted"], textposition="inside"))
+        fig_mc.add_trace(go.Bar(x=monthly_conv["assessment_month"], y=monthly_conv["not_converted"],
+                                name="Not Converted", marker_color="#e74c3c",
+                                text=monthly_conv["not_converted"], textposition="inside"))
+        fig_mc.update_layout(barmode="stack", title="Monthly Assessments: Converted vs Not",
+                             height=420, yaxis_title="Assessments",
+                             legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
+        st.plotly_chart(fig_mc, use_container_width=True)
+
+    with mc2:
+        fig_pct = go.Figure()
+        colors = ["#2ecc71" if p >= 50 else "#f39c12" if p >= 25 else "#e74c3c"
+                  for p in monthly_conv["pct"]]
+        fig_pct.add_trace(go.Scatter(
+            x=monthly_conv["assessment_month"], y=monthly_conv["pct"],
+            mode="lines+markers+text",
+            text=monthly_conv["pct"].apply(lambda v: f"{v:.1f}%"),
+            textposition="top center",
+            line=dict(color="#8e44ad", width=3),
+            marker=dict(size=10, color=colors),
+        ))
+        fig_pct.update_layout(title="Monthly Conversion Rate %",
+                              height=420, yaxis_title="Conversion %",
+                              yaxis=dict(range=[0, max(100, monthly_conv["pct"].max() + 10)]))
+        st.plotly_chart(fig_pct, use_container_width=True)
+
+    # ── Expert-wise Conversion ───────────────────────────────────
+    if "expert_name" in conv_df.columns:
+        st.markdown("---")
+        st.subheader("Expert-wise Assessment Conversion" + title_suffix)
+
+        expert_conv = conv_df.groupby("expert_name").agg(
+            total=("converted", "size"),
+            converted=("converted", "sum"),
+            avg_days=("days_to_interview", lambda x: round(x.dropna().mean(), 1) if x.dropna().any() else None),
+            candidates=("candidate_name", "nunique"),
+            companies=("company_name", "nunique"),
+        ).reset_index()
+        expert_conv["pct"] = (expert_conv["converted"] / expert_conv["total"] * 100).round(1)
+        expert_conv["not_converted"] = expert_conv["total"] - expert_conv["converted"]
+        expert_conv = expert_conv.sort_values("pct", ascending=False)
+
+        # Top/Bottom performers
+        if len(expert_conv) >= 2:
+            top_performer = expert_conv.iloc[0]
+            low_performer = expert_conv.iloc[-1]
+            avg_pct = round(expert_conv["pct"].mean(), 1)
+
+            perf_cols = st.columns(3)
+            perf_cols[0].metric("Top Converter",
+                                str(top_performer["expert_name"]),
+                                delta=f"{top_performer['pct']:.1f}%", delta_color="normal")
+            perf_cols[1].metric("Needs Improvement",
+                                str(low_performer["expert_name"]),
+                                delta=f"{low_performer['pct']:.1f}%", delta_color="inverse")
+            perf_cols[2].metric("Team Average", f"{avg_pct:.1f}%")
+
+        ec1, ec2 = st.columns(2)
+        with ec1:
+            expert_sorted = expert_conv.sort_values("pct", ascending=True)
+            avg_pct_val = expert_conv["pct"].mean()
+            bar_colors = ["#2ecc71" if p >= avg_pct_val else "#e74c3c" for p in expert_sorted["pct"]]
+            fig_ec = go.Figure(go.Bar(
+                y=expert_sorted["expert_name"], x=expert_sorted["pct"],
+                orientation="h", marker_color=bar_colors,
+                text=expert_sorted["pct"].apply(lambda v: f"{v:.1f}%"),
+                textposition="outside",
+            ))
+            fig_ec.add_vline(x=avg_pct_val, line_dash="dash", line_color="#f39c12",
+                             annotation_text=f"Avg: {avg_pct_val:.1f}%")
+            fig_ec.update_layout(title="Expert Conversion Rate %",
+                                 height=max(420, len(expert_sorted) * 35),
+                                 xaxis_title="Conversion %",
+                                 xaxis=dict(range=[0, 100]))
+            st.plotly_chart(fig_ec, use_container_width=True)
+
+        with ec2:
+            fig_ev = go.Figure()
+            expert_by_vol = expert_conv.sort_values("total", ascending=True)
+            fig_ev.add_trace(go.Bar(y=expert_by_vol["expert_name"], x=expert_by_vol["converted"],
+                                    name="Converted", orientation="h", marker_color="#2ecc71",
+                                    text=expert_by_vol["converted"], textposition="inside"))
+            fig_ev.add_trace(go.Bar(y=expert_by_vol["expert_name"], x=expert_by_vol["not_converted"],
+                                    name="Not Converted", orientation="h", marker_color="#e74c3c",
+                                    text=expert_by_vol["not_converted"], textposition="inside"))
+            fig_ev.update_layout(barmode="stack", title="Expert Assessment Volume",
+                                 height=max(420, len(expert_by_vol) * 35),
+                                 xaxis_title="Assessments",
+                                 legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
+            st.plotly_chart(fig_ev, use_container_width=True)
+
+        with st.expander("Expert Conversion Data" + title_suffix):
+            display_ec = expert_conv[["expert_name", "total", "converted", "not_converted",
+                                      "pct", "avg_days", "candidates", "companies"]].copy()
+            display_ec.columns = ["Expert", "Total Assessments", "Converted", "Not Converted",
+                                  "Conversion %", "Avg Days to Interview", "Candidates", "Companies"]
+            st.dataframe(display_ec, use_container_width=True, hide_index=True)
+
+    # ── Candidate-wise Conversion ────────────────────────────────
+    if "candidate_name" in conv_df.columns:
+        st.markdown("---")
+        st.subheader("Candidate-wise Assessment Conversion" + title_suffix)
+
+        cand_conv = conv_df.groupby("candidate_name").agg(
+            total=("converted", "size"),
+            converted=("converted", "sum"),
+            avg_days=("days_to_interview", lambda x: round(x.dropna().mean(), 1) if x.dropna().any() else None),
+            experts=("expert_name", "nunique"),
+            companies=("company_name", "nunique"),
+        ).reset_index()
+        cand_conv["pct"] = (cand_conv["converted"] / cand_conv["total"] * 100).round(1)
+        cand_conv = cand_conv.sort_values("total", ascending=False)
+
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            top_cands = cand_conv.head(20).sort_values("pct", ascending=True)
+            avg_cand_pct = cand_conv["pct"].mean()
+            cand_colors = ["#2ecc71" if p >= avg_cand_pct else "#e74c3c" for p in top_cands["pct"]]
+            fig_cc = go.Figure(go.Bar(
+                y=top_cands["candidate_name"], x=top_cands["pct"],
+                orientation="h", marker_color=cand_colors,
+                text=top_cands["pct"].apply(lambda v: f"{v:.1f}%"),
+                textposition="outside",
+            ))
+            fig_cc.update_layout(title="Top 20 Candidates: Conversion Rate",
+                                 height=max(420, len(top_cands) * 35),
+                                 xaxis_title="Conversion %",
+                                 xaxis=dict(range=[0, 110]))
+            st.plotly_chart(fig_cc, use_container_width=True)
+
+        with cc2:
+            top_cands_vol = cand_conv.head(20).sort_values("total", ascending=True)
+            fig_cv = go.Figure()
+            fig_cv.add_trace(go.Bar(y=top_cands_vol["candidate_name"], x=top_cands_vol["converted"],
+                                    name="Converted", orientation="h", marker_color="#2ecc71",
+                                    text=top_cands_vol["converted"], textposition="inside"))
+            not_conv = top_cands_vol["total"] - top_cands_vol["converted"]
+            fig_cv.add_trace(go.Bar(y=top_cands_vol["candidate_name"], x=not_conv,
+                                    name="Not Converted", orientation="h", marker_color="#e74c3c",
+                                    text=not_conv, textposition="inside"))
+            fig_cv.update_layout(barmode="stack", title="Top 20 Candidates: Assessment Volume",
+                                 height=max(420, len(top_cands_vol) * 35),
+                                 xaxis_title="Assessments",
+                                 legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
+            st.plotly_chart(fig_cv, use_container_width=True)
+
+        with st.expander("Candidate Conversion Data" + title_suffix):
+            display_cc = cand_conv[["candidate_name", "total", "converted", "pct",
+                                    "avg_days", "experts", "companies"]].copy()
+            display_cc.columns = ["Candidate", "Total Assessments", "Converted", "Conversion %",
+                                  "Avg Days to Interview", "Experts", "Companies"]
+            st.dataframe(display_cc, use_container_width=True, hide_index=True)
+
+    # ── Company-wise Conversion ──────────────────────────────────
+    if "company_name" in conv_df.columns:
+        st.markdown("---")
+        st.subheader("Company-wise Assessment Conversion" + title_suffix)
+
+        comp_conv = conv_df.groupby("company_name").agg(
+            total=("converted", "size"),
+            converted=("converted", "sum"),
+            avg_days=("days_to_interview", lambda x: round(x.dropna().mean(), 1) if x.dropna().any() else None),
+            candidates=("candidate_name", "nunique"),
+            experts=("expert_name", "nunique"),
+        ).reset_index()
+        comp_conv["pct"] = (comp_conv["converted"] / comp_conv["total"] * 100).round(1)
+        comp_conv = comp_conv.sort_values("total", ascending=False)
+
+        co1, co2 = st.columns(2)
+        with co1:
+            top_comps = comp_conv.head(20).sort_values("pct", ascending=True)
+            avg_comp_pct = comp_conv["pct"].mean()
+            comp_colors = ["#2ecc71" if p >= avg_comp_pct else "#e74c3c" for p in top_comps["pct"]]
+            fig_co = go.Figure(go.Bar(
+                y=top_comps["company_name"], x=top_comps["pct"],
+                orientation="h", marker_color=comp_colors,
+                text=top_comps["pct"].apply(lambda v: f"{v:.1f}%"),
+                textposition="outside",
+            ))
+            fig_co.add_vline(x=avg_comp_pct, line_dash="dash", line_color="#f39c12",
+                             annotation_text=f"Avg: {avg_comp_pct:.1f}%")
+            fig_co.update_layout(title="Top 20 Companies: Conversion Rate",
+                                 height=max(420, len(top_comps) * 35),
+                                 xaxis_title="Conversion %",
+                                 xaxis=dict(range=[0, 110]))
+            st.plotly_chart(fig_co, use_container_width=True)
+
+        with co2:
+            top_comps_vol = comp_conv.head(20).sort_values("total", ascending=True)
+            fig_cov = go.Figure()
+            fig_cov.add_trace(go.Bar(y=top_comps_vol["company_name"], x=top_comps_vol["converted"],
+                                     name="Converted", orientation="h", marker_color="#2ecc71",
+                                     text=top_comps_vol["converted"], textposition="inside"))
+            not_conv_c = top_comps_vol["total"] - top_comps_vol["converted"]
+            fig_cov.add_trace(go.Bar(y=top_comps_vol["company_name"], x=not_conv_c,
+                                     name="Not Converted", orientation="h", marker_color="#e74c3c",
+                                     text=not_conv_c, textposition="inside"))
+            fig_cov.update_layout(barmode="stack", title="Top 20 Companies: Assessment Volume",
+                                  height=max(420, len(top_comps_vol) * 35),
+                                  xaxis_title="Assessments",
+                                  legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
+            st.plotly_chart(fig_cov, use_container_width=True)
+
+        with st.expander("Company Conversion Data" + title_suffix):
+            display_co = comp_conv[["company_name", "total", "converted", "pct",
+                                    "avg_days", "candidates", "experts"]].copy()
+            display_co.columns = ["Company", "Total Assessments", "Converted", "Conversion %",
+                                  "Avg Days to Interview", "Candidates", "Experts"]
+            st.dataframe(display_co, use_container_width=True, hide_index=True)
+
+    # ── Interview Round Distribution for Converted ───────────────
+    converted_only = conv_df[conv_df["converted"] == 1]
+    if not converted_only.empty and "interview_round" in converted_only.columns:
+        st.markdown("---")
+        st.subheader("Which Rounds Did Converted Assessments Reach?" + title_suffix)
+
+        round_dist = converted_only["interview_round"].value_counts()
+        if not round_dist.empty:
+            rd1, rd2 = st.columns(2)
+            with rd1:
+                fig_rd = go.Figure(go.Pie(
+                    labels=round_dist.index, values=round_dist.values,
+                    hole=0.4, textinfo="label+value+percent",
+                ))
+                fig_rd.update_layout(title="Interview Round Distribution (Converted)", height=420)
+                st.plotly_chart(fig_rd, use_container_width=True)
+            with rd2:
+                fig_rb = go.Figure(go.Bar(
+                    y=round_dist.index, x=round_dist.values,
+                    orientation="h", marker_color="#1abc9c",
+                    text=round_dist.values, textposition="outside",
+                ))
+                fig_rb.update_layout(title="Converted Assessments by Interview Round",
+                                     height=max(400, len(round_dist) * 35),
+                                     yaxis=dict(autorange="reversed"),
+                                     xaxis_title="Count")
+                st.plotly_chart(fig_rb, use_container_width=True)
+
+    # ── Speed Heatmap: Expert x Month (Avg Days to Interview) ────
+    if "expert_name" in conv_df.columns:
+        converted_with_days = conv_df[(conv_df["converted"] == 1) & (conv_df["days_to_interview"].notna())]
+        if not converted_with_days.empty:
+            st.markdown("---")
+            st.subheader("Expert x Month: Avg Days to Interview" + title_suffix)
+            st.caption("Lower values (lighter colors) indicate faster conversion")
+
+            speed_pivot = converted_with_days.groupby(["expert_name", "assessment_month"])["days_to_interview"].mean().round(1)
+            speed_wide = speed_pivot.unstack(fill_value=None)
+
+            if not speed_wide.empty and speed_wide.shape[0] > 0:
+                fig_speed = px.imshow(
+                    speed_wide, text_auto=True, aspect="auto",
+                    color_continuous_scale="RdYlGn_r",
+                    title="Expert x Month: Avg Days to Interview (Lower = Faster)" + title_suffix,
+                    labels=dict(x="Month", y="Expert", color="Avg Days"),
+                )
+                fig_speed.update_layout(height=max(450, len(speed_wide) * 30))
+                st.plotly_chart(fig_speed, use_container_width=True)
+
+    # ── Fuzzy Match Quality Report ───────────────────────────────
+    matched = conv_df[conv_df["converted"] == 1].copy()
+    if not matched.empty and "match_score" in matched.columns and "company_name" in matched.columns:
+        fuzzy_matches = matched[matched["match_score"].notna() & (matched["match_score"] < 1.0)]
+        if not fuzzy_matches.empty:
+            with st.expander("Fuzzy Company Match Report" + title_suffix):
+                st.caption("These conversions were matched using fuzzy company name matching. Review for accuracy.")
+                display_fm = fuzzy_matches[["candidate_name", "company_name", "matched_company",
+                                            "match_score", "days_to_interview"]].drop_duplicates()
+                display_fm.columns = ["Candidate", "Assessment Company", "Matched Interview Company",
+                                      "Match Score", "Days to Interview"]
+                st.dataframe(display_fm.sort_values("Match Score"),
+                             use_container_width=True, hide_index=True)
+
+    # ── Full Conversion Data ─────────────────────────────────────
+    with st.expander("Full Assessment Conversion Data" + title_suffix):
+        display_cols = [c for c in ["date", "candidate_name", "expert_name", "company_name",
+                                    "task_status", "converted", "matched_interview_date",
+                                    "matched_company", "match_score", "days_to_interview",
+                                    "interview_round", "interview_expert", "interview_status",
+                                    "assessment_month"]
+                        if c in conv_df.columns]
+        st.dataframe(conv_df[display_cols].sort_values("date", ascending=False),
+                     use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════
 
@@ -2788,6 +3327,28 @@ def main():
                         st.subheader("Sentiment — All Completed Interviews (" + sel_cr_month + ")")
                         render_sentiment_section(cr_month_data,
                                                  section_title="Completed Interview Sentiment - " + sel_cr_month)
+        # ── ASSESSMENT CONVERSION ANALYTICS ──────────────────────
+        if selected_support == "Assessment Support":
+            st.markdown("---")
+            st.subheader("Assessment to Interview Conversion Analytics")
+            st.caption("Tracks which assessments led to interviews within 60 days using fuzzy company name matching")
+
+            conv_df = compute_assessment_conversions(all_case_df)
+            if not conv_df.empty:
+                current_m = date.today().strftime("%Y-%m")
+                conv_months = sorted(conv_df["assessment_month"].unique(), reverse=True)
+                default_conv_idx = conv_months.index(current_m) if current_m in conv_months else 0
+                sel_conv_month = st.selectbox("Select Month", conv_months, index=default_conv_idx,
+                                              key="conv_month")
+                conv_month_data = conv_df[conv_df["assessment_month"] == sel_conv_month]
+
+                if conv_month_data.empty:
+                    st.info("No assessments in " + sel_conv_month)
+                else:
+                    render_assessment_conversion_kpi(conv_month_data, " - " + sel_conv_month)
+                    render_assessment_conversion_charts(conv_month_data, " - " + sel_conv_month)
+            else:
+                st.info("No assessment data available for conversion analysis.")
 
         # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────
         st.markdown("---")
@@ -3005,6 +3566,25 @@ def main():
                 st.markdown("---")
                 st.subheader("Scheduling Clashes (" + str(start) + " to " + str(end) + ")")
                 render_today_clash_summary(period)
+            # ── ASSESSMENT CONVERSION (period) ───────────────────
+            if selected_support == "Assessment Support":
+                st.markdown("---")
+                st.subheader("Assessment Conversion (" + str(start) + " to " + str(end) + ")")
+                conv_df_all = compute_assessment_conversions(all_case_df)
+                if not conv_df_all.empty:
+                    conv_period = conv_df_all[
+                        (conv_df_all["date"].dt.date >= start) &
+                        (conv_df_all["date"].dt.date <= end)
+                    ]
+                    if not conv_period.empty:
+                        render_assessment_conversion_kpi(conv_period,
+                                                         " - " + str(start) + " to " + str(end))
+                        render_assessment_conversion_charts(conv_period,
+                                                            " - " + str(start) + " to " + str(end))
+                    else:
+                        st.info("No assessments in this period.")
+
+        
 
             # ── TECHNOLOGY BREAKDOWN (period) ────────────────────
             if "candidate_technology" in period.columns:
@@ -3084,6 +3664,9 @@ def main():
         st.header("Deep-Dive Analytics - " + support_label)
 
         tab_names = ["Experts", "Companies", "Rounds", "Day of Week", "Cross-Support", "Candidates", "Technology"]
+        if selected_support == "Assessment Support":
+            tab_names.append("Conversion Analytics")
+
         if selected_support == "Interview Support" and "start_hour" in support_df.columns:
             tab_names.append("Start Time")
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
@@ -3214,6 +3797,7 @@ def main():
                 st.plotly_chart(fig2, use_container_width=True)
             else:
                 st.info("No technology column found.")
+        
 
         if selected_support == "Interview Support" and "start_hour" in support_df.columns and "Start Time" in tab_names:
             with tabs[tab_names.index("Start Time")]:
@@ -3228,7 +3812,17 @@ def main():
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns and "Blockage" in tab_names:
             with tabs[tab_names.index("Blockage")]:
                 render_blockage_summary(support_df, title_suffix=" - All Data")
-
+                
+        if selected_support == "Assessment Support" and "Conversion Analytics" in tab_names:
+            with tabs[tab_names.index("Conversion Analytics")]:
+                st.subheader("Assessment to Interview Conversion (All Data)")
+                st.caption("Full-year conversion analysis with fuzzy company matching")
+                conv_df_deep = compute_assessment_conversions(all_case_df)
+                if not conv_df_deep.empty:
+                    render_assessment_conversion_kpi(conv_df_deep, " - All Data")
+                    render_assessment_conversion_charts(conv_df_deep, " - All Data")
+                else:
+                    st.info("No assessment data available for conversion analysis.")
     # ====== SCHEDULE VIEW ======
     elif view == "Schedule View":
         render_schedule_view(all_case_df, active_expert_df)
