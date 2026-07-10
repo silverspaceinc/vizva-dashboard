@@ -938,7 +938,7 @@ def _get_active_experts_for_day(df, target_day, lookback_working_days=7):
     return recent_experts | target_experts
 
 
-def detect_blockages(df, active_expert_count=None):
+def detect_blockages(df, active_expert_count=None, all_experts_df=None):
     """Detect blockage events across all days in df.
 
     New logic: A blockage occurs in a 1-hour window on a given day when
@@ -971,7 +971,8 @@ def detect_blockages(df, active_expert_count=None):
         if active_expert_count is not None:
             day_active_count = active_expert_count
         else:
-            day_active_experts = _get_active_experts_for_day(valid, day_val, lookback_working_days=7)
+            lookback_data = all_experts_df if all_experts_df is not None else valid
+            day_active_experts = _get_active_experts_for_day(lookback_data, day_val, lookback_working_days=7)
             day_active_count = len(day_active_experts)
 
         if day_active_count == 0:
@@ -1047,9 +1048,9 @@ def detect_blockages(df, active_expert_count=None):
 #  TODAY'S BLOCKAGE INDICATOR
 # ═══════════════════════════════════════════════════════════════════
 
-def render_today_blockage(df):
+def render_today_blockage(df, all_experts_df=None):
     """Compact blockage indicator for Today's Snapshot."""
-    blockages = detect_blockages(df)
+    blockages = detect_blockages(df, all_experts_df=all_experts_df)
 
     if blockages.empty:
         st.success("No blockage detected today. Interview load is within expert capacity in every hour.")
@@ -1090,15 +1091,15 @@ def render_today_blockage(df):
 #  BLOCKAGE ANALYTICS (full view for Monthly / Deep-Dive)
 # ═══════════════════════════════════════════════════════════════════
 
-def render_blockage_summary(df, title_suffix=""):
+def render_blockage_summary(df, title_suffix="", all_experts_df=None):
     """Full blockage analytics section."""
-    blockages = detect_blockages(df)
+    blockages = detect_blockages(df, all_experts_df=all_experts_df)
 
     st.subheader("Blockage Analysis" + title_suffix)
     st.caption(
         "A blockage occurs in any 1-hour window when the number of interviews "
         "exceeds the number of active experts for that day. "
-        "Active experts = unique experts from the past 7 working days + any new expert on that day. "
+        "Active experts = unique experts (including now-inactive) from the past 7 working days + any new expert on that day. "
         "This means all experts are occupied and no capacity remains."
     )
 
@@ -2696,6 +2697,11 @@ def main():
 
     all_case_df = raw.copy()
     active_expert_df = filter_active_experts(raw)
+    # All Interview Support data (no active expert filter) for blockage lookback
+    all_interview_support_df = all_case_df[all_case_df["support_name"].str.lower() == "interview support"].copy()
+    if "start_time" in all_interview_support_df.columns:
+        all_interview_support_df = add_start_time_columns(all_interview_support_df)
+
 
     # ── Add sentiment scores to the active expert data ONCE ──────
     active_expert_df, _fb_col = add_sentiment_column(active_expert_df)
@@ -2768,7 +2774,8 @@ def main():
             st.sidebar.metric("Experts with Clashes", clash_groups_check["expert_name"].nunique())
 
         # Blockage sidebar indicator
-        blockage_check = detect_blockages(support_df)
+        blockage_check = detect_blockages(support_df, all_experts_df=all_interview_support_df)
+
         if not blockage_check.empty:
             st.sidebar.metric("🚨 Total Blockages", len(blockage_check))
             st.sidebar.metric("Days with Blockage", blockage_check["date"].dt.date.nunique())
@@ -2830,7 +2837,7 @@ def main():
         if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
             st.markdown("---")
             st.subheader("Blockage Indicator - " + str(today))
-            render_today_blockage(today_df)
+            render_today_blockage(today_df, all_experts_df=all_interview_support_df)
 
         if not today_df.empty:
             c1, c2 = st.columns(2)
@@ -2993,7 +3000,7 @@ def main():
         # ── BLOCKAGE ANALYSIS — OVERALL ──────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
             st.markdown("---")
-            render_blockage_summary(support_df, title_suffix=" - All Months")
+            render_blockage_summary(support_df, title_suffix=" - All Months", all_experts_df=all_interview_support_df)
 
         # ── MONTHLY SENTIMENT TRENDS ─────────────────────────────
         st.markdown("---")
@@ -3857,8 +3864,8 @@ def main():
 
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns and "Blockage" in tab_names:
             with tabs[tab_names.index("Blockage")]:
-                render_blockage_summary(support_df, title_suffix=" - All Data")
-                
+                render_blockage_summary(support_df, title_suffix=" - All Data", all_experts_df=all_interview_support_df)
+ 
         if selected_support == "Assessment Support" and "Conversion Analytics" in tab_names:
             with tabs[tab_names.index("Conversion Analytics")]:
                 st.subheader("Assessment to Interview Conversion (All Data)")
