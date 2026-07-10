@@ -907,27 +907,51 @@ def render_today_clash_summary(df):
 #  days of data PLUS any new experts appearing on the target day.
 # ═══════════════════════════════════════════════════════════════════
 
-def _get_active_experts(df):
-    """Return the set of active expert names from the last 5 calendar days of data."""
+def _get_active_experts_for_day(df, target_day, lookback_working_days=7):
+    """Return the set of active expert names based on the past N working days
+    of data relative to target_day, plus any new experts on target_day itself.
+    
+    Working days = days that actually have interview data (not calendar days).
+    """
     if df.empty or "expert_name" not in df.columns or "date" not in df.columns:
         return set()
-    all_dates = df["date"].dt.date.unique()
-    if len(all_dates) == 0:
-        return set()
-    sorted_dates = sorted(all_dates, reverse=True)
-    last_5_dates = set(sorted_dates[:5])
-    mask_last5 = df["date"].dt.date.isin(last_5_dates)
-    return set(df.loc[mask_last5, "expert_name"].dropna().unique())
+    
+    # Get all unique dates with data, before the target day
+    all_dates = sorted(df["date"].dt.date.unique())
+    past_dates = [d for d in all_dates if d < target_day]
+    
+    # Take the last N working days (days with actual data)
+    recent_dates = set(past_dates[-lookback_working_days:]) if past_dates else set()
+    
+    # Experts from recent working days
+    if recent_dates:
+        mask = df["date"].dt.date.isin(recent_dates)
+        recent_experts = set(df.loc[mask, "expert_name"].dropna().unique())
+    else:
+        recent_experts = set()
+    
+    # Experts appearing on the target day itself
+    target_mask = df["date"].dt.date == target_day
+    target_experts = set(df.loc[target_mask, "expert_name"].dropna().unique())
+    
+    # Combine both
+    return recent_experts | target_experts
 
 
-def detect_blockages(df):
+def detect_blockages(df, active_expert_count=None):
     """Detect blockage events across all days in df.
 
+    New logic: A blockage occurs in a 1-hour window on a given day when
+    the number of interviews in that window >= number of active experts
+    for that specific day.
+    
+    Active experts per day = unique experts from past 7 working days + 
+    any new expert on that day.
+
     Returns a DataFrame with one row per blockage bracket, columns:
-      date, day_name, bracket_start_min, bracket_label,
-      total_experts_active, experts_in_bracket, experts_with_clash,
-      involved_experts, clash_experts, mean_start_minutes,
-      mean_start_label, month
+      date, day_name, bracket_start_min, bracket_end_min, bracket_label,
+      active_experts, interviews_in_bracket, overflow,
+      involved_experts, mean_start_minutes, mean_start_label, month
     """
     empty = pd.DataFrame()
     if "_parsed_start" not in df.columns or "expert_name" not in df.columns or "date" not in df.columns:
@@ -940,25 +964,26 @@ def detect_blockages(df):
     valid["_day"] = valid["date"].dt.date
     valid["_start_minutes"] = valid["_parsed_start"].dt.hour * 60 + valid["_parsed_start"].dt.minute
 
-    global_active = _get_active_experts(valid)
-    if not global_active:
-        return empty
-
     blockage_rows = []
 
     for day_val, day_grp in valid.groupby("_day"):
-        day_experts = set(day_grp["expert_name"].unique())
-        day_active = global_active | day_experts
-        total_active = len(day_active)
+        # Calculate active experts specifically for this day
+        if active_expert_count is not None:
+            day_active_count = active_expert_count
+        else:
+            day_active_experts = _get_active_experts_for_day(valid, day_val, lookback_working_days=7)
+            day_active_count = len(day_active_experts)
 
-        if total_active == 0:
+        if day_active_count == 0:
             continue
 
         min_start = int(day_grp["_start_minutes"].min())
         max_start = int(day_grp["_start_minutes"].max())
 
-        for bracket_start in range(max(0, min_start - 30), min(max_start + 30, 24 * 60), 15):
-            bracket_end = bracket_start + 30
+        # Slide a 1-hour (60 min) window in 15-min steps
+        for bracket_start in range(max(0, min_start - 60), min(max_start + 15, 24 * 60), 15):
+            bracket_end = bracket_start + 60
+
             in_bracket = day_grp[
                 (day_grp["_start_minutes"] >= bracket_start) &
                 (day_grp["_start_minutes"] < bracket_end)
@@ -967,45 +992,51 @@ def detect_blockages(df):
             if in_bracket.empty:
                 continue
 
-            experts_in_bracket = set(in_bracket["expert_name"].unique())
+            interview_count = len(in_bracket)
 
-            # Condition 1: ALL active experts must be in this bracket
-            if experts_in_bracket != day_active:
-                continue
+            # BLOCKAGE: interviews in this hour >= active experts for this day
+            if interview_count >= day_active_count:
+                experts_in_bracket = sorted(in_bracket["expert_name"].unique())
+                mean_min = in_bracket["_start_minutes"].mean()
+                mean_h = int(mean_min // 60) % 24
+                mean_m = int(mean_min % 60)
+                mean_label = datetime(2000, 1, 1, mean_h, mean_m).strftime("%I:%M %p")
 
-            # Condition 2: at least one expert has 2+ interviews in this bracket
-            expert_counts = in_bracket.groupby("expert_name").size()
-            clash_expert_names = set(expert_counts[expert_counts >= 2].index)
+                bracket_h = int(bracket_start // 60) % 24
+                bracket_m = int(bracket_start % 60)
+                bracket_label = datetime(2000, 1, 1, bracket_h, bracket_m).strftime("%I:%M %p")
 
-            if not clash_expert_names:
-                continue
+                bracket_end_h = int(bracket_end // 60) % 24
+                bracket_end_m = int(bracket_end % 60)
+                bracket_end_label = datetime(2000, 1, 1, bracket_end_h, bracket_end_m).strftime("%I:%M %p")
 
-            # BLOCKAGE detected
-            mean_min = in_bracket["_start_minutes"].mean()
-            mean_h = int(mean_min // 60) % 24
-            mean_m = int(mean_min % 60)
-            mean_label = datetime(2000, 1, 1, mean_h, mean_m).strftime("%I:%M %p")
+                overflow = interview_count - day_active_count
 
-            bracket_h = int(bracket_start // 60) % 24
-            bracket_m = int(bracket_start % 60)
-            bracket_label = datetime(2000, 1, 1, bracket_h, bracket_m).strftime("%I:%M %p")
-
-            blockage_rows.append({
-                "date": pd.Timestamp(day_val),
-                "day_name": pd.Timestamp(day_val).day_name(),
-                "bracket_start_min": bracket_start,
-                "bracket_label": bracket_label,
-                "total_experts_active": total_active,
-                "experts_in_bracket": len(experts_in_bracket),
-                "experts_with_clash": len(clash_expert_names),
-                "involved_experts": ", ".join(sorted(experts_in_bracket)),
-                "clash_experts": ", ".join(sorted(clash_expert_names)),
-                "mean_start_minutes": round(mean_min, 1),
-                "mean_start_label": mean_label,
-            })
+                blockage_rows.append({
+                    "date": pd.Timestamp(day_val),
+                    "day_name": pd.Timestamp(day_val).day_name(),
+                    "bracket_start_min": bracket_start,
+                    "bracket_end_min": bracket_end,
+                    "bracket_label": bracket_label + " - " + bracket_end_label,
+                    "active_experts": day_active_count,
+                    "interviews_in_bracket": interview_count,
+                    "overflow": overflow,
+                    "involved_experts": ", ".join(experts_in_bracket),
+                    "mean_start_minutes": round(mean_min, 1),
+                    "mean_start_label": mean_label,
+                })
 
     if not blockage_rows:
         return empty
+
+    result = pd.DataFrame(blockage_rows)
+    result["month"] = result["date"].dt.to_period("M").astype(str)
+
+    # Deduplicate overlapping windows per day
+    result = result.sort_values(["date", "interviews_in_bracket"], ascending=[True, False])
+    result = result.drop_duplicates(subset=["date", "bracket_start_min"], keep="first")
+
+    return result
 
     result = pd.DataFrame(blockage_rows)
     result["month"] = result["date"].dt.to_period("M").astype(str)
@@ -1021,7 +1052,7 @@ def render_today_blockage(df):
     blockages = detect_blockages(df)
 
     if blockages.empty:
-        st.success("No blockage detected today. At least one expert is available in every bracket.")
+        st.success("No blockage detected today. Interview load is within expert capacity in every hour.")
         return
 
     today_val = date.today()
@@ -1032,27 +1063,28 @@ def render_today_blockage(df):
         return
 
     total_brackets = len(today_blockages)
-    all_experts_count = today_blockages["total_experts_active"].iloc[0]
-    total_clash_experts = today_blockages["clash_experts"].str.split(", ").explode().nunique()
+    active_count = int(today_blockages["active_experts"].iloc[0])
+    max_overflow = int(today_blockages["overflow"].max())
+    total_interviews_blocked = int(today_blockages["interviews_in_bracket"].sum())
     mean_min = today_blockages["mean_start_minutes"].mean()
     mean_label = _mean_start_label_from_minutes(mean_min)
 
-    st.warning(f"🚨 **{total_brackets} Blockage Bracket(s) Detected Today!**")
+    st.warning(f"🚨 **{total_brackets} Blockage Hour(s) Detected Today!** (Interviews >= {active_count} active experts)")
 
-    k = st.columns(4)
-    k[0].metric("Blockage Brackets", total_brackets)
-    k[1].metric("Experts (All Busy)", all_experts_count)
-    k[2].metric("Total Clash Experts", total_clash_experts)
-    k[3].metric("Mean Blockage Time", mean_label)
+    k = st.columns(5)
+    k[0].metric("Blockage Hours", total_brackets)
+    k[1].metric("Active Experts (7-day)", active_count)
+    k[2].metric("Max Overflow", f"+{max_overflow}")
+    k[3].metric("Peak Blockage Time", mean_label)
+    k[4].metric("Total Blocked Interviews", total_interviews_blocked)
 
     with st.expander("Blockage Details"):
-        display = today_blockages[["bracket_label", "total_experts_active",
-                                    "experts_with_clash", "involved_experts",
-                                    "clash_experts", "mean_start_label"]].copy()
-        display.columns = ["Bracket", "Active Experts", "Experts w/ Clash",
-                           "All Experts", "Clash Experts", "Mean Start"]
+        display = today_blockages[["bracket_label", "active_experts",
+                                    "interviews_in_bracket", "overflow",
+                                    "involved_experts", "mean_start_label"]].copy()
+        display.columns = ["Hour Window", "Active Experts", "Interviews",
+                           "Overflow", "Experts Involved", "Mean Start"]
         st.dataframe(display, use_container_width=True, hide_index=True)
-
 
 # ═══════════════════════════════════════════════════════════════════
 #  BLOCKAGE ANALYTICS (full view for Monthly / Deep-Dive)
@@ -1064,11 +1096,10 @@ def render_blockage_summary(df, title_suffix=""):
 
     st.subheader("Blockage Analysis" + title_suffix)
     st.caption(
-        "A blockage occurs in a 30-min bracket when ALL active experts "
-        "(from the last 5 days + any new experts that day) have at least one "
-        "interview AND at least one expert has a scheduling clash (2+ interviews) "
-        "in that bracket. If any active expert has zero interviews that day, "
-        "blockage is impossible."
+        "A blockage occurs in any 1-hour window when the number of interviews "
+        "is equal to or greater than the number of active experts for that day. "
+        "Active experts = unique experts from the past 7 working days + any new expert on that day. "
+        "This means all experts are occupied and no capacity remains."
     )
 
     if blockages.empty:
@@ -1079,31 +1110,46 @@ def render_blockage_summary(df, title_suffix=""):
     total_events = len(blockages)
     days_with = blockages["date"].dt.date.nunique()
     months_with = blockages["month"].nunique()
-    total_clash_experts = blockages["clash_experts"].str.split(", ").explode().nunique()
+    max_overflow = int(blockages["overflow"].max())
+    avg_overflow = round(blockages["overflow"].mean(), 1)
     mean_min = blockages["mean_start_minutes"].mean()
     mean_label = _mean_start_label_from_minutes(mean_min)
+    avg_active = round(blockages["active_experts"].mean(), 1)
 
-    k = st.columns(5)
+    k = st.columns(7)
     k[0].metric("Total Blockage Events", total_events)
     k[1].metric("Days with Blockage", days_with)
     k[2].metric("Months with Blockage", months_with)
-    k[3].metric("Total Clash Experts", total_clash_experts)
-    k[4].metric("Mean Blockage Time", mean_label)
+    k[3].metric("Max Overflow", f"+{max_overflow}")
+    k[4].metric("Avg Overflow", f"+{avg_overflow}")
+    k[5].metric("Avg Active Experts", f"{avg_active:.1f}")
+    k[6].metric("Mean Blockage Time", mean_label)
 
     # ── Monthly Blockage Trend ───────────────────────────────────
     st.markdown("---")
     st.subheader("Monthly Blockage Trends" + title_suffix)
 
-    monthly_counts = blockages.groupby("month").size().reset_index(name="blockage_events")
+    monthly_counts = blockages.groupby("month").agg(
+        blockage_events=("overflow", "size"),
+        avg_overflow=("overflow", "mean"),
+        max_overflow=("overflow", "max"),
+        avg_interviews=("interviews_in_bracket", "mean"),
+        avg_active=("active_experts", "mean"),
+    ).reset_index()
+    monthly_counts["avg_overflow"] = monthly_counts["avg_overflow"].round(1)
+    monthly_counts["avg_interviews"] = monthly_counts["avg_interviews"].round(1)
+    monthly_counts["avg_active"] = monthly_counts["avg_active"].round(1)
 
     col_m1, col_m2 = st.columns(2)
     with col_m1:
-        fig_monthly = go.Figure(go.Bar(
+        fig_monthly = go.Figure()
+        fig_monthly.add_trace(go.Bar(
             x=monthly_counts["month"],
             y=monthly_counts["blockage_events"],
             marker_color="#e74c3c",
             text=monthly_counts["blockage_events"],
             textposition="outside",
+            name="Blockage Events",
         ))
         fig_monthly.update_layout(
             title="Blockage Events by Month",
@@ -1114,35 +1160,33 @@ def render_blockage_summary(df, title_suffix=""):
         st.plotly_chart(fig_monthly, use_container_width=True)
 
     with col_m2:
-        monthly_mean = blockages.groupby("month").agg(
-            mean_start=("mean_start_minutes", "mean"),
-        ).reset_index()
-        monthly_mean["mean_start_label"] = monthly_mean["mean_start"].apply(
-            _mean_start_label_from_minutes
-        )
-        monthly_mean["mean_start_hour"] = (monthly_mean["mean_start"] / 60).round(2)
-
-        fig_mm = go.Figure()
-        fig_mm.add_trace(go.Scatter(
-            x=monthly_mean["month"],
-            y=monthly_mean["mean_start_hour"],
+        fig_ov = go.Figure()
+        fig_ov.add_trace(go.Scatter(
+            x=monthly_counts["month"],
+            y=monthly_counts["avg_overflow"],
             mode="lines+markers+text",
-            text=monthly_mean["mean_start_label"],
+            text=monthly_counts["avg_overflow"].apply(lambda v: f"+{v:.1f}"),
             textposition="top center",
             line=dict(color="#e74c3c", width=3),
             marker=dict(size=10),
+            name="Avg Overflow",
         ))
-        fig_mm.update_layout(
-            title="Mean Blockage Time by Month",
+        fig_ov.add_trace(go.Scatter(
+            x=monthly_counts["month"],
+            y=monthly_counts["avg_active"],
+            mode="lines+markers",
+            line=dict(color="#3498db", width=2, dash="dot"),
+            marker=dict(size=8),
+            name="Avg Active Experts",
+        ))
+        fig_ov.update_layout(
+            title="Monthly Overflow vs Active Experts",
             height=420,
             xaxis_title="Month",
-            yaxis_title="Hour of Day (24h)",
-            yaxis=dict(range=[
-                max(0, monthly_mean["mean_start_hour"].min() - 2),
-                min(24, monthly_mean["mean_start_hour"].max() + 2),
-            ]),
+            yaxis_title="Count",
+            legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
         )
-        st.plotly_chart(fig_mm, use_container_width=True)
+        st.plotly_chart(fig_ov, use_container_width=True)
 
     # ── Expert-wise Blockage Involvement ─────────────────────────
     st.markdown("---")
@@ -1161,10 +1205,10 @@ def render_blockage_summary(df, title_suffix=""):
             textposition="outside",
         ))
         fig_exp.update_layout(
-            title="Top 20 Experts in Blockage Events",
+            title="Top 20 Experts in Blockage Hours",
             height=max(420, len(expert_involvement) * 35),
             yaxis=dict(autorange="reversed"),
-            xaxis_title="Blockage Events Involved",
+            xaxis_title="Blockage Hours Involved",
         )
         st.plotly_chart(fig_exp, use_container_width=True)
 
@@ -1186,46 +1230,48 @@ def render_blockage_summary(df, title_suffix=""):
         text=counts, textposition="outside",
     ))
     fig_tod.update_layout(
-        title="Blockage Brackets by Hour of Day" + title_suffix,
+        title="Blockage by Hour of Day" + title_suffix,
         height=420,
         xaxis_title="Hour of Day",
-        yaxis_title="Blockage Brackets",
+        yaxis_title="Blockage Events",
         xaxis=dict(tickangle=-45),
     )
     st.plotly_chart(fig_tod, use_container_width=True)
 
-    # ── Expert × Month Heatmap ───────────────────────────────────
+    # ── Overflow Heatmap: Day x Hour ─────────────────────────────
     st.markdown("---")
-    st.subheader("Expert × Month Blockage Heatmap" + title_suffix)
+    st.subheader("Blockage Intensity Heatmap" + title_suffix)
+    st.caption("Overflow count (interviews above expert capacity) by date and hour")
 
-    exploded = blockages.copy()
-    exploded["expert_list"] = exploded["involved_experts"].str.split(", ")
-    exploded = exploded.explode("expert_list")
+    blockages_hm = blockages.copy()
+    blockages_hm["hour"] = (blockages_hm["bracket_start_min"] // 60).astype(int)
+    blockages_hm["date_str"] = blockages_hm["date"].dt.strftime("%Y-%m-%d")
 
-    pivot_hm = exploded.groupby(["expert_list", "month"]).size().reset_index(name="count")
-    pivot_wide = pivot_hm.pivot(index="expert_list", columns="month", values="count").fillna(0).astype(int)
+    pivot_hm = blockages_hm.groupby(["date_str", "hour"])["overflow"].max().reset_index()
+    pivot_wide = pivot_hm.pivot(index="hour", columns="date_str", values="overflow").fillna(0).astype(int)
+    pivot_wide = pivot_wide.reindex(range(24), fill_value=0)
+    pivot_wide.index = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0") for h in range(24)]
+
+    pivot_wide = pivot_wide.loc[(pivot_wide != 0).any(axis=1)]
 
     if not pivot_wide.empty:
-        pivot_wide["_total"] = pivot_wide.sum(axis=1)
-        pivot_wide = pivot_wide.sort_values("_total", ascending=False).head(20).drop(columns="_total")
-
         fig_hm = px.imshow(
             pivot_wide, text_auto=True, aspect="auto",
             color_continuous_scale="Reds",
-            title="Expert × Month Blockage Heatmap (Top 20)" + title_suffix,
-            labels=dict(x="Month", y="Expert", color="Events"),
+            title="Blockage Overflow: Date x Hour" + title_suffix,
+            labels=dict(x="Date", y="Hour", color="Overflow"),
         )
-        fig_hm.update_layout(height=max(450, len(pivot_wide) * 30))
+        fig_hm.update_layout(height=max(400, len(pivot_wide) * 35))
         st.plotly_chart(fig_hm, use_container_width=True)
 
     # ── Detailed Blockage Table ──────────────────────────────────
     with st.expander("Detailed Blockage Events" + title_suffix):
         display = blockages[["date", "day_name", "bracket_label",
-                              "total_experts_active", "experts_with_clash",
-                              "involved_experts", "clash_experts",
+                              "active_experts", "interviews_in_bracket",
+                              "overflow", "involved_experts",
                               "mean_start_label", "month"]].copy()
-        display.columns = ["Date", "Day", "Bracket", "Active Experts",
-                           "Experts w/ Clash", "All Involved", "Clash Experts",
+        display.columns = ["Date", "Day", "Hour Window", "Active Experts (7-day)",
+                           "Interviews", "Overflow", "Experts Involved",
                            "Mean Start", "Month"]
         display["Date"] = display["Date"].dt.strftime("%Y-%m-%d")
         st.dataframe(display, use_container_width=True, hide_index=True)
@@ -3869,4 +3915,3 @@ if st.session_state["authenticated"]:
     main()
 else:
     login()
-
