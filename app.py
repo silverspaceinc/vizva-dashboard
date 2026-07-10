@@ -995,7 +995,7 @@ def detect_blockages(df, active_expert_count=None):
             interview_count = len(in_bracket)
 
             # BLOCKAGE: interviews in this hour >= active experts for this day
-            if interview_count >= day_active_count:
+            if interview_count > day_active_count:
                 experts_in_bracket = sorted(in_bracket["expert_name"].unique())
                 mean_min = in_bracket["_start_minutes"].mean()
                 mean_h = int(mean_min // 60) % 24
@@ -1065,18 +1065,18 @@ def render_today_blockage(df):
     total_brackets = len(today_blockages)
     active_count = int(today_blockages["active_experts"].iloc[0])
     max_overflow = int(today_blockages["overflow"].max())
-    total_interviews_blocked = int(today_blockages["interviews_in_bracket"].sum())
+    max_interviews = int(today_blockages["interviews_in_bracket"].max())
     mean_min = today_blockages["mean_start_minutes"].mean()
     mean_label = _mean_start_label_from_minutes(mean_min)
 
-    st.warning(f"🚨 **{total_brackets} Blockage Hour(s) Detected Today!** (Interviews >= {active_count} active experts)")
+    st.warning(f"🚨 **{total_brackets} Blockage Hour(s) Detected Today!** (Interviews > {active_count} active experts)")
 
     k = st.columns(5)
     k[0].metric("Blockage Hours", total_brackets)
     k[1].metric("Active Experts (7-day)", active_count)
     k[2].metric("Max Overflow", f"+{max_overflow}")
     k[3].metric("Peak Blockage Time", mean_label)
-    k[4].metric("Total Blocked Interviews", total_interviews_blocked)
+    k[4].metric("Peak Interviews in 1 Hour", max_interviews)
 
     with st.expander("Blockage Details"):
         display = today_blockages[["bracket_label", "active_experts",
@@ -1097,7 +1097,7 @@ def render_blockage_summary(df, title_suffix=""):
     st.subheader("Blockage Analysis" + title_suffix)
     st.caption(
         "A blockage occurs in any 1-hour window when the number of interviews "
-        "is equal to or greater than the number of active experts for that day. "
+        "exceeds the number of active experts for that day. "
         "Active experts = unique experts from the past 7 working days + any new expert on that day. "
         "This means all experts are occupied and no capacity remains."
     )
