@@ -2304,7 +2304,7 @@ def render_top_candidates_analysis(df, title_suffix="", min_interviews=5):
 
     # ── Candidate Landscape Scatter — ALL candidates with 1+ interview ──
     st.markdown("---")
-    st.subheader("Candidate Landscape: Volume vs Sentiment" + title_suffix)
+    st.subheader("Candidate Performance Matrix" + title_suffix)
     st.caption(
         "All candidates with at least 1 completed interview (excluding Self-expert). "
         "Color-coded by quadrant: 🟢 High Volume + High Sentiment, 🔵 Low Volume + High Sentiment, "
@@ -2426,7 +2426,7 @@ def render_top_candidates_analysis(df, title_suffix="", min_interviews=5):
                       int(q_counts.get("Low Volume + Low Sentiment", 0)))
 
         fig_landscape.update_layout(
-            title="Candidate Landscape — All Candidates (1+ Completed Interview)" + title_suffix,
+            title="Candidate Performance Matrix — All Candidates (1+ Completed Interview)" + title_suffix,
             height=650,
             xaxis_title="Completed Interviews",
             yaxis_title="Avg Sentiment Score (%)",
