@@ -117,6 +117,12 @@ def compute_sentiment_score(text):
 
 
 def add_sentiment_column(df, feedback_col="feedback"):
+    """Add sentiment_score and sentiment_label columns.
+    Sentiment is computed ONLY for rows where:
+      - task_status == 'completed'
+      - expert_name is NOT 'Self' (case-insensitive)
+    All other rows get None for sentiment columns.
+    """
     candidates = [feedback_col, "feedback", "Feedback", "feedback_text",
                   "case_feedback", "expert_feedback", "comments", "remark", "remarks"]
     found_col = None
@@ -129,11 +135,28 @@ def add_sentiment_column(df, feedback_col="feedback"):
         df["sentiment_label"] = None
         return df, None
 
-    df["sentiment_score"] = df[found_col].apply(compute_sentiment_score)
-    df["sentiment_label"] = df["sentiment_score"].apply(
-        lambda x: sentiment_label(x) if pd.notna(x) else None
-    )
+    # Default all rows to None
+    df["sentiment_score"] = None
+    df["sentiment_label"] = None
+
+    # Build mask: completed AND expert is not Self
+    mask = pd.Series(True, index=df.index)
+
+    if "task_status" in df.columns:
+        mask = mask & (df["task_status"].astype(str).str.strip().str.lower() == "completed")
+
+    if "expert_name" in df.columns:
+        mask = mask & (df["expert_name"].astype(str).str.strip().str.lower() != "self")
+
+    # Compute sentiment only for qualifying rows
+    if mask.any():
+        df.loc[mask, "sentiment_score"] = df.loc[mask, found_col].apply(compute_sentiment_score)
+        df.loc[mask, "sentiment_label"] = df.loc[mask, "sentiment_score"].apply(
+            lambda x: sentiment_label(x) if pd.notna(x) else None
+        )
+
     return df, found_col
+
 
 
 def get_sentiment_stats(df):
@@ -1357,17 +1380,38 @@ def render_wordcloud_section(texts, section_title="Word Cloud"):
 
 
 def extract_feedback_texts(df, col="feedback"):
+    """Extract feedback texts for word cloud / NLP analysis.
+    Only includes rows where:
+      - task_status == 'completed'
+      - expert_name is NOT 'Self' (case-insensitive)
+    """
     candidates = [col, "feedback", "Feedback", "feedback_text",
                   "case_feedback", "expert_feedback", "comments", "remark", "remarks"]
+    found_col = None
     for c in candidates:
         if c in df.columns:
-            series = df[c].dropna().astype(str).str.strip()
-            series = series[series != ""]
-            series = series[series.str.lower() != "nan"]
-            series = series[series.str.lower() != "none"]
-            return series.tolist()
-    return []
+            found_col = c
+            break
+    if found_col is None:
+        return []
 
+    # Apply the same filter: completed + not Self
+    filtered = df.copy()
+
+    if "task_status" in filtered.columns:
+        filtered = filtered[filtered["task_status"].astype(str).str.strip().str.lower() == "completed"]
+
+    if "expert_name" in filtered.columns:
+        filtered = filtered[filtered["expert_name"].astype(str).str.strip().str.lower() != "self"]
+
+    if filtered.empty:
+        return []
+
+    series = filtered[found_col].dropna().astype(str).str.strip()
+    series = series[series != ""]
+    series = series[series.str.lower() != "nan"]
+    series = series[series.str.lower() != "none"]
+    return series.tolist()
 
 # ═══════════════════════════════════════════════════════════════════
 #  ORIGINAL HELPERS (unchanged)
