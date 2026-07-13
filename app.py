@@ -2694,6 +2694,16 @@ def main():
     if raw.empty:
         st.error("No data found for current year.")
         st.stop()
+    # ── AUTO-UPDATE: Self-expert rows ─────────────────────────────
+    if "expert_name" in raw.columns:
+        self_mask = raw["expert_name"].str.strip().str.lower() == "self"
+        if "task_status" in raw.columns:
+            raw.loc[self_mask, "task_status"] = "completed"
+        # Update whichever feedback column(s) exist
+        feedback_text = "This Interview is given by Candidate himself and so no support was required."
+        for col in ["feedback", "expert_feedback", "client_feedback"]:
+            if col in raw.columns:
+                raw.loc[self_mask, col] = feedback_text
 
     all_case_df = raw.copy()
     active_expert_df = filter_active_experts(raw)
