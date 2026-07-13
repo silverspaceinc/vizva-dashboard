@@ -2113,6 +2113,292 @@ def render_schedule_view(all_data, active_expert_df):
         display.columns = [c.replace("_", " ").title() for c in table_cols]
         st.dataframe(display.sort_values(["Expert Name", "Start Label"]),
                      use_container_width=True, hide_index=True)
+def render_top_candidates_analysis(df, title_suffix="", min_interviews=5):
+    """Render Top 10 Strong and Top 10 Weak candidates based on avg sentiment.
+    
+    Only considers rows where:
+      - task_status == 'completed'
+      - expert_name is NOT 'Self' (case-insensitive)
+      - candidate has at least `min_interviews` completed interviews
+    """
+    if df.empty or "candidate_name" not in df.columns or "sentiment_score" not in df.columns:
+        st.info("No data available for candidate strength analysis" + title_suffix + ".")
+        return
+
+    # Filter: completed only, expert != Self
+    filtered = df.copy()
+    if "task_status" in filtered.columns:
+        filtered = filtered[filtered["task_status"].astype(str).str.strip().str.lower() == "completed"]
+    if "expert_name" in filtered.columns:
+        filtered = filtered[filtered["expert_name"].astype(str).str.strip().str.lower() != "self"]
+
+    # Drop rows without sentiment
+    filtered = filtered.dropna(subset=["sentiment_score"])
+
+    if filtered.empty:
+        st.info("No completed interviews with sentiment data available" + title_suffix + ".")
+        return
+
+    # Aggregate per candidate
+    cand_agg = filtered.groupby("candidate_name").agg(
+        completed_interviews=("sentiment_score", "size"),
+        avg_sentiment=("sentiment_score", "mean"),
+        min_sentiment=("sentiment_score", "min"),
+        max_sentiment=("sentiment_score", "max"),
+        positive_count=("sentiment_score", lambda x: int((x >= 20).sum())),
+        neutral_count=("sentiment_score", lambda x: int(((x > -20) & (x < 20)).sum())),
+        negative_count=("sentiment_score", lambda x: int((x <= -20).sum())),
+        companies=("company_name", "nunique") if "company_name" in filtered.columns else ("sentiment_score", "size"),
+        experts=("expert_name", "nunique") if "expert_name" in filtered.columns else ("sentiment_score", "size"),
+    ).reset_index()
+
+    cand_agg["avg_sentiment"] = cand_agg["avg_sentiment"].round(1)
+    cand_agg["min_sentiment"] = cand_agg["min_sentiment"].round(1)
+    cand_agg["max_sentiment"] = cand_agg["max_sentiment"].round(1)
+
+    # Filter: at least min_interviews completed
+    qualified = cand_agg[cand_agg["completed_interviews"] >= min_interviews].copy()
+
+    if qualified.empty:
+        st.info(
+            "No candidates with at least " + str(min_interviews) +
+            " completed interviews found" + title_suffix + "."
+        )
+        return
+
+    # Sort for strong (descending) and weak (ascending)
+    strong = qualified.sort_values("avg_sentiment", ascending=False).head(10).reset_index(drop=True)
+    weak = qualified.sort_values("avg_sentiment", ascending=True).head(10).reset_index(drop=True)
+
+    # ── Section Header ───────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Candidate Strength Analysis" + title_suffix)
+    st.caption(
+        "Based on average feedback sentiment score. Only candidates with "
+        + str(min_interviews) + "+ completed interviews (excluding Self-expert) are considered."
+    )
+
+    # ── KPI Row ──────────────────────────────────────────────────
+    k = st.columns(5)
+    k[0].metric("Qualified Candidates", len(qualified))
+    k[1].metric("Min Interviews Required", min_interviews)
+    k[2].metric("Team Avg Sentiment", f"{qualified['avg_sentiment'].mean():+.1f}%")
+    if not strong.empty:
+        k[3].metric("Strongest Candidate", str(strong.iloc[0]["candidate_name"]),
+                     delta=f"{strong.iloc[0]['avg_sentiment']:+.1f}%", delta_color="normal")
+    if not weak.empty:
+        k[4].metric("Weakest Candidate", str(weak.iloc[0]["candidate_name"]),
+                     delta=f"{weak.iloc[0]['avg_sentiment']:+.1f}%", delta_color="inverse")
+
+    # ── Strong and Weak Side by Side ─────────────────────────────
+    col_strong, col_weak = st.columns(2)
+
+    with col_strong:
+        st.markdown("### ✅ Top 10 Strong Candidates")
+        if not strong.empty:
+            # Bar chart
+            strong_sorted = strong.sort_values("avg_sentiment", ascending=True)
+            fig_strong = go.Figure(go.Bar(
+                y=strong_sorted["candidate_name"],
+                x=strong_sorted["avg_sentiment"],
+                orientation="h",
+                marker_color=["#27ae60" if v >= 40 else "#2ecc71" if v >= 20 else "#f39c12"
+                              for v in strong_sorted["avg_sentiment"]],
+                text=strong_sorted["avg_sentiment"].apply(lambda v: f"{v:+.1f}%"),
+                textposition="outside",
+            ))
+            fig_strong.update_layout(
+                title="Top 10 Strong Candidates (Avg Sentiment)",
+                height=max(400, len(strong_sorted) * 40),
+                xaxis_title="Avg Sentiment Score (%)",
+                xaxis=dict(range=[
+                    min(0, strong_sorted["avg_sentiment"].min() - 10),
+                    strong_sorted["avg_sentiment"].max() + 15
+                ]),
+            )
+            st.plotly_chart(fig_strong, use_container_width=True)
+
+    with col_weak:
+        st.markdown("### ⚠️ Top 10 Weak Candidates")
+        if not weak.empty:
+            weak_sorted = weak.sort_values("avg_sentiment", ascending=True)
+            fig_weak = go.Figure(go.Bar(
+                y=weak_sorted["candidate_name"],
+                x=weak_sorted["avg_sentiment"],
+                orientation="h",
+                marker_color=["#c0392b" if v <= -40 else "#e74c3c" if v <= -20 else "#f39c12"
+                              for v in weak_sorted["avg_sentiment"]],
+                text=weak_sorted["avg_sentiment"].apply(lambda v: f"{v:+.1f}%"),
+                textposition="outside",
+            ))
+            fig_weak.update_layout(
+                title="Top 10 Weak Candidates (Avg Sentiment)",
+                height=max(400, len(weak_sorted) * 40),
+                xaxis_title="Avg Sentiment Score (%)",
+                xaxis=dict(range=[
+                    weak_sorted["avg_sentiment"].min() - 15,
+                    max(0, weak_sorted["avg_sentiment"].max() + 10)
+                ]),
+            )
+            st.plotly_chart(fig_weak, use_container_width=True)
+
+    # ── Sentiment Breakdown Comparison ───────────────────────────
+    st.markdown("---")
+    st.subheader("Sentiment Breakdown Comparison" + title_suffix)
+
+    comp_c1, comp_c2 = st.columns(2)
+    with comp_c1:
+        if not strong.empty:
+            fig_sb = go.Figure()
+            strong_display = strong.sort_values("avg_sentiment", ascending=False)
+            fig_sb.add_trace(go.Bar(
+                y=strong_display["candidate_name"], x=strong_display["positive_count"],
+                name="Positive", orientation="h", marker_color="#2ecc71",
+                text=strong_display["positive_count"], textposition="inside",
+            ))
+            fig_sb.add_trace(go.Bar(
+                y=strong_display["candidate_name"], x=strong_display["neutral_count"],
+                name="Neutral", orientation="h", marker_color="#f39c12",
+                text=strong_display["neutral_count"], textposition="inside",
+            ))
+            fig_sb.add_trace(go.Bar(
+                y=strong_display["candidate_name"], x=strong_display["negative_count"],
+                name="Negative", orientation="h", marker_color="#e74c3c",
+                text=strong_display["negative_count"], textposition="inside",
+            ))
+            fig_sb.update_layout(
+                barmode="stack", title="Strong Candidates — Sentiment Breakdown",
+                height=max(400, len(strong_display) * 40),
+                xaxis_title="Feedback Count",
+                yaxis=dict(autorange="reversed"),
+                legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
+            )
+            st.plotly_chart(fig_sb, use_container_width=True)
+
+    with comp_c2:
+        if not weak.empty:
+            fig_wb = go.Figure()
+            weak_display = weak.sort_values("avg_sentiment", ascending=True)
+            fig_wb.add_trace(go.Bar(
+                y=weak_display["candidate_name"], x=weak_display["positive_count"],
+                name="Positive", orientation="h", marker_color="#2ecc71",
+                text=weak_display["positive_count"], textposition="inside",
+            ))
+            fig_wb.add_trace(go.Bar(
+                y=weak_display["candidate_name"], x=weak_display["neutral_count"],
+                name="Neutral", orientation="h", marker_color="#f39c12",
+                text=weak_display["neutral_count"], textposition="inside",
+            ))
+            fig_wb.add_trace(go.Bar(
+                y=weak_display["candidate_name"], x=weak_display["negative_count"],
+                name="Negative", orientation="h", marker_color="#e74c3c",
+                text=weak_display["negative_count"], textposition="inside",
+            ))
+            fig_wb.update_layout(
+                barmode="stack", title="Weak Candidates — Sentiment Breakdown",
+                height=max(400, len(weak_display) * 40),
+                xaxis_title="Feedback Count",
+                yaxis=dict(autorange="reversed"),
+                legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
+            )
+            st.plotly_chart(fig_wb, use_container_width=True)
+
+    # ── Scatter Plot: Interviews vs Sentiment ────────────────────
+    st.markdown("---")
+    st.subheader("Candidate Landscape: Volume vs Sentiment" + title_suffix)
+
+    avg_sent_all = qualified["avg_sentiment"].mean()
+    avg_vol_all = qualified["completed_interviews"].mean()
+
+    fig_scatter = go.Figure()
+
+    # Plot strong in green
+    if not strong.empty:
+        fig_scatter.add_trace(go.Scatter(
+            x=strong["completed_interviews"], y=strong["avg_sentiment"],
+            mode="markers+text", text=strong["candidate_name"],
+            textposition="top center", textfont=dict(size=9),
+            marker=dict(size=12, color="#2ecc71", line=dict(width=1, color="white")),
+            name="Strong (Top 10)",
+        ))
+
+    # Plot weak in red
+    if not weak.empty:
+        fig_scatter.add_trace(go.Scatter(
+            x=weak["completed_interviews"], y=weak["avg_sentiment"],
+            mode="markers+text", text=weak["candidate_name"],
+            textposition="bottom center", textfont=dict(size=9),
+            marker=dict(size=12, color="#e74c3c", line=dict(width=1, color="white")),
+            name="Weak (Top 10)",
+        ))
+
+    # Plot remaining candidates in gray
+    strong_names = set(strong["candidate_name"]) if not strong.empty else set()
+    weak_names = set(weak["candidate_name"]) if not weak.empty else set()
+    others = qualified[~qualified["candidate_name"].isin(strong_names | weak_names)]
+    if not others.empty:
+        fig_scatter.add_trace(go.Scatter(
+            x=others["completed_interviews"], y=others["avg_sentiment"],
+            mode="markers", marker=dict(size=8, color="#95a5a6", opacity=0.5),
+            name="Other Candidates",
+        ))
+
+    fig_scatter.add_hline(y=avg_sent_all, line_dash="dash", line_color="#8e44ad", opacity=0.5,
+                          annotation_text=f"Avg Sentiment: {avg_sent_all:+.1f}%")
+    fig_scatter.add_vline(x=avg_vol_all, line_dash="dash", line_color="#8e44ad", opacity=0.5,
+                          annotation_text=f"Avg Interviews: {avg_vol_all:.0f}")
+
+    fig_scatter.update_layout(
+        title="Candidate Landscape" + title_suffix,
+        height=550,
+        xaxis_title="Completed Interviews",
+        yaxis_title="Avg Sentiment Score (%)",
+        legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
+    )
+    st.plotly_chart(fig_scatter, use_container_width=True)
+
+    # ── Detailed Tables ──────────────────────────────────────────
+    display_cols = ["candidate_name", "completed_interviews", "avg_sentiment",
+                    "min_sentiment", "max_sentiment", "positive_count",
+                    "neutral_count", "negative_count"]
+    display_headers = ["Candidate", "Completed Interviews", "Avg Sentiment",
+                       "Min Sentiment", "Max Sentiment", "Positive",
+                       "Neutral", "Negative"]
+
+    # Add companies and experts columns if they exist meaningfully
+    if "company_name" in filtered.columns:
+        display_cols.append("companies")
+        display_headers.append("Companies")
+    if "expert_name" in filtered.columns:
+        display_cols.append("experts")
+        display_headers.append("Experts")
+
+    with st.expander("✅ Strong Candidates — Full Data" + title_suffix):
+        if not strong.empty:
+            strong_disp = strong[display_cols].copy()
+            strong_disp.columns = display_headers
+            strong_disp.index = range(1, len(strong_disp) + 1)
+            strong_disp.index.name = "Rank"
+            st.dataframe(strong_disp, use_container_width=True)
+        else:
+            st.info("No strong candidates found.")
+
+    with st.expander("⚠️ Weak Candidates — Full Data" + title_suffix):
+        if not weak.empty:
+            weak_disp = weak[display_cols].copy()
+            weak_disp.columns = display_headers
+            weak_disp.index = range(1, len(weak_disp) + 1)
+            weak_disp.index.name = "Rank"
+            st.dataframe(weak_disp, use_container_width=True)
+        else:
+            st.info("No weak candidates found.")
+
+    with st.expander("All Qualified Candidates (" + str(min_interviews) + "+ interviews)" + title_suffix):
+        all_disp = qualified.sort_values("avg_sentiment", ascending=False)[display_cols].copy()
+        all_disp.columns = display_headers
+        all_disp.index = range(1, len(all_disp) + 1)
+        all_disp.index.name = "Rank"
+        st.dataframe(all_disp, use_container_width=True)
 
 # ── AVAILABILITY SUMMARY ─────────────────────────────────────
 def render_availability_summary(sched, selected_date, all_expert_names=None):
@@ -3457,6 +3743,28 @@ def main():
             else:
                 st.info("No assessment data available for conversion analysis.")
 
+        # ── CANDIDATE STRENGTH ANALYSIS (Monthly) ───────────────
+        if selected_support == "Interview Support":
+            st.markdown("---")
+            st.subheader("Candidate Strength Analysis — Monthly")
+
+            if "date" in support_df.columns:
+                strength_df = support_df.copy()
+                strength_df["month"] = strength_df["date"].dt.to_period("M").astype(str)
+                strength_months = sorted(strength_df["month"].unique(), reverse=True)
+                current_m_str = date.today().strftime("%Y-%m")
+                strength_def_idx = strength_months.index(current_m_str) if current_m_str in strength_months else 0
+                sel_strength_month = st.selectbox("Select Month", strength_months,
+                                                   index=strength_def_idx, key="strength_month")
+                strength_month_data = strength_df[strength_df["month"] == sel_strength_month]
+
+                if not strength_month_data.empty:
+                    render_top_candidates_analysis(strength_month_data,
+                                                    title_suffix=" — " + sel_strength_month,
+                                                    min_interviews=5)
+                else:
+                    st.info("No data for " + sel_strength_month)
+        
         # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────
         st.markdown("---")
         st.subheader("Candidate-wise Monthly Counts (All Support Types)")
@@ -3700,6 +4008,12 @@ def main():
                                     "Top Technologies (" + str(start) + " to " + str(end) + ")")
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
+# ── CANDIDATE STRENGTH ANALYSIS (period) ────────────
+            if selected_support == "Interview Support":
+                render_top_candidates_analysis(period,
+                                                title_suffix=" — " + str(start) + " to " + str(end),
+                                                min_interviews=5)
+
 
         # ── SINGLE DAY DRILL-DOWN ────────────────────────────────
         st.markdown("---")
@@ -3889,6 +4203,13 @@ def main():
                 fig.update_layout(barmode="stack", title="Top 20 Candidates", height=600,
                                   yaxis=dict(autorange="reversed"))
                 st.plotly_chart(fig, use_container_width=True)
+                
+    # ── CANDIDATE STRENGTH ANALYSIS (All Data) ──────────
+            if selected_support == "Interview Support":
+                render_top_candidates_analysis(support_df,
+                                                title_suffix=" — All Data",
+                                                min_interviews=5)
+    
 
         with tabs[6]:
             if "candidate_technology" in support_df.columns:
