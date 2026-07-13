@@ -3742,28 +3742,6 @@ def main():
                     render_assessment_conversion_charts(conv_month_data, " - " + sel_conv_month)
             else:
                 st.info("No assessment data available for conversion analysis.")
-
-        # ── CANDIDATE STRENGTH ANALYSIS (Monthly) ───────────────
-        if selected_support == "Interview Support":
-            st.markdown("---")
-            st.subheader("Candidate Strength Analysis — Monthly")
-
-            if "date" in support_df.columns:
-                strength_df = support_df.copy()
-                strength_df["month"] = strength_df["date"].dt.to_period("M").astype(str)
-                strength_months = sorted(strength_df["month"].unique(), reverse=True)
-                current_m_str = date.today().strftime("%Y-%m")
-                strength_def_idx = strength_months.index(current_m_str) if current_m_str in strength_months else 0
-                sel_strength_month = st.selectbox("Select Month", strength_months,
-                                                   index=strength_def_idx, key="strength_month")
-                strength_month_data = strength_df[strength_df["month"] == sel_strength_month]
-
-                if not strength_month_data.empty:
-                    render_top_candidates_analysis(strength_month_data,
-                                                    title_suffix=" — " + sel_strength_month,
-                                                    min_interviews=5)
-                else:
-                    st.info("No data for " + sel_strength_month)
         
         # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────
         st.markdown("---")
@@ -4008,12 +3986,6 @@ def main():
                                     "Top Technologies (" + str(start) + " to " + str(end) + ")")
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
-# ── CANDIDATE STRENGTH ANALYSIS (period) ────────────
-            if selected_support == "Interview Support":
-                render_top_candidates_analysis(period,
-                                                title_suffix=" — " + str(start) + " to " + str(end),
-                                                min_interviews=5)
-
 
         # ── SINGLE DAY DRILL-DOWN ────────────────────────────────
         st.markdown("---")
