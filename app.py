@@ -2196,7 +2196,6 @@ def render_top_candidates_analysis(df, title_suffix="", min_interviews=5):
     with col_strong:
         st.markdown("### ✅ Top 10 Strong Candidates")
         if not strong.empty:
-            # Bar chart
             strong_sorted = strong.sort_values("avg_sentiment", ascending=True)
             fig_strong = go.Figure(go.Bar(
                 y=strong_sorted["candidate_name"],
@@ -2303,59 +2302,193 @@ def render_top_candidates_analysis(df, title_suffix="", min_interviews=5):
             )
             st.plotly_chart(fig_wb, use_container_width=True)
 
-    # ── Scatter Plot: Interviews vs Sentiment ────────────────────
+    # ── Candidate Landscape Scatter — ALL candidates with 1+ interview ──
     st.markdown("---")
     st.subheader("Candidate Landscape: Volume vs Sentiment" + title_suffix)
-
-    avg_sent_all = qualified["avg_sentiment"].mean()
-    avg_vol_all = qualified["completed_interviews"].mean()
-
-    fig_scatter = go.Figure()
-
-    # Plot strong in green
-    if not strong.empty:
-        fig_scatter.add_trace(go.Scatter(
-            x=strong["completed_interviews"], y=strong["avg_sentiment"],
-            mode="markers+text", text=strong["candidate_name"],
-            textposition="top center", textfont=dict(size=9),
-            marker=dict(size=12, color="#2ecc71", line=dict(width=1, color="white")),
-            name="Strong (Top 10)",
-        ))
-
-    # Plot weak in red
-    if not weak.empty:
-        fig_scatter.add_trace(go.Scatter(
-            x=weak["completed_interviews"], y=weak["avg_sentiment"],
-            mode="markers+text", text=weak["candidate_name"],
-            textposition="bottom center", textfont=dict(size=9),
-            marker=dict(size=12, color="#e74c3c", line=dict(width=1, color="white")),
-            name="Weak (Top 10)",
-        ))
-
-    # Plot remaining candidates in gray
-    strong_names = set(strong["candidate_name"]) if not strong.empty else set()
-    weak_names = set(weak["candidate_name"]) if not weak.empty else set()
-    others = qualified[~qualified["candidate_name"].isin(strong_names | weak_names)]
-    if not others.empty:
-        fig_scatter.add_trace(go.Scatter(
-            x=others["completed_interviews"], y=others["avg_sentiment"],
-            mode="markers", marker=dict(size=8, color="#95a5a6", opacity=0.5),
-            name="Other Candidates",
-        ))
-
-    fig_scatter.add_hline(y=avg_sent_all, line_dash="dash", line_color="#8e44ad", opacity=0.5,
-                          annotation_text=f"Avg Sentiment: {avg_sent_all:+.1f}%")
-    fig_scatter.add_vline(x=avg_vol_all, line_dash="dash", line_color="#8e44ad", opacity=0.5,
-                          annotation_text=f"Avg Interviews: {avg_vol_all:.0f}")
-
-    fig_scatter.update_layout(
-        title="Candidate Landscape" + title_suffix,
-        height=550,
-        xaxis_title="Completed Interviews",
-        yaxis_title="Avg Sentiment Score (%)",
-        legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
+    st.caption(
+        "All candidates with at least 1 completed interview (excluding Self-expert). "
+        "Color-coded by quadrant: 🟢 High Volume + High Sentiment, 🔵 Low Volume + High Sentiment, "
+        "🟠 High Volume + Low Sentiment, 🔴 Low Volume + Low Sentiment"
     )
-    st.plotly_chart(fig_scatter, use_container_width=True)
+
+    # Build landscape data with min 1 interview
+    landscape = cand_agg[cand_agg["completed_interviews"] >= 1].copy()
+
+    if landscape.empty:
+        st.info("No candidates with completed interviews for landscape view.")
+    else:
+        avg_sent = landscape["avg_sentiment"].median()
+        avg_vol = landscape["completed_interviews"].median()
+
+        # Assign quadrant
+        def _assign_quadrant(row):
+            high_vol = row["completed_interviews"] >= avg_vol
+            high_sent = row["avg_sentiment"] >= avg_sent
+            if high_vol and high_sent:
+                return "High Volume + High Sentiment"
+            elif not high_vol and high_sent:
+                return "Low Volume + High Sentiment"
+            elif high_vol and not high_sent:
+                return "High Volume + Low Sentiment"
+            else:
+                return "Low Volume + Low Sentiment"
+
+        landscape["quadrant"] = landscape.apply(_assign_quadrant, axis=1)
+
+        quadrant_colors = {
+            "High Volume + High Sentiment": "#2ecc71",
+            "Low Volume + High Sentiment": "#3498db",
+            "High Volume + Low Sentiment": "#f39c12",
+            "Low Volume + Low Sentiment": "#e74c3c",
+        }
+
+        quadrant_symbols = {
+            "High Volume + High Sentiment": "star",
+            "Low Volume + High Sentiment": "diamond",
+            "High Volume + Low Sentiment": "triangle-up",
+            "Low Volume + Low Sentiment": "circle",
+        }
+
+        fig_landscape = go.Figure()
+
+        for quadrant in ["High Volume + High Sentiment", "Low Volume + High Sentiment",
+                         "High Volume + Low Sentiment", "Low Volume + Low Sentiment"]:
+            q_data = landscape[landscape["quadrant"] == quadrant]
+            if q_data.empty:
+                continue
+
+            hover_texts = []
+            for _, row in q_data.iterrows():
+                hover_texts.append(
+                    "<b>" + str(row["candidate_name"]) + "</b><br>"
+                    + "Completed Interviews: " + str(int(row["completed_interviews"])) + "<br>"
+                    + "Avg Sentiment: " + f"{row['avg_sentiment']:+.1f}%" + "<br>"
+                    + "Min: " + f"{row['min_sentiment']:+.1f}%" + " | Max: " + f"{row['max_sentiment']:+.1f}%" + "<br>"
+                    + "Positive: " + str(int(row["positive_count"]))
+                    + " | Neutral: " + str(int(row["neutral_count"]))
+                    + " | Negative: " + str(int(row["negative_count"])) + "<br>"
+                    + "Companies: " + str(int(row["companies"]))
+                    + " | Experts: " + str(int(row["experts"])) + "<br>"
+                    + "Quadrant: " + quadrant
+                )
+
+            fig_landscape.add_trace(go.Scatter(
+                x=q_data["completed_interviews"],
+                y=q_data["avg_sentiment"],
+                mode="markers+text",
+                text=q_data["candidate_name"],
+                textposition="top center",
+                textfont=dict(size=8),
+                marker=dict(
+                    size=10,
+                    color=quadrant_colors[quadrant],
+                    symbol=quadrant_symbols[quadrant],
+                    line=dict(width=1, color="white"),
+                ),
+                hovertext=hover_texts,
+                hoverinfo="text",
+                name=quadrant,
+            ))
+
+        # Quadrant divider lines
+        fig_landscape.add_hline(y=avg_sent, line_dash="dash", line_color="#8e44ad", opacity=0.5,
+                                annotation_text=f"Median Sentiment: {avg_sent:+.1f}%",
+                                annotation_position="top right")
+        fig_landscape.add_vline(x=avg_vol, line_dash="dash", line_color="#8e44ad", opacity=0.5,
+                                annotation_text=f"Median Interviews: {avg_vol:.0f}",
+                                annotation_position="top right")
+
+        # Quadrant background labels
+        x_min = max(0, landscape["completed_interviews"].min() - 1)
+        x_max = landscape["completed_interviews"].max() + 2
+        y_min = landscape["avg_sentiment"].min() - 10
+        y_max = landscape["avg_sentiment"].max() + 10
+
+        fig_landscape.add_annotation(x=x_max * 0.85, y=y_max * 0.9, text="⭐ Stars",
+                                     showarrow=False, font=dict(size=14, color="#2ecc71"), opacity=0.4)
+        fig_landscape.add_annotation(x=x_min + 1, y=y_max * 0.9, text="💎 Potential",
+                                     showarrow=False, font=dict(size=14, color="#3498db"), opacity=0.4)
+        fig_landscape.add_annotation(x=x_max * 0.85, y=y_min + 5, text="⚠️ At Risk",
+                                     showarrow=False, font=dict(size=14, color="#f39c12"), opacity=0.4)
+        fig_landscape.add_annotation(x=x_min + 1, y=y_min + 5, text="🔴 Concern",
+                                     showarrow=False, font=dict(size=14, color="#e74c3c"), opacity=0.4)
+
+        # Quadrant count KPIs
+        q_counts = landscape["quadrant"].value_counts()
+        qk = st.columns(4)
+        qk[0].metric("⭐ Stars (High Vol + High Sent)",
+                      int(q_counts.get("High Volume + High Sentiment", 0)))
+        qk[1].metric("💎 Potential (Low Vol + High Sent)",
+                      int(q_counts.get("Low Volume + High Sentiment", 0)))
+        qk[2].metric("⚠️ At Risk (High Vol + Low Sent)",
+                      int(q_counts.get("High Volume + Low Sentiment", 0)))
+        qk[3].metric("🔴 Concern (Low Vol + Low Sent)",
+                      int(q_counts.get("Low Volume + Low Sentiment", 0)))
+
+        fig_landscape.update_layout(
+            title="Candidate Landscape — All Candidates (1+ Completed Interview)" + title_suffix,
+            height=650,
+            xaxis_title="Completed Interviews",
+            yaxis_title="Avg Sentiment Score (%)",
+            xaxis=dict(range=[x_min, x_max]),
+            yaxis=dict(range=[y_min, y_max]),
+            legend=dict(orientation="h", y=1.12, x=0.5, xanchor="center"),
+            hovermode="closest",
+        )
+        st.plotly_chart(fig_landscape, use_container_width=True)
+
+        # Quadrant detail tables
+        with st.expander("⭐ Stars — High Volume + High Sentiment" + title_suffix):
+            stars = landscape[landscape["quadrant"] == "High Volume + High Sentiment"].sort_values("avg_sentiment", ascending=False)
+            if not stars.empty:
+                st.dataframe(stars[["candidate_name", "completed_interviews", "avg_sentiment",
+                                    "positive_count", "neutral_count", "negative_count", "companies", "experts"]].rename(
+                    columns={"candidate_name": "Candidate", "completed_interviews": "Interviews",
+                             "avg_sentiment": "Avg Sentiment", "positive_count": "Positive",
+                             "neutral_count": "Neutral", "negative_count": "Negative",
+                             "companies": "Companies", "experts": "Experts"}),
+                    use_container_width=True, hide_index=True)
+            else:
+                st.info("No candidates in this quadrant.")
+
+        with st.expander("💎 Potential — Low Volume + High Sentiment" + title_suffix):
+            potential = landscape[landscape["quadrant"] == "Low Volume + High Sentiment"].sort_values("avg_sentiment", ascending=False)
+            if not potential.empty:
+                st.dataframe(potential[["candidate_name", "completed_interviews", "avg_sentiment",
+                                        "positive_count", "neutral_count", "negative_count", "companies", "experts"]].rename(
+                    columns={"candidate_name": "Candidate", "completed_interviews": "Interviews",
+                             "avg_sentiment": "Avg Sentiment", "positive_count": "Positive",
+                             "neutral_count": "Neutral", "negative_count": "Negative",
+                             "companies": "Companies", "experts": "Experts"}),
+                    use_container_width=True, hide_index=True)
+            else:
+                st.info("No candidates in this quadrant.")
+
+        with st.expander("⚠️ At Risk — High Volume + Low Sentiment" + title_suffix):
+            at_risk = landscape[landscape["quadrant"] == "High Volume + Low Sentiment"].sort_values("avg_sentiment", ascending=True)
+            if not at_risk.empty:
+                st.dataframe(at_risk[["candidate_name", "completed_interviews", "avg_sentiment",
+                                      "positive_count", "neutral_count", "negative_count", "companies", "experts"]].rename(
+                    columns={"candidate_name": "Candidate", "completed_interviews": "Interviews",
+                             "avg_sentiment": "Avg Sentiment", "positive_count": "Positive",
+                             "neutral_count": "Neutral", "negative_count": "Negative",
+                             "companies": "Companies", "experts": "Experts"}),
+                    use_container_width=True, hide_index=True)
+            else:
+                st.info("No candidates in this quadrant.")
+
+        with st.expander("🔴 Concern — Low Volume + Low Sentiment" + title_suffix):
+            concern = landscape[landscape["quadrant"] == "Low Volume + Low Sentiment"].sort_values("avg_sentiment", ascending=True)
+            if not concern.empty:
+                st.dataframe(concern[["candidate_name", "completed_interviews", "avg_sentiment",
+                                      "positive_count", "neutral_count", "negative_count", "companies", "experts"]].rename(
+                    columns={"candidate_name": "Candidate", "completed_interviews": "Interviews",
+                             "avg_sentiment": "Avg Sentiment", "positive_count": "Positive",
+                             "neutral_count": "Neutral", "negative_count": "Negative",
+                             "companies": "Companies", "experts": "Experts"}),
+                    use_container_width=True, hide_index=True)
+            else:
+                st.info("No candidates in this quadrant.")
 
     # ── Detailed Tables ──────────────────────────────────────────
     display_cols = ["candidate_name", "completed_interviews", "avg_sentiment",
@@ -2365,7 +2498,6 @@ def render_top_candidates_analysis(df, title_suffix="", min_interviews=5):
                        "Min Sentiment", "Max Sentiment", "Positive",
                        "Neutral", "Negative"]
 
-    # Add companies and experts columns if they exist meaningfully
     if "company_name" in filtered.columns:
         display_cols.append("companies")
         display_headers.append("Companies")
@@ -4176,7 +4308,7 @@ def main():
                                   yaxis=dict(autorange="reversed"))
                 st.plotly_chart(fig, use_container_width=True)
                 
-    # ── CANDIDATE STRENGTH ANALYSIS (All Data) ──────────
+            # ── CANDIDATE STRENGTH ANALYSIS (All Data) ──────────
             if selected_support == "Interview Support":
                 render_top_candidates_analysis(support_df,
                                                 title_suffix=" — All Data",
