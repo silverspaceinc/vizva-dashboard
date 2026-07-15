@@ -2662,8 +2662,13 @@ def compute_assessment_conversions(all_data, window_days=60, similarity_threshol
     assessments = all_data[all_data["support_name"].str.lower() == "assessment support"].copy()
     interviews = all_data[all_data["support_name"].str.lower() == "interview support"].copy()
 
+    # Only consider completed assessments
+    if "task_status" in assessments.columns:
+        assessments = assessments[assessments["task_status"].astype(str).str.strip().str.lower() == "completed"]
+
     if assessments.empty:
         return pd.DataFrame()
+
 
     if "date" not in assessments.columns or "candidate_name" not in assessments.columns:
         return pd.DataFrame()
