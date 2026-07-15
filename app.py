@@ -2967,7 +2967,7 @@ def render_assessment_conversion_charts(conv_df, title_suffix=""):
 
         cc1, cc2 = st.columns(2)
         with cc1:
-            top_cands = cand_conv.head(20).sort_values("pct", ascending=True)
+            top_cands = cand_conv.sort_values("pct", ascending=False).head(20).sort_values("pct", ascending=True)
             avg_cand_pct = cand_conv["pct"].mean()
             cand_colors = ["#2ecc71" if p >= avg_cand_pct else "#e74c3c" for p in top_cands["pct"]]
             fig_cc = go.Figure(go.Bar(
