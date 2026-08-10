@@ -1319,13 +1319,15 @@ def is_out_of_shift(start_minutes):
 
 
 def add_out_of_shift_column(df):
-    """Add 'out_of_shift' boolean column to df. Requires '_parsed_start' or 'start_hour'."""
+    """Add 'out_of_shift' boolean column to df. Requires '_parsed_start' or 'start_hour'.
+    This marks ALL rows that are outside shift hours (regardless of status/expert).
+    Filtering for completed+non-Self is done at the analytics/render level.
+    """
     df = df.copy()
     if "_parsed_start" in df.columns:
         minutes = df["_parsed_start"].dt.hour * 60 + df["_parsed_start"].dt.minute
         df["_start_minutes_oos"] = minutes
     elif "start_hour" in df.columns:
-        # Approximate: use start_hour * 60 (no minute granularity)
         df["_start_minutes_oos"] = df["start_hour"] * 60
     else:
         df["out_of_shift"] = None
@@ -1335,11 +1337,40 @@ def add_out_of_shift_column(df):
     return df
 
 
-def get_oos_df(df):
-    """Return only the out-of-shift rows from df."""
+def get_oos_df(df, analytics_filter=True):
+    """Return only the out-of-shift rows from df.
+
+    If analytics_filter=True (default for analytics sections):
+      Only returns rows where task_status=='completed' AND expert_name!='self'
+    If analytics_filter=False (for Schedule View):
+      Returns ALL OOS rows regardless of status/expert
+    """
     if "out_of_shift" not in df.columns:
         return pd.DataFrame()
-    return df[df["out_of_shift"] == True].copy()
+    oos = df[df["out_of_shift"] == True].copy()
+    if analytics_filter and not oos.empty:
+        if "task_status" in oos.columns:
+            oos = oos[oos["task_status"].astype(str).str.strip().str.lower() == "completed"]
+        if "expert_name" in oos.columns:
+            oos = oos[oos["expert_name"].astype(str).str.strip().str.lower() != "self"]
+    return oos
+
+
+def get_oos_valid_df(df, analytics_filter=True):
+    """Return rows with valid out_of_shift data, optionally filtered for analytics.
+
+    If analytics_filter=True: only completed + non-Self rows with valid OOS data
+    If analytics_filter=False: all rows with valid OOS data
+    """
+    if "out_of_shift" not in df.columns:
+        return pd.DataFrame()
+    valid = df[df["out_of_shift"].notna()].copy()
+    if analytics_filter and not valid.empty:
+        if "task_status" in valid.columns:
+            valid = valid[valid["task_status"].astype(str).str.strip().str.lower() == "completed"]
+        if "expert_name" in valid.columns:
+            valid = valid[valid["expert_name"].astype(str).str.strip().str.lower() != "self"]
+    return valid
 
 
 def get_in_shift_df(df):
@@ -1350,27 +1381,34 @@ def get_in_shift_df(df):
 
 
 def render_oos_kpi(df, title_suffix=""):
-    """Render Out-of-Shift KPI row."""
+    """Render Out-of-Shift KPI row.
+    Only considers completed + non-Self interviews for analytics.
+    """
     if "out_of_shift" not in df.columns:
         return
-
-    valid = df[df["out_of_shift"].notna()].copy()
+    valid = get_oos_valid_df(df, analytics_filter=True)
     if valid.empty:
-        st.info("No interviews with valid time data for out-of-shift analysis" + title_suffix + ".")
+        st.info("No completed (non-Self) interviews with valid time data for out-of-shift analysis" + title_suffix + ".")
         return
 
+    # Recompute _start_minutes_oos if it's been dropped (filtered subset)
+    if "_parsed_start" in valid.columns and "_start_minutes_oos" not in valid.columns:
+        valid["_start_minutes_oos"] = valid["_parsed_start"].dt.hour * 60 + valid["_parsed_start"].dt.minute
+    elif "start_hour" in valid.columns and "_start_minutes_oos" not in valid.columns:
+        valid["_start_minutes_oos"] = valid["start_hour"] * 60
+
     total_with_time = len(valid)
-    oos_count = int(valid["out_of_shift"].sum())
+    oos_df = valid[valid["out_of_shift"] == True]
+    oos_count = len(oos_df)
     in_shift_count = total_with_time - oos_count
     oos_pct = round(oos_count / total_with_time * 100, 1) if total_with_time > 0 else 0
 
-    oos_df = valid[valid["out_of_shift"] == True]
     oos_candidates = oos_df["candidate_name"].nunique() if "candidate_name" in oos_df.columns and not oos_df.empty else 0
     oos_experts = oos_df["expert_name"].nunique() if "expert_name" in oos_df.columns and not oos_df.empty else 0
     oos_companies = oos_df["company_name"].nunique() if "company_name" in oos_df.columns and not oos_df.empty else 0
 
     k = st.columns(7)
-    k[0].metric("Interviews with Time", total_with_time)
+    k[0].metric("Completed (non-Self) w/ Time", total_with_time)
     k[1].metric("In Shift (3:30AM-12:30PM)", in_shift_count)
     k[2].metric("Out of Shift", oos_count)
     k[3].metric("Out of Shift %", f"{oos_pct}%",
@@ -1381,15 +1419,25 @@ def render_oos_kpi(df, title_suffix=""):
 
 
 def render_oos_section(df, title_suffix=""):
-    """Full Out-of-Shift analysis section with charts and tables."""
+    """Full Out-of-Shift analysis section with charts and tables.
+    Only considers completed + non-Self interviews for analytics (OOS analytics).
+    """
     if "out_of_shift" not in df.columns:
         st.info("No start_time data available for out-of-shift analysis.")
         return
 
-    valid = df[df["out_of_shift"].notna()].copy()
+    valid = get_oos_valid_df(df, analytics_filter=True)
     if valid.empty:
-        st.info("No interviews with valid time data" + title_suffix + ".")
+        st.info("No completed (non-Self) interviews with valid time data" + title_suffix + ".")
         return
+
+    if "_start_minutes_oos" not in valid.columns:
+        if "_parsed_start" in valid.columns:
+            valid["_start_minutes_oos"] = (
+                valid["_parsed_start"].dt.hour * 60 + valid["_parsed_start"].dt.minute
+            )
+        elif "start_hour" in valid.columns:
+            valid["_start_minutes_oos"] = valid["start_hour"] * 60
 
     oos_df = valid[valid["out_of_shift"] == True].copy()
     total_with_time = len(valid)
@@ -1399,116 +1447,60 @@ def render_oos_section(df, title_suffix=""):
 
     st.subheader("Out-of-Shift Interview Analysis" + title_suffix)
     st.caption(
-        "Shift: 3:30 AM – 12:30 PM EDT. Interviews before 3:30 AM or on/after 12:30 PM EDT "
-        "are classified as **Out of Shift**."
+        "Shift: 3:30 AM - 12:30 PM EDT. Interviews before 3:30 AM or on/after "
+        "12:30 PM EDT are classified as **Out of Shift**. Only **completed** "
+        "interviews by **non-Self** experts are analyzed."
     )
 
-    # ── KPI Row ──────────────────────────────────────────────────
     render_oos_kpi(df, title_suffix)
 
     if oos_count == 0:
         st.success("No out-of-shift interviews detected" + title_suffix + ".")
         return
 
-    # ── Donut: In Shift vs Out of Shift ──────────────────────────
     oos_c1, oos_c2 = st.columns(2)
     with oos_c1:
         fig_donut = go.Figure(go.Pie(
             labels=["In Shift", "Out of Shift"],
-            values=[in_shift_count, oos_count],
-            hole=0.5,
+            values=[in_shift_count, oos_count], hole=0.5,
             marker=dict(colors=["#2ecc71", "#e74c3c"]),
             textinfo="label+value+percent",
         ))
-        fig_donut.update_layout(title="Shift Split" + title_suffix, height=400, showlegend=False)
+        fig_donut.update_layout(title="Shift Split" + title_suffix,
+                                height=400, showlegend=False)
         st.plotly_chart(fig_donut, use_container_width=True)
-
-    # ── Hour-of-Day Distribution for OOS ─────────────────────────
     with oos_c2:
         if "_start_minutes_oos" in oos_df.columns:
             oos_hours = (oos_df["_start_minutes_oos"] // 60).astype(int)
             hour_counts = oos_hours.value_counts().sort_index()
             all_hours = list(range(0, 24))
-            hour_labels = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0") for h in all_hours]
+            hour_labels = [datetime(2000, 1, 1, h).strftime("%I %p").lstrip("0")
+                           for h in all_hours]
             counts = [int(hour_counts.get(h, 0)) for h in all_hours]
-
-            # Color: in-shift hours green, OOS hours red
-            bar_colors = []
-            for h in all_hours:
-                h_start = h * 60
-                if h_start < SHIFT_START_MIN or h_start >= SHIFT_END_MIN:
-                    bar_colors.append("#e74c3c")
-                else:
-                    bar_colors.append("#2ecc71")
-
+            bar_colors = [("#e74c3c" if (h * 60) < SHIFT_START_MIN
+                           or (h * 60) >= SHIFT_END_MIN else "#2ecc71")
+                          for h in all_hours]
             fig_hour = go.Figure(go.Bar(
-                x=hour_labels, y=counts,
-                marker_color=bar_colors,
+                x=hour_labels, y=counts, marker_color=bar_colors,
                 text=counts, textposition="outside",
             ))
-            # Add shift boundary lines
-            shift_start_label = datetime(2000, 1, 1, 3, 30).strftime("%I:%M %p").lstrip("0")
-            shift_end_label = datetime(2000, 1, 1, 12, 30).strftime("%I:%M %p").lstrip("0")
-
-            fig_hour.update_layout(
-                title="OOS Interviews by Hour" + title_suffix,
-                height=400,
-                xaxis_title="Hour of Day (EDT)",
-                yaxis_title="OOS Interviews",
-                xaxis=dict(tickangle=-45),
-            )
+            fig_hour.update_layout(title="OOS Interviews by Hour" + title_suffix,
+                                   height=400, xaxis_title="Hour of Day (EDT)",
+                                   yaxis_title="OOS Interviews",
+                                   xaxis=dict(tickangle=-45))
             st.plotly_chart(fig_hour, use_container_width=True)
 
-    # ── Task Status Split for OOS ────────────────────────────────
-    if "task_status" in oos_df.columns:
-        st.markdown("---")
-        st.subheader("Out-of-Shift — Task Status Breakdown" + title_suffix)
-
-        oos_status = oos_df["task_status"].value_counts()
-        oos_s1, oos_s2 = st.columns(2)
-        with oos_s1:
-            labels_s = [TASK_LABEL.get(s, s.title()) for s in oos_status.index]
-            colors_s = [CLR.get(s, "#95a5a6") for s in oos_status.index]
-            fig_s = go.Figure(go.Pie(
-                labels=labels_s, values=oos_status.values.tolist(),
-                hole=0.45,
-                marker=dict(colors=colors_s),
-                textinfo="label+value+percent",
-            ))
-            fig_s.update_layout(title="OOS Task Status Split", height=400, showlegend=False)
-            st.plotly_chart(fig_s, use_container_width=True)
-
-        with oos_s2:
-            fig_sb = go.Figure(go.Bar(
-                x=[TASK_LABEL.get(s, s.title()) for s in oos_status.index],
-                y=oos_status.values,
-                marker_color=colors_s,
-                text=oos_status.values, textposition="outside",
-            ))
-            fig_sb.update_layout(title="OOS Task Status Counts", height=400,
-                                 xaxis_title="Status", yaxis_title="Count")
-            st.plotly_chart(fig_sb, use_container_width=True)
-
-    # ── Expert-wise OOS ──────────────────────────────────────────
     if "expert_name" in oos_df.columns:
         st.markdown("---")
         st.subheader("Expert-wise Out-of-Shift Breakdown" + title_suffix)
-
         expert_oos = oos_df.groupby("expert_name").agg(
-            oos_interviews=("out_of_shift", "size"),
-        ).reset_index()
-
-        # Get total interviews per expert from the full valid set
-        expert_total = valid.groupby("expert_name").size().reset_index(name="total_interviews")
+            oos_interviews=("out_of_shift", "size")).reset_index()
+        expert_total = valid.groupby("expert_name").size().reset_index(
+            name="total_interviews")
         expert_oos = expert_oos.merge(expert_total, on="expert_name", how="left")
-        expert_oos["oos_pct"] = (expert_oos["oos_interviews"] / expert_oos["total_interviews"] * 100).round(1)
+        expert_oos["oos_pct"] = (expert_oos["oos_interviews"]
+                                 / expert_oos["total_interviews"] * 100).round(1)
         expert_oos = expert_oos.sort_values("oos_interviews", ascending=False)
-
-        # Task status breakdown per expert for OOS
-        if "task_status" in oos_df.columns:
-            expert_status = oos_df.groupby(["expert_name", "task_status"]).size().unstack(fill_value=0).reset_index()
-            expert_oos = expert_oos.merge(expert_status, on="expert_name", how="left").fillna(0)
-
         oos_e1, oos_e2 = st.columns(2)
         with oos_e1:
             top_experts = expert_oos.head(15).sort_values("oos_interviews", ascending=True)
@@ -1517,19 +1509,17 @@ def render_oos_section(df, title_suffix=""):
             fig_e = go.Figure(go.Bar(
                 y=top_experts["expert_name"], x=top_experts["oos_interviews"],
                 orientation="h", marker_color=e_colors,
-                text=top_experts.apply(lambda r: str(int(r["oos_interviews"])) + " (" + str(r["oos_pct"]) + "%)", axis=1),
+                text=top_experts.apply(
+                    lambda r: str(int(r["oos_interviews"])) + " (" + str(r["oos_pct"]) + "%)", axis=1),
                 textposition="outside",
             ))
-            fig_e.update_layout(
-                title="Top 15 Experts by OOS Interviews",
-                height=max(420, len(top_experts) * 35),
-                xaxis_title="OOS Interviews",
-            )
+            fig_e.update_layout(title="Top 15 Experts by OOS Interviews",
+                                height=max(420, len(top_experts) * 35),
+                                xaxis_title="OOS Interviews")
             st.plotly_chart(fig_e, use_container_width=True)
-
         with oos_e2:
-            # OOS % bar chart
-            top_by_pct = expert_oos[expert_oos["total_interviews"] >= 3].sort_values("oos_pct", ascending=False).head(15)
+            top_by_pct = expert_oos[expert_oos["total_interviews"] >= 3].sort_values(
+                "oos_pct", ascending=False).head(15)
             top_by_pct_sorted = top_by_pct.sort_values("oos_pct", ascending=True)
             pct_colors = ["#e74c3c" if p >= 50 else "#f39c12" if p >= 25 else "#2ecc71"
                           for p in top_by_pct_sorted["oos_pct"]]
@@ -1539,81 +1529,44 @@ def render_oos_section(df, title_suffix=""):
                 text=top_by_pct_sorted["oos_pct"].apply(lambda v: f"{v:.1f}%"),
                 textposition="outside",
             ))
-            fig_ep.update_layout(
-                title="Top 15 Experts by OOS % (min 3 interviews)",
-                height=max(420, len(top_by_pct_sorted) * 35),
-                xaxis_title="OOS %",
-                xaxis=dict(range=[0, min(100, top_by_pct_sorted["oos_pct"].max() + 15)]),
-            )
+            fig_ep.update_layout(title="Top 15 Experts by OOS % (min 3 interviews)",
+                                 height=max(420, len(top_by_pct_sorted) * 35),
+                                 xaxis_title="OOS %",
+                                 xaxis=dict(range=[0, min(100, top_by_pct_sorted["oos_pct"].max() + 15)]))
             st.plotly_chart(fig_ep, use_container_width=True)
-
-        # Stacked bar: expert OOS by task status
-        if "task_status" in oos_df.columns:
-            expert_oos_status = oos_df.groupby(["expert_name", "task_status"]).size().unstack(fill_value=0)
-            expert_oos_status["_total"] = expert_oos_status.sum(axis=1)
-            expert_oos_status = expert_oos_status.sort_values("_total", ascending=True).drop(columns="_total").tail(15)
-
-            fig_es = go.Figure()
-            for s in TASK_ORDER:
-                if s in expert_oos_status.columns:
-                    fig_es.add_trace(go.Bar(
-                        y=expert_oos_status.index, x=expert_oos_status[s],
-                        name=TASK_LABEL[s], orientation="h", marker_color=CLR[s],
-                        text=expert_oos_status[s], textposition="inside",
-                    ))
-            fig_es.update_layout(
-                barmode="stack",
-                title="Expert OOS — Task Status Breakdown (Top 15)",
-                height=max(420, len(expert_oos_status) * 35),
-                xaxis_title="OOS Interviews",
-                legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
-            )
-            st.plotly_chart(fig_es, use_container_width=True)
-
         with st.expander("Expert OOS Data" + title_suffix):
-            display_cols = ["expert_name", "oos_interviews", "total_interviews", "oos_pct"]
-            for s in TASK_ORDER:
-                if s in expert_oos.columns:
-                    display_cols.append(s)
-            disp = expert_oos[display_cols].copy()
-            col_names = ["Expert", "OOS Interviews", "Total Interviews", "OOS %"]
-            for s in TASK_ORDER:
-                if s in expert_oos.columns:
-                    col_names.append(TASK_LABEL[s] + " (OOS)")
-            disp.columns = col_names
+            disp = expert_oos[["expert_name", "oos_interviews",
+                               "total_interviews", "oos_pct"]].copy()
+            disp.columns = ["Expert", "OOS Interviews", "Total Interviews", "OOS %"]
             st.dataframe(disp, use_container_width=True, hide_index=True)
 
-    # ── Candidate-wise OOS ───────────────────────────────────────
     if "candidate_name" in oos_df.columns:
         st.markdown("---")
         st.subheader("Candidate-wise Out-of-Shift Breakdown" + title_suffix)
-
         cand_oos = oos_df.groupby("candidate_name").agg(
-            oos_interviews=("out_of_shift", "size"),
-        ).reset_index()
+            oos_interviews=("out_of_shift", "size")).reset_index()
         cand_total = valid.groupby("candidate_name").size().reset_index(name="total_interviews")
         cand_oos = cand_oos.merge(cand_total, on="candidate_name", how="left")
-        cand_oos["oos_pct"] = (cand_oos["oos_interviews"] / cand_oos["total_interviews"] * 100).round(1)
+        cand_oos["oos_pct"] = (cand_oos["oos_interviews"]
+                               / cand_oos["total_interviews"] * 100).round(1)
         cand_oos = cand_oos.sort_values("oos_interviews", ascending=False)
-
         oos_ca1, oos_ca2 = st.columns(2)
         with oos_ca1:
             top_cands = cand_oos.head(15).sort_values("oos_interviews", ascending=True)
             fig_c = go.Figure(go.Bar(
                 y=top_cands["candidate_name"], x=top_cands["oos_interviews"],
                 orientation="h", marker_color="#e74c3c",
-                text=top_cands.apply(lambda r: str(int(r["oos_interviews"])) + " (" + str(r["oos_pct"]) + "%)", axis=1),
+                text=top_cands.apply(
+                    lambda r: str(int(r["oos_interviews"])) + " (" + str(r["oos_pct"]) + "%)", axis=1),
                 textposition="outside",
             ))
-            fig_c.update_layout(
-                title="Top 15 Candidates by OOS Interviews",
-                height=max(420, len(top_cands) * 35),
-                xaxis_title="OOS Interviews",
-            )
+            fig_c.update_layout(title="Top 15 Candidates by OOS Interviews",
+                                height=max(420, len(top_cands) * 35),
+                                xaxis_title="OOS Interviews")
             st.plotly_chart(fig_c, use_container_width=True)
-
         with oos_ca2:
-            top_cands_pct = cand_oos[cand_oos["total_interviews"] >= 3].sort_values("oos_pct", ascending=False).head(15)
+            top_cands_pct = cand_oos[cand_oos["total_interviews"] >= 3].sort_values(
+                "oos_pct", ascending=False).head(15)
             top_cands_pct_s = top_cands_pct.sort_values("oos_pct", ascending=True)
             cpct_colors = ["#e74c3c" if p >= 50 else "#f39c12" if p >= 25 else "#2ecc71"
                            for p in top_cands_pct_s["oos_pct"]]
@@ -1623,80 +1576,76 @@ def render_oos_section(df, title_suffix=""):
                 text=top_cands_pct_s["oos_pct"].apply(lambda v: f"{v:.1f}%"),
                 textposition="outside",
             ))
-            fig_cp.update_layout(
-                title="Top 15 Candidates by OOS % (min 3 interviews)",
-                height=max(420, len(top_cands_pct_s) * 35),
-                xaxis_title="OOS %",
-                xaxis=dict(range=[0, min(100, top_cands_pct_s["oos_pct"].max() + 15)]),
-            )
+            fig_cp.update_layout(title="Top 15 Candidates by OOS % (min 3 interviews)",
+                                 height=max(420, len(top_cands_pct_s) * 35),
+                                 xaxis_title="OOS %",
+                                 xaxis=dict(range=[0, min(100, top_cands_pct_s["oos_pct"].max() + 15)]))
             st.plotly_chart(fig_cp, use_container_width=True)
-
         with st.expander("Candidate OOS Data" + title_suffix):
-            disp_c = cand_oos[["candidate_name", "oos_interviews", "total_interviews", "oos_pct"]].copy()
+            disp_c = cand_oos[["candidate_name", "oos_interviews",
+                               "total_interviews", "oos_pct"]].copy()
             disp_c.columns = ["Candidate", "OOS Interviews", "Total Interviews", "OOS %"]
             st.dataframe(disp_c, use_container_width=True, hide_index=True)
 
-    # ── Round-wise OOS ───────────────────────────────────────────
     if "round_name" in oos_df.columns:
         st.markdown("---")
         st.subheader("Round-wise Out-of-Shift Breakdown" + title_suffix)
-
         round_oos = oos_df.groupby("round_name").agg(
-            oos_interviews=("out_of_shift", "size"),
-        ).reset_index()
-        round_total = valid.groupby("round_name").size().reset_index(name="total_interviews") if "round_name" in valid.columns else pd.DataFrame()
+            oos_interviews=("out_of_shift", "size")).reset_index()
+        if "round_name" in valid.columns:
+            round_total = valid.groupby("round_name").size().reset_index(name="total_interviews")
+        else:
+            round_total = pd.DataFrame()
         if not round_total.empty:
             round_oos = round_oos.merge(round_total, on="round_name", how="left")
-            round_oos["oos_pct"] = (round_oos["oos_interviews"] / round_oos["total_interviews"] * 100).round(1)
+            round_oos["oos_pct"] = (round_oos["oos_interviews"]
+                                    / round_oos["total_interviews"] * 100).round(1)
         else:
             round_oos["total_interviews"] = round_oos["oos_interviews"]
             round_oos["oos_pct"] = 100.0
         round_oos = round_oos.sort_values("oos_interviews", ascending=False)
-
         oos_r1, oos_r2 = st.columns(2)
         with oos_r1:
             round_sorted = round_oos.sort_values("oos_interviews", ascending=True)
             fig_r = go.Figure(go.Bar(
                 y=round_sorted["round_name"], x=round_sorted["oos_interviews"],
                 orientation="h", marker_color="#e67e22",
-                text=round_sorted.apply(lambda r: str(int(r["oos_interviews"])) + " (" + str(r["oos_pct"]) + "%)", axis=1),
+                text=round_sorted.apply(
+                    lambda r: str(int(r["oos_interviews"])) + " (" + str(r["oos_pct"]) + "%)", axis=1),
                 textposition="outside",
             ))
-            fig_r.update_layout(
-                title="Rounds by OOS Count",
-                height=max(400, len(round_sorted) * 40),
-                xaxis_title="OOS Interviews",
-            )
+            fig_r.update_layout(title="Rounds by OOS Count",
+                                height=max(400, len(round_sorted) * 40),
+                                xaxis_title="OOS Interviews")
             st.plotly_chart(fig_r, use_container_width=True)
-
         with oos_r2:
             fig_rp = go.Figure(go.Pie(
-                labels=round_oos["round_name"], values=round_oos["oos_interviews"].tolist(),
+                labels=round_oos["round_name"],
+                values=round_oos["oos_interviews"].tolist(),
                 hole=0.45, textinfo="label+value+percent",
             ))
-            fig_rp.update_layout(title="OOS Round Split", height=400, showlegend=False)
+            fig_rp.update_layout(title="OOS Round Split",
+                                 height=400, showlegend=False)
             st.plotly_chart(fig_rp, use_container_width=True)
-
         with st.expander("Round OOS Data" + title_suffix):
-            disp_r = round_oos[["round_name", "oos_interviews", "total_interviews", "oos_pct"]].copy()
+            disp_r = round_oos[["round_name", "oos_interviews",
+                                "total_interviews", "oos_pct"]].copy()
             disp_r.columns = ["Round", "OOS Interviews", "Total Interviews", "OOS %"]
             st.dataframe(disp_r, use_container_width=True, hide_index=True)
 
-    # ── Monthly OOS Trend ────────────────────────────────────────
     if "date" in valid.columns:
         st.markdown("---")
         st.subheader("Monthly Out-of-Shift Trend" + title_suffix)
-
         valid_m = valid.copy()
         valid_m["month"] = valid_m["date"].dt.to_period("M").astype(str)
-
         monthly_total = valid_m.groupby("month").size().reset_index(name="total")
-        monthly_oos = valid_m[valid_m["out_of_shift"] == True].groupby("month").size().reset_index(name="oos")
+        monthly_oos = valid_m[valid_m["out_of_shift"] == True].groupby(
+            "month").size().reset_index(name="oos")
         monthly_trend = monthly_total.merge(monthly_oos, on="month", how="left").fillna(0)
         monthly_trend["oos"] = monthly_trend["oos"].astype(int)
         monthly_trend["in_shift"] = monthly_trend["total"] - monthly_trend["oos"]
-        monthly_trend["oos_pct"] = (monthly_trend["oos"] / monthly_trend["total"] * 100).round(1)
-
+        monthly_trend["oos_pct"] = (monthly_trend["oos"]
+                                    / monthly_trend["total"] * 100).round(1)
         mt1, mt2 = st.columns(2)
         with mt1:
             fig_mt = go.Figure()
@@ -1708,9 +1657,9 @@ def render_oos_section(df, title_suffix=""):
                                     text=monthly_trend["oos"], textposition="inside"))
             fig_mt.update_layout(barmode="stack", title="Monthly: In Shift vs OOS",
                                  height=420, yaxis_title="Interviews",
-                                 legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
+                                 legend=dict(orientation="h", y=1.05,
+                                             x=0.5, xanchor="center"))
             st.plotly_chart(fig_mt, use_container_width=True)
-
         with mt2:
             pct_colors = ["#e74c3c" if p >= 30 else "#f39c12" if p >= 15 else "#2ecc71"
                           for p in monthly_trend["oos_pct"]]
@@ -1723,69 +1672,68 @@ def render_oos_section(df, title_suffix=""):
                 line=dict(color="#e74c3c", width=3),
                 marker=dict(size=10, color=pct_colors),
             ))
-            fig_mp.update_layout(title="Monthly OOS %", height=420,
-                                 yaxis_title="OOS %",
+            fig_mp.update_layout(title="Monthly OOS %", height=420, yaxis_title="OOS %",
                                  yaxis=dict(range=[0, max(50, monthly_trend["oos_pct"].max() + 10)]))
             st.plotly_chart(fig_mp, use_container_width=True)
-
         with st.expander("Monthly OOS Data" + title_suffix):
             st.dataframe(monthly_trend, use_container_width=True, hide_index=True)
 
-    # ── Company-wise OOS ─────────────────────────────────────────
     if "company_name" in oos_df.columns:
         st.markdown("---")
         st.subheader("Company-wise Out-of-Shift Breakdown" + title_suffix)
-
         comp_oos = oos_df.groupby("company_name").agg(
-            oos_interviews=("out_of_shift", "size"),
-        ).reset_index()
-        comp_total = valid.groupby("company_name").size().reset_index(name="total_interviews") if "company_name" in valid.columns else pd.DataFrame()
+            oos_interviews=("out_of_shift", "size")).reset_index()
+        if "company_name" in valid.columns:
+            comp_total = valid.groupby("company_name").size().reset_index(name="total_interviews")
+        else:
+            comp_total = pd.DataFrame()
         if not comp_total.empty:
             comp_oos = comp_oos.merge(comp_total, on="company_name", how="left")
-            comp_oos["oos_pct"] = (comp_oos["oos_interviews"] / comp_oos["total_interviews"] * 100).round(1)
+            comp_oos["oos_pct"] = (comp_oos["oos_interviews"]
+                                   / comp_oos["total_interviews"] * 100).round(1)
         else:
             comp_oos["total_interviews"] = comp_oos["oos_interviews"]
             comp_oos["oos_pct"] = 100.0
         comp_oos = comp_oos.sort_values("oos_interviews", ascending=False)
-
         top_comp = comp_oos.head(15).sort_values("oos_interviews", ascending=True)
         fig_comp = go.Figure(go.Bar(
             y=top_comp["company_name"], x=top_comp["oos_interviews"],
             orientation="h", marker_color="#e74c3c",
-            text=top_comp.apply(lambda r: str(int(r["oos_interviews"])) + " (" + str(r["oos_pct"]) + "%)", axis=1),
+            text=top_comp.apply(
+                lambda r: str(int(r["oos_interviews"])) + " (" + str(r["oos_pct"]) + "%)", axis=1),
             textposition="outside",
         ))
-        fig_comp.update_layout(
-            title="Top 15 Companies by OOS Interviews",
-            height=max(420, len(top_comp) * 35),
-            xaxis_title="OOS Interviews",
-        )
+        fig_comp.update_layout(title="Top 15 Companies by OOS Interviews",
+                               height=max(420, len(top_comp) * 35),
+                               xaxis_title="OOS Interviews")
         st.plotly_chart(fig_comp, use_container_width=True)
-
         with st.expander("Company OOS Data" + title_suffix):
-            disp_co = comp_oos[["company_name", "oos_interviews", "total_interviews", "oos_pct"]].copy()
+            disp_co = comp_oos[["company_name", "oos_interviews",
+                                "total_interviews", "oos_pct"]].copy()
             disp_co.columns = ["Company", "OOS Interviews", "Total Interviews", "OOS %"]
             st.dataframe(disp_co, use_container_width=True, hide_index=True)
 
-    # ── Detailed OOS Table ───────────────────────────────────────
-    with st.expander("All Out-of-Shift Interviews" + title_suffix):
-        display_cols = [c for c in ["date", "candidate_name", "expert_name", "company_name",
-                                    "round_name", "task_status", "start_time",
-                                    "sentiment_score", "sentiment_label"]
-                        if c in oos_df.columns]
+    with st.expander("All Out-of-Shift Interviews (Completed, non-Self)" + title_suffix):
+        display_cols = [c for c in ["date", "candidate_name", "expert_name",
+                                    "company_name", "round_name", "task_status",
+                                    "start_time", "sentiment_score",
+                                    "sentiment_label"] if c in oos_df.columns]
         if display_cols:
-            st.dataframe(oos_df[display_cols].sort_values("date", ascending=False) if "date" in display_cols else oos_df[display_cols],
-                         use_container_width=True, hide_index=True)
+            df_show = oos_df[display_cols]
+            if "date" in df_show.columns:
+                df_show = df_show.sort_values("date", ascending=False)
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
         else:
             st.dataframe(oos_df, use_container_width=True, hide_index=True)
 
-
 def render_oos_compact(df, title_suffix=""):
-    """Compact OOS summary (for Today's Snapshot and single-day views)."""
+    """Compact OOS summary (for Today's Snapshot and single-day views).
+    Only considers completed + non-Self interviews.
+    """
     if "out_of_shift" not in df.columns:
         return
 
-    valid = df[df["out_of_shift"].notna()].copy()
+    valid = get_oos_valid_df(df, analytics_filter=True)
     if valid.empty:
         return
 
@@ -1794,11 +1742,11 @@ def render_oos_compact(df, title_suffix=""):
     oos_count = len(oos_df)
 
     if oos_count == 0:
-        st.success("All interviews are within shift (3:30 AM – 12:30 PM EDT)" + title_suffix + ".")
+        st.success("All completed (non-Self) interviews are within shift (3:30 AM – 12:30 PM EDT)" + title_suffix + ".")
         return
 
     oos_pct = round(oos_count / total_with_time * 100, 1)
-    st.warning(f"⏰ **{oos_count} Out-of-Shift interview(s)** detected ({oos_pct}% of {total_with_time})" + title_suffix)
+    st.warning(f"⏰ **{oos_count} Out-of-Shift interview(s)** detected ({oos_pct}% of {total_with_time} completed non-Self)" + title_suffix)
 
     k = st.columns(4)
     k[0].metric("Out of Shift", oos_count)
@@ -2262,21 +2210,20 @@ def _minutes_to_label(m):
 
 
 def build_schedule_data(all_data, selected_date):
-    """Build a DataFrame of interview slots for the Gantt chart.
+    """Build interview slots DataFrame for the Gantt chart.
 
-    Returns a DataFrame with columns:
+    Returns DataFrame with columns:
       expert_name, candidate_name, company_name, round_name, support_name,
       task_status, start_min, end_min, start_label, end_label, duration,
-      has_clash (bool)
+      has_clash (bool), is_oos (bool)
     """
     if all_data.empty or "date" not in all_data.columns:
         return pd.DataFrame()
 
     day_df = all_data[
-        (all_data["date"].dt.date == selected_date) &
-        (all_data["support_name"].str.lower() == "interview support")
+        (all_data["date"].dt.date == selected_date)
+        & (all_data["support_name"].str.lower() == "interview support")
     ].copy()
-
     if day_df.empty:
         return pd.DataFrame()
 
@@ -2289,75 +2236,68 @@ def build_schedule_data(all_data, selected_date):
         support = r.get("support_name", "")
         status = r.get("task_status", "pending")
 
-        # Parse start time
         start_raw = r.get("start_time", None)
         start_min = _parse_time_to_minutes(str(start_raw)) if pd.notna(start_raw) else None
-
-        # Parse end time
         end_raw = r.get("end_time", None)
         end_min = _parse_time_to_minutes(str(end_raw)) if pd.notna(end_raw) else None
 
-        # If no start time at all, skip this row
         if start_min is None:
             continue
-
-        # Default duration: 30 minutes if no end time
         if end_min is None or end_min <= start_min:
             end_min = start_min + 30
 
         duration = end_min - start_min
+        oos_flag = is_out_of_shift(start_min)
 
         rows.append({
-            "expert_name": expert,
-            "candidate_name": candidate,
-            "company_name": company,
-            "round_name": round_name,
-            "support_name": support,
-            "task_status": status,
-            "start_min": start_min,
-            "end_min": end_min,
+            "expert_name": expert, "candidate_name": candidate,
+            "company_name": company, "round_name": round_name,
+            "support_name": support, "task_status": status,
+            "start_min": start_min, "end_min": end_min,
             "start_label": _minutes_to_label(start_min),
             "end_label": _minutes_to_label(end_min),
             "duration": duration,
+            "is_oos": bool(oos_flag) if oos_flag is not None else False,
         })
 
     if not rows:
         return pd.DataFrame()
 
     sched = pd.DataFrame(rows)
-
-    # Detect clashes per expert (overlapping intervals)
     sched["has_clash"] = False
     for expert, grp in sched.groupby("expert_name"):
         if len(grp) < 2:
             continue
         idxs = grp.index.tolist()
-        for i in range(len(idxs)):
-            for j in range(i + 1, len(idxs)):
-                s1, e1 = sched.loc[idxs[i], "start_min"], sched.loc[idxs[i], "end_min"]
-                s2, e2 = sched.loc[idxs[j], "start_min"], sched.loc[idxs[j], "end_min"]
-                if s1 < e2 and s2 < e1:  # overlap
-                    sched.loc[idxs[i], "has_clash"] = True
-                    sched.loc[idxs[j], "has_clash"] = True
-
+        for a in range(len(idxs)):
+            for b in range(a + 1, len(idxs)):
+                s1, e1 = sched.loc[idxs[a], "start_min"], sched.loc[idxs[a], "end_min"]
+                s2, e2 = sched.loc[idxs[b], "start_min"], sched.loc[idxs[b], "end_min"]
+                if s1 < e2 and s2 < e1:
+                    sched.loc[idxs[a], "has_clash"] = True
+                    sched.loc[idxs[b], "has_clash"] = True
     return sched
 
-
 def render_schedule_gantt(sched, selected_date, all_expert_names=None):
-    """Render the Gantt-style timeline chart with merged hover for overlapping slots."""
+    """Gantt timeline chart with merged hover for overlapping slots.
+    OOS interviews get purple fill (#9b59b6) + orange border (#ff6600).
+    Clash interviews retain status color + red border.
+    Shift window drawn as dashed vertical lines (3:30 AM and 12:30 PM).
+    Legend includes status colors, Clash (red border), Out of Shift
+    (purple/orange). All interviews shown (including Self, all statuses);
+    only OOS rows are visually flagged.
+    """
 
-    # Experts with interviews — sorted by earliest start
+    ref = datetime(2000, 1, 1)
     if not sched.empty:
         sched = sched.copy()
-        ref = datetime(2000, 1, 1)
         sched["start_dt"] = sched["start_min"].apply(lambda m: ref + timedelta(minutes=int(m)))
         sched["end_dt"] = sched["end_min"].apply(lambda m: ref + timedelta(minutes=int(m)))
-        experts_with_interviews = sched.groupby("expert_name")["start_min"].min().sort_values().index.tolist()
+        experts_with_interviews = (sched.groupby("expert_name")["start_min"].min()
+                                   .sort_values().index.tolist())
     else:
-        ref = datetime(2000, 1, 1)
         experts_with_interviews = []
 
-    # ALL active experts (including those with zero interviews)
     if all_expert_names:
         experts_without = [e for e in all_expert_names if e not in experts_with_interviews]
         expert_order = experts_with_interviews + sorted(experts_without)
@@ -2374,21 +2314,25 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
         "cancelled": "#e74c3c",
         "pending": "#3498db",
     }
+    OOS_COLOR = "#9b59b6"   # purple fill for OOS
+    OOS_BORDER = "#ff6600"  # orange border for OOS
 
     fig = go.Figure()
+    shift_start_dt = ref + timedelta(minutes=SHIFT_START_MIN)
+    shift_end_dt = ref + timedelta(minutes=SHIFT_END_MIN)
 
     if not sched.empty:
         for expert in experts_with_interviews:
             expert_df = sched[sched["expert_name"] == expert].sort_values("start_min")
 
-            # Build clusters of overlapping intervals
             clusters = []
             for _, row in expert_df.iterrows():
                 row_dict = row.to_dict()
                 placed = False
                 for cluster in clusters:
                     for c_row in cluster:
-                        if row_dict["start_min"] < c_row["end_min"] and c_row["start_min"] < row_dict["end_min"]:
+                        if (row_dict["start_min"] < c_row["end_min"]
+                                and c_row["start_min"] < row_dict["end_min"]):
                             cluster.append(row_dict)
                             placed = True
                             break
@@ -2400,93 +2344,95 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
             for cluster in clusters:
                 if len(cluster) == 1:
                     row = cluster[0]
-                    base_color = status_colors.get(row["task_status"], "#95a5a6")
-                    line_dict = dict(color="#ff0000", width=3) if row["has_clash"] else dict(color="white", width=1)
+                    is_oos = bool(row.get("is_oos", False))
+                    has_clash = bool(row.get("has_clash", False))
+                    if is_oos:
+                        base_color = OOS_COLOR
+                        line_dict = dict(color=OOS_BORDER, width=3)
+                    elif has_clash:
+                        base_color = status_colors.get(row["task_status"], "#95a5a6")
+                        line_dict = dict(color="#ff0000", width=3)
+                    else:
+                        base_color = status_colors.get(row["task_status"], "#95a5a6")
+                        line_dict = dict(color="white", width=1)
 
+                    oos_tag = " | OOS" if is_oos else ""
+                    clash_tag = " | CLASH" if has_clash else ""
                     hover = (
                         "<b>" + str(row.get("candidate_name", "") or "") + "</b><br>"
                         + "Company: " + str(row.get("company_name", "") or "") + "<br>"
                         + "Round: " + str(row.get("round_name", "") or "") + "<br>"
                         + "Status: " + str(row.get("task_status", "") or "") + "<br>"
-                        + "Time: " + str(row["start_label"]) + " – " + str(row["end_label"]) + "<br>"
+                        + "Time: " + str(row["start_label"]) + " - " + str(row["end_label"]) + "<br>"
                         + "Duration: " + str(row["duration"]) + " min"
+                        + oos_tag + clash_tag
                     )
-
                     fig.add_trace(go.Bar(
                         y=[expert],
                         x=[(row["end_dt"] - row["start_dt"]).total_seconds() * 1000],
-                        base=[row["start_dt"]],
-                        orientation="h",
+                        base=[row["start_dt"]], orientation="h",
                         marker=dict(color=base_color, line=line_dict),
-                        hovertext=hover,
-                        hoverinfo="text",
-                        showlegend=False,
-                        width=0.6,
+                        hovertext=hover, hoverinfo="text",
+                        showlegend=False, width=0.6,
                     ))
                 else:
                     min_start = min(r["start_min"] for r in cluster)
                     max_end = max(r["end_min"] for r in cluster)
                     start_dt = ref + timedelta(minutes=int(min_start))
                     end_dt = ref + timedelta(minutes=int(max_end))
-
-                    hover_parts = ["<b>⚠️ " + str(len(cluster)) + " OVERLAPPING INTERVIEWS</b><br><br>"]
+                    any_oos = any(bool(r.get("is_oos", False)) for r in cluster)
+                    hover_parts = ["<b>" + str(len(cluster)) + " overlapping</b>"]
+                    if any_oos:
+                        hover_parts[0] += " (OOS)"
+                    hover_parts.append("<br><br>")
                     for idx, row in enumerate(cluster):
+                        oos_marker = " [OOS]" if bool(row.get("is_oos", False)) else ""
                         hover_parts.append(
-                            "<b>" + str(idx + 1) + ". " + str(row.get("candidate_name", "") or "") + "</b><br>"
-                            + "   Company: " + str(row.get("company_name", "") or "") + "<br>"
-                            + "   Round: " + str(row.get("round_name", "") or "") + "<br>"
-                            + "   Status: " + str(row.get("task_status", "") or "") + "<br>"
-                            + "   Time: " + str(row["start_label"]) + " – " + str(row["end_label"]) + "<br>"
-                            + "   Duration: " + str(row["duration"]) + " min<br><br>"
+                            str(idx + 1) + ". "
+                            + str(row.get("candidate_name", "") or "") + oos_marker + " | "
+                            + str(row.get("company_name", "") or "") + " | "
+                            + str(row.get("round_name", "") or "") + " | "
+                            + str(row.get("task_status", "") or "") + " | "
+                            + str(row["start_label"]) + "-" + str(row["end_label"]) + " ("
+                            + str(row["duration"]) + " min)<br>"
                         )
-
-                    base_color = status_colors.get(cluster[0]["task_status"], "#95a5a6")
+                    base_color = (OOS_COLOR if any_oos
+                                  else status_colors.get(cluster[0]["task_status"], "#95a5a6"))
                     merged_hover = "".join(hover_parts)
-
                     fig.add_trace(go.Bar(
                         y=[expert],
                         x=[(end_dt - start_dt).total_seconds() * 1000],
-                        base=[start_dt],
-                        orientation="h",
+                        base=[start_dt], orientation="h",
                         marker=dict(color=base_color, line=dict(color="#ff0000", width=3)),
-                        hovertext=merged_hover,
-                        hoverinfo="text",
-                        showlegend=False,
-                        width=0.6,
+                        hovertext=merged_hover, hoverinfo="text",
+                        showlegend=False, width=0.6,
                     ))
-
                     for row in cluster:
-                        bar_color = status_colors.get(row["task_status"], "#95a5a6")
+                        is_oos = bool(row.get("is_oos", False))
+                        bar_color = (OOS_COLOR if is_oos
+                                     else status_colors.get(row["task_status"], "#95a5a6"))
+                        border_color = OOS_BORDER if is_oos else "#ff0000"
                         fig.add_trace(go.Bar(
                             y=[expert],
                             x=[(row["end_dt"] - row["start_dt"]).total_seconds() * 1000],
-                            base=[row["start_dt"]],
-                            orientation="h",
-                            marker=dict(color=bar_color, line=dict(color="#ff0000", width=2),
+                            base=[row["start_dt"]], orientation="h",
+                            marker=dict(color=bar_color,
+                                        line=dict(color=border_color, width=2),
                                         opacity=0.7),
-                            hovertext=merged_hover,
-                            hoverinfo="text",
-                            showlegend=False,
-                            width=0.3,
+                            hovertext=merged_hover, hoverinfo="text",
+                            showlegend=False, width=0.3,
                         ))
 
-    # Add invisible traces for experts with NO interviews (so they appear on y-axis)
     experts_on_chart = set(experts_with_interviews)
     for expert in expert_order:
         if expert not in experts_on_chart:
             fig.add_trace(go.Bar(
-                y=[expert],
-                x=[0],
-                base=[ref + timedelta(hours=8)],
-                orientation="h",
-                marker=dict(color="rgba(0,0,0,0)"),
+                y=[expert], x=[0], base=[ref + timedelta(hours=8)],
+                orientation="h", marker=dict(color="rgba(0,0,0,0)"),
                 hovertext="No interviews scheduled",
-                hoverinfo="text",
-                showlegend=False,
-                width=0.6,
+                hoverinfo="text", showlegend=False, width=0.6,
             ))
 
-    # Legend traces
     for status, color in status_colors.items():
         fig.add_trace(go.Bar(
             y=[None], x=[None],
@@ -2497,11 +2443,14 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
     fig.add_trace(go.Bar(
         y=[None], x=[None],
         marker=dict(color="#95a5a6", line=dict(color="#ff0000", width=3)),
-        name="⚠️ Clash (red border)",
-        showlegend=True,
+        name="Clash (red border)", showlegend=True,
+    ))
+    fig.add_trace(go.Bar(
+        y=[None], x=[None],
+        marker=dict(color=OOS_COLOR, line=dict(color=OOS_BORDER, width=3)),
+        name="Out of Shift (purple/orange)", showlegend=True,
     ))
 
-    # Time range
     if not sched.empty:
         min_start_val = sched["start_min"].min()
         max_end_val = sched["end_min"].max()
@@ -2512,26 +2461,24 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
     range_start = ref + timedelta(minutes=max(0, int(min_start_val) - 30))
     range_end = ref + timedelta(minutes=min(1440, int(max_end_val) + 30))
 
+    fig.add_vline(x=shift_start_dt, line_dash="dash", line_color="#2ecc71",
+                  opacity=0.6, annotation_text="Shift Start 3:30 AM",
+                  annotation_position="top")
+    fig.add_vline(x=shift_end_dt, line_dash="dash", line_color="#2ecc71",
+                  opacity=0.6, annotation_text="Shift End 12:30 PM",
+                  annotation_position="top")
+
     fig.update_layout(
-        title="Expert Schedule — " + str(selected_date) + " (EDT)",
+        title="Expert Schedule - " + str(selected_date) + " (EDT)",
         height=max(500, len(expert_order) * 45),
-        xaxis=dict(
-            type="date",
-            tickformat="%I:%M %p",
-            range=[range_start, range_end],
-            title="Time (EDT)",
-            dtick=30 * 60 * 1000,
-        ),
-        yaxis=dict(
-            categoryorder="array",
-            categoryarray=expert_order[::-1],
-            title="Expert",
-        ),
+        xaxis=dict(type="date", tickformat="%I:%M %p",
+                   range=[range_start, range_end], title="Time (EDT)",
+                   dtick=30 * 60 * 1000),
+        yaxis=dict(categoryorder="array", categoryarray=expert_order[::-1], title="Expert"),
         barmode="overlay",
         legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
         hovermode="closest",
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
 def render_schedule_view(all_data, active_expert_df):
@@ -2614,6 +2561,79 @@ def render_schedule_view(all_data, active_expert_df):
                                   "Status", "Start", "End", "Duration (min)"]
         st.dataframe(clash_display.sort_values(["Expert", "Start"]),
                      use_container_width=True, hide_index=True)
+
+
+    # OUT-OF-SHIFT DETAILS (Schedule View) - kept here between clash block
+    # and the FULL SCHEDULE TABLE expander.
+    if "is_oos" in sched.columns and not sched.empty:
+        oos_sched = sched[sched["is_oos"] == True].copy()
+        if not oos_sched.empty:
+            st.markdown("---")
+            st.subheader("Out-of-Shift Interviews - " + str(selected_date))
+            st.caption(
+                "All interviews (any status, including Self) scheduled "
+                "outside the shift window (3:30 AM - 12:30 PM EDT). "
+                "Purple/orange bars in the Gantt above flag OOS."
+            )
+            oos_k = st.columns(5)
+            oos_k[0].metric("OOS Interviews", len(oos_sched))
+            oos_k[1].metric("OOS Experts", int(oos_sched["expert_name"].nunique()))
+            oos_k[2].metric(
+                "OOS Candidates",
+                int(oos_sched["candidate_name"].nunique())
+                if "candidate_name" in oos_sched.columns else 0,
+            )
+            oos_k[3].metric(
+                "OOS Completed",
+                int((oos_sched["task_status"] == "completed").sum()),
+            )
+            oos_k[4].metric(
+                "OOS Pending",
+                int((oos_sched["task_status"] == "pending").sum()),
+            )
+
+            oos_sc1, oos_sc2 = st.columns(2)
+            with oos_sc1:
+                oos_status_series = oos_sched["task_status"].value_counts()
+                labels_s = [TASK_LABEL.get(s, s.title()) for s in oos_status_series.index]
+                colors_s = [CLR.get(s, "#95a5a6") for s in oos_status_series.index]
+                fig_os = go.Figure(go.Pie(
+                    labels=labels_s, values=oos_status_series.values.tolist(),
+                    hole=0.45, marker=dict(colors=colors_s),
+                    textinfo="label+value+percent",
+                ))
+                fig_os.update_layout(title="OOS by Task Status",
+                                     height=380, showlegend=False)
+                st.plotly_chart(fig_os, use_container_width=True)
+            with oos_sc2:
+                oos_by_expert = oos_sched["expert_name"].value_counts()
+                fig_oe = go.Figure(go.Bar(
+                    y=oos_by_expert.index, x=oos_by_expert.values,
+                    orientation="h", marker_color="#9b59b6",
+                    text=oos_by_expert.values, textposition="outside",
+                ))
+                fig_oe.update_layout(
+                    title="OOS by Expert",
+                    height=max(380, len(oos_by_expert) * 35),
+                    yaxis=dict(autorange="reversed"),
+                    xaxis_title="OOS Interviews",
+                )
+                st.plotly_chart(fig_oe, use_container_width=True)
+
+            with st.expander("OOS Interview Details - " + str(selected_date)):
+                cols_show = [c for c in ["expert_name", "candidate_name",
+                                          "company_name", "round_name",
+                                          "task_status", "start_label",
+                                          "end_label", "duration"]
+                             if c in oos_sched.columns]
+                oos_display = oos_sched[cols_show].copy()
+                oos_display.columns = [c.replace("_", " ").title() for c in cols_show]
+                sort_cols = [c for c in ["Expert Name", "Start Label"]
+                             if c in oos_display.columns]
+                st.dataframe(
+                    oos_display.sort_values(sort_cols) if sort_cols else oos_display,
+                    use_container_width=True, hide_index=True,
+                )
 
     # ── FULL SCHEDULE TABLE ──────────────────────────────────────
     with st.expander("Full Schedule Table — " + str(selected_date)):
@@ -3772,13 +3792,15 @@ def main():
             # Out-of-Shift sidebar indicator
         
         if "out_of_shift" in support_df.columns:
-            oos_total = int(support_df["out_of_shift"].sum()) if support_df["out_of_shift"].notna().any() else 0
-            if oos_total > 0:
-                total_valid = int(support_df["out_of_shift"].notna().sum())
-                oos_pct_sb = round(oos_total / total_valid * 100, 1) if total_valid > 0 else 0
-                st.sidebar.markdown("---")
-                st.sidebar.metric("⏰ Out-of-Shift Interviews", oos_total)
-                st.sidebar.metric("OOS %", f"{oos_pct_sb}%")
+            oos_valid_sb = get_oos_valid_df(support_df, analytics_filter=True)
+            if not oos_valid_sb.empty:
+                oos_total = int(oos_valid_sb["out_of_shift"].sum())
+                if oos_total > 0:
+                    total_valid = len(oos_valid_sb)
+                    oos_pct_sb = round(oos_total / total_valid * 100, 1) if total_valid > 0 else 0
+                    st.sidebar.markdown("---")
+                    st.sidebar.metric("⏰ OOS (Completed, non-Self)", oos_total)
+                    st.sidebar.metric("OOS %", f"{oos_pct_sb}%")
 
 
     hist = hist_monthly_df(selected_support)
@@ -4010,10 +4032,34 @@ def main():
             st.markdown("---")
             render_blockage_summary(support_df, title_suffix=" - All Months", all_experts_df=all_interview_support_df)
             
-        # ── OUT-OF-SHIFT ANALYSIS — OVERALL ──────────────────────
+        # ──         # ── OUT-OF-SHIFT ANALYSIS ── SELECTED MONTH ────────────────
         if selected_support == "Interview Support" and "out_of_shift" in support_df.columns:
             st.markdown("---")
-            render_oos_section(support_df, title_suffix=" - All Months")
+            st.subheader("Out-of-Shift Analysis - Monthly")
+
+            support_df_oos = support_df.copy()
+            support_df_oos["_oos_month"] = support_df_oos["date"].dt.to_period("M").astype(str)
+            oos_months_avail = sorted(support_df_oos["_oos_month"].unique(), reverse=True)
+            current_m_oos = date.today().strftime("%Y-%m")
+            default_oos_idx = (oos_months_avail.index(current_m_oos)
+                                if current_m_oos in oos_months_avail else 0)
+            sel_oos_month = st.selectbox(
+                "Select Month for OOS Analysis",
+                oos_months_avail,
+                index=default_oos_idx,
+                key="oos_month_sel",
+            )
+
+            oos_month_data = support_df_oos[support_df_oos["_oos_month"] == sel_oos_month]
+            if not oos_month_data.empty:
+                render_oos_section(oos_month_data,
+                                    title_suffix=" - " + sel_oos_month)
+            else:
+                st.info("No data for " + sel_oos_month)
+
+            with st.expander("All Months OOS Trend"):
+                render_oos_section(support_df, title_suffix=" - All Months")
+
 
 
         # ── MONTHLY SENTIMENT TRENDS ─────────────────────────────
@@ -4922,7 +4968,7 @@ def main():
         render_schedule_view(all_case_df, active_expert_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v21.0 | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection")
+    st.sidebar.caption("Vizva Dashboard v22.0 | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection (Completed/non-Self)")
 
 
 # ═══════════════════════════════════════════════════════════════════
