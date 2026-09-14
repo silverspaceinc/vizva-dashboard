@@ -2023,11 +2023,6 @@ def daily_agg(idf):
 
 
 # ── EXCEL EXPORT — proper .xlsx with openpyxl ──────────────────────
-import openpyxl.cell.cell
-
-# Monkey-patch: disable openpyxl's illegal character check so we can
-# handle cleaning ourselves (belt-and-suspenders approach)
-openpyxl.cell.cell.ILLEGAL_CHARACTERS_RE = re.compile(r'$')  # matches nothing
 
 # Regex that catches ALL characters illegal in XML 1.0 (used by Excel)
 _ILLEGAL_XML_CHARS_RE = re.compile(
@@ -2048,26 +2043,30 @@ def _clean_cell_value(val):
             val = str(val)
     if not isinstance(val, str):
         return val
-    # Strip ALL illegal XML characters
     val = _ILLEGAL_XML_CHARS_RE.sub('', val)
-    # Truncate to Excel's max cell length
     if len(val) > _EXCEL_MAX_CELL_LEN:
         val = val[:_EXCEL_MAX_CELL_LEN - 60] + '... [TRUNCATED - original length: ' + str(len(val)) + ']'
     return val
 
 
 def to_excel_bytes(df):
-    """Convert a DataFrame to Excel (.xlsx) bytes.
-    Handles illegal XML characters and cells exceeding Excel's character limit.
-    Returns bytes suitable for st.download_button.
-    """
+    """Convert a DataFrame to Excel (.xlsx) bytes."""
+    # ── FORCE disable openpyxl's illegal character check ──
+    # This MUST happen here, right before writing, so it can't be
+    # overridden by any later import.
+    try:
+        import openpyxl.cell.cell as _opc
+        _opc.ILLEGAL_CHARACTERS_RE = re.compile(r'$')  # matches nothing
+    except Exception:
+        pass
+
     clean = df.copy()
 
-    # Clean EVERY column, not just object columns
+    # Clean EVERY column (not just object dtype)
     for col in clean.columns:
         clean[col] = clean[col].map(_clean_cell_value)
 
-    # Also clean column names themselves
+    # Also clean column names
     clean.columns = [_clean_cell_value(str(c)) for c in clean.columns]
 
     # Make datetimes timezone-unaware (openpyxl requirement)
@@ -2080,6 +2079,7 @@ def to_excel_bytes(df):
         clean.to_excel(writer, index=False, sheet_name="Data")
     buffer.seek(0)
     return buffer.getvalue()
+
 
 def kpi_row(data):
     c = st.columns(5)
