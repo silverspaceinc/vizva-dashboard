@@ -1062,6 +1062,10 @@ def detect_blockages(df, active_expert_count=None, all_experts_df=None):
 
     return result
 
+    result = pd.DataFrame(blockage_rows)
+    result["month"] = result["date"].dt.to_period("M").astype(str)
+    return result
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  TODAY'S BLOCKAGE INDICATOR
@@ -2022,60 +2026,16 @@ def daily_agg(idf):
     return pd.DataFrame(rows)
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  EXCEL EXPORT — proper .xlsx with openpyxl
-#  • Strips illegal XML control characters that crash openpyxl
-#  • Truncates any cell exceeding Excel's 32,767 character limit
-#  • Returns bytes ready for st.download_button
-# ═══════════════════════════════════════════════════════════════════
-
-# Regex that catches characters illegal in Excel/XML
-_ILLEGAL_XML_CHARS_RE = re.compile(
-    r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufeff\ufffe\uffff]'
-)
-
-# Excel hard limit per cell
-_EXCEL_MAX_CELL_LEN = 32767
-
-
-def _clean_cell_value(val):
-    """Sanitise a single cell value for Excel export."""
-    if not isinstance(val, str):
-        return val
-    # Strip illegal XML characters
-    val = _ILLEGAL_XML_CHARS_RE.sub('', val)
-    # Truncate to Excel's max cell length
-    if len(val) > _EXCEL_MAX_CELL_LEN:
-        val = val[:_EXCEL_MAX_CELL_LEN - 50] + '... [TRUNCATED — original length: ' + str(len(val)) + ']'
-    return val
-
-
 def to_excel_bytes(df):
-    """Convert a DataFrame to Excel (.xlsx) bytes.
-
-    Handles:
-      • Illegal XML control characters → stripped
-      • Cells > 32,767 chars → truncated with note
-      • datetime / Timestamp columns → timezone-unaware for openpyxl
-    Returns bytes suitable for st.download_button.
-    """
     clean = df.copy()
-
-    # ── Clean every object/string column ─────────────────────────
     for col in clean.columns:
-        if clean[col].dtype == object:
-            clean[col] = clean[col].map(_clean_cell_value)
-
-    # ── Make datetimes timezone-unaware (openpyxl requirement) ───
-    for col in clean.select_dtypes(include=["datetimetz"]).columns:
-        clean[col] = clean[col].dt.tz_localize(None)
-
-    # ── Write to in-memory Excel file ────────────────────────────
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        clean.to_excel(writer, index=False, sheet_name="Data")
-    buffer.seek(0)
-    return buffer.getvalue()
+        try:
+            clean[col] = clean[col].apply(
+                lambda x: re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufeff\ufffe\uffff]', '', str(x)) if isinstance(x, str) else x
+            )
+        except Exception:
+            pass
+    return clean.to_csv(index=False).encode("utf-8")
 
 
 def kpi_row(data):
@@ -3762,8 +3722,8 @@ def main():
         st.download_button(
             label="Download Raw Data",
             data=excel_data,
-            file_name="vizva_raw_data_" + date.today().strftime("%Y%m%d") + ".xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            file_name="vizva_raw_data_" + date.today().strftime("%Y%m%d") + ".csv",
+            mime="text/csv"
         )
 
     st.sidebar.header("Support Type")
