@@ -2022,17 +2022,10 @@ def daily_agg(idf):
     return pd.DataFrame(rows)
 
 
-# ── EXCEL EXPORT — proper .xlsx with openpyxl ──────────────────────
-
-# Regex that catches ALL characters illegal in XML 1.0 (used by Excel)
-_ILLEGAL_XML_CHARS_RE = re.compile(
-    r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f'
-    r'\ud800-\udfff\ufdd0-\ufddf\ufffe\uffff]'
-)
+# ── EXCEL EXPORT — proper .xlsx with xlsxwriter (no IllegalCharacterError) ───
 
 # Excel hard limit per cell
 _EXCEL_MAX_CELL_LEN = 32767
-
 
 def _clean_cell_value(val):
     """Sanitise a single cell value for Excel export."""
@@ -2043,42 +2036,34 @@ def _clean_cell_value(val):
             val = str(val)
     if not isinstance(val, str):
         return val
-    val = _ILLEGAL_XML_CHARS_RE.sub('', val)
+    # Truncate to Excel's max cell length
     if len(val) > _EXCEL_MAX_CELL_LEN:
         val = val[:_EXCEL_MAX_CELL_LEN - 60] + '... [TRUNCATED - original length: ' + str(len(val)) + ']'
     return val
 
 
 def to_excel_bytes(df):
-    """Convert a DataFrame to Excel (.xlsx) bytes."""
-    # ── FORCE disable openpyxl's illegal character check ──
-    # This MUST happen here, right before writing, so it can't be
-    # overridden by any later import.
-    try:
-        import openpyxl.cell.cell as _opc
-        _opc.ILLEGAL_CHARACTERS_RE = re.compile(r'$')  # matches nothing
-    except Exception:
-        pass
-
+    """Convert a DataFrame to Excel (.xlsx) bytes using xlsxwriter.
+    xlsxwriter silently strips illegal XML characters — no more
+    IllegalCharacterError.
+    """
     clean = df.copy()
 
-    # Clean EVERY column (not just object dtype)
+    # Clean every column for cell length limits
     for col in clean.columns:
-        clean[col] = clean[col].map(_clean_cell_value)
+        if clean[col].dtype == object:
+            clean[col] = clean[col].map(_clean_cell_value)
 
-    # Also clean column names
-    clean.columns = [_clean_cell_value(str(c)) for c in clean.columns]
-
-    # Make datetimes timezone-unaware (openpyxl requirement)
+    # Make datetimes timezone-unaware
     for col in clean.select_dtypes(include=["datetimetz"]).columns:
         clean[col] = clean[col].dt.tz_localize(None)
 
-    # Write to in-memory Excel file
     buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         clean.to_excel(writer, index=False, sheet_name="Data")
     buffer.seek(0)
     return buffer.getvalue()
+
 
 
 def kpi_row(data):
