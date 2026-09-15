@@ -2507,6 +2507,28 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
         legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
         hovermode="closest",
     )
+
+    # ── Current-time marker line (only on today) ─────────────
+    EDT = timezone(timedelta(hours=-4))
+    now_edt = datetime.now(EDT)
+    
+    if selected_date == now_edt.date():
+        now_marker = datetime.combine(
+            selected_date,
+            now_edt.time()
+        ).replace(second=0, microsecond=0)
+    
+        fig.add_vline(
+            x=now_marker,
+            line_width=2,
+            line_dash="dash",
+            line_color="#FF00FF",
+            annotation_text="Now",
+            annotation_position="top",
+            annotation_font_size=12,
+            annotation_font_color="#FF00FF",
+        )
+
     st.plotly_chart(fig, use_container_width=True)
 
 def render_schedule_view(all_data, active_expert_df):
