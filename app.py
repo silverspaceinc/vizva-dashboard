@@ -2510,15 +2510,18 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
         hovermode="closest",
     )
 
-    # ── Current-time marker line (only on today) ─────────────
+    # -- Current-time marker line (only on today) -------------
     EDT = timezone(timedelta(hours=-4))
     now_edt = datetime.now(EDT)
     
     if selected_date == now_edt.date():
-        now_marker = datetime.combine(
-            selected_date,
-            now_edt.time()
-        ).replace(second=0, microsecond=0)
+        # Build marker using the SAME reference date (2000-01-01) as the chart
+        now_marker = ref.replace(
+            hour=now_edt.hour,
+            minute=now_edt.minute,
+            second=0,
+            microsecond=0,
+        )
     
         fig.add_vline(
             x=now_marker,
@@ -2530,6 +2533,7 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
             annotation_font_size=12,
             annotation_font_color="#FF00FF",
         )
+
 
     st.plotly_chart(fig, use_container_width=True)
 
