@@ -5031,6 +5031,10 @@ def main():
 # AUTHENTICATION LAYER
 # ═══════════════════════════════════════════════════════════════════
 
+# Session timeout in seconds (8 hours)
+_SESSION_TIMEOUT = 8 * 3600
+
+
 def login():
     st.title("Vizva Secure Login")
     username = st.text_input("Username")
@@ -5042,27 +5046,43 @@ def login():
             valid_pass = st.secrets["VIZVA_PASSWORD"]
         except KeyError:
             st.error("Login secrets (VIZVA_USERNAME / VIZVA_PASSWORD) not configured. "
-         "Please add them to your Streamlit secrets.")
-
+                     "Please add them to your Streamlit secrets.")
             return
 
         if username.strip() == valid_user.strip() and password == valid_pass:
             st.session_state["authenticated"] = True
-            st.session_state["login_time"] = datetime.now()
+            st.session_state["last_activity"] = datetime.now()
             st.rerun()
         else:
             st.error("Invalid credentials")
 
 
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
+def _check_session():
+    """Return True if user is authenticated and session is still valid."""
+    if not st.session_state.get("authenticated", False):
+        return False
 
-if st.session_state["authenticated"]:
-    if "login_time" in st.session_state:
-        delta = datetime.now() - st.session_state["login_time"]
-        if delta.total_seconds() > 3600:
-            st.session_state["authenticated"] = False
-            st.rerun()
+    last = st.session_state.get("last_activity")
+    if last is None:
+        # Authenticated but no timestamp — set it now (handles legacy sessions)
+        st.session_state["last_activity"] = datetime.now()
+        return True
+
+    elapsed = (datetime.now() - last).total_seconds()
+    if elapsed > _SESSION_TIMEOUT:
+        # Session expired — clear auth but do NOT call st.rerun() here
+        st.session_state["authenticated"] = False
+        st.session_state.pop("last_activity", None)
+        return False
+
+    # Session is valid — refresh the activity timestamp so active users
+    # never get logged out mid-use
+    st.session_state["last_activity"] = datetime.now()
+    return True
+
+
+if _check_session():
     main()
 else:
     login()
+
