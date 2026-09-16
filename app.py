@@ -3735,6 +3735,9 @@ def render_assessment_conversion_charts(conv_df, title_suffix=""):
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
+    auto = st.sidebar.checkbox("Auto-refresh every 2 min", value=True)
+    if auto:
+        st_autorefresh(interval=2 * 60 * 1000, key="data_autorefresh")
     title_col, dl_col = st.columns([4, 1])
     with title_col:
         st.title("Vizva Interview Dashboard")
