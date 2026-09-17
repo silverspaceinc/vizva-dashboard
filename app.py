@@ -2757,6 +2757,103 @@ def resolve_clashes(sched, all_expert_names):
     return resolved
 
 
+
+# ═════════════════════════════════════════════════════════════════
+#  10-MINUTE GAP POLICY  (2nd priority)
+#  Every expert must have at least GAP_MINUTES between two interviews.
+#  Where possible, gap-violating interviews are moved to another
+#  expert that has room WITH the buffer. If all experts are busy,
+#  the interview stays where it is (marked gap_violation=True).
+# ═════════════════════════════════════════════════════════════════
+
+GAP_MINUTES = 10
+
+
+def _is_expert_free_with_gap(busy_intervals, start_min, end_min, min_gap=GAP_MINUTES):
+    """True if [start_min, end_min) fits on the expert with a min_gap-minute
+    buffer on BOTH sides (no interview ending <10 min before start,
+    no interview starting <10 min after end)."""
+    for bs, be in busy_intervals:
+        if start_min < be + min_gap and bs < end_min + min_gap:
+            return False
+    return True
+
+
+def _try_relocate_with_gap(resolved, idx, current_expert, candidate_experts, min_gap):
+    """Try to move the interview at `idx` to another expert that can host it
+    while respecting the min_gap buffer on both sides. Returns True if moved."""
+    s = resolved.loc[idx, "start_min"]
+    e = resolved.loc[idx, "end_min"]
+    for alt in candidate_experts:
+        if alt == current_expert:
+            continue
+        busy = _get_expert_busy_intervals(resolved, alt)
+        if _is_expert_free_with_gap(busy, s, e, min_gap):
+            resolved.loc[idx, "expert_name"] = alt
+            resolved.loc[idx, "resolution_action"] = "gap_reassigned"
+            resolved.loc[idx, "gap_violation"] = False
+            return True
+    return False
+
+
+def enforce_gap_policy(resolved, all_expert_names, min_gap=GAP_MINUTES):
+    """SECOND-PRIORITY RULE - call AFTER resolve_clashes().
+
+    For each expert, every pair of consecutive interviews must be at least
+    `min_gap` minutes apart. If a pair is too close (or overlapping):
+      1. try to move the LATER interview to another expert that has room
+         WITH the buffer respected;
+      2. if that fails, try to move the EARLIER interview;
+      3. if every expert is busy, leave it as-is (no issue, just marked).
+    Iterates until the schedule is stable. Returns the updated DataFrame
+    with an extra column `gap_violation` (True = still violates the
+    10-minute rule because no expert was free). Moved interviews get
+    resolution_action = "gap_reassigned".
+    """
+    resolved = resolved.copy()
+    resolved["gap_violation"] = False
+
+    EXCLUDE = {"hcr", "self"}
+    candidate_experts = [
+        e for e in all_expert_names if e.strip().lower() not in EXCLUDE
+    ]
+
+    for _ in range(max(2, len(resolved))):
+        changed = False
+        for expert in candidate_experts:
+            mask = resolved["expert_name"] == expert
+            idxs = resolved.loc[mask].sort_values("start_min").index.tolist()
+            for a in range(len(idxs) - 1):
+                i1, i2 = idxs[a], idxs[a + 1]
+                e1 = resolved.loc[i1, "end_min"]
+                s2 = resolved.loc[i2, "start_min"]
+                if s2 - e1 >= min_gap:
+                    continue  # already fine
+                if _try_relocate_with_gap(resolved, i2, expert, candidate_experts, min_gap):
+                    changed = True
+                    continue
+                if _try_relocate_with_gap(resolved, i1, expert, candidate_experts, min_gap):
+                    changed = True
+                    continue
+                resolved.loc[i1, "gap_violation"] = True
+                resolved.loc[i2, "gap_violation"] = True
+        if not changed:
+            break
+
+    # Final clean recompute of gap_violation
+    resolved["gap_violation"] = False
+    for expert in candidate_experts:
+        mask = resolved["expert_name"] == expert
+        idxs = resolved.loc[mask].sort_values("start_min").index.tolist()
+        for a in range(len(idxs) - 1):
+            i1, i2 = idxs[a], idxs[a + 1]
+            if (resolved.loc[i2, "start_min"] - resolved.loc[i1, "end_min"]) < min_gap:
+                resolved.loc[i1, "gap_violation"] = True
+                resolved.loc[i2, "gap_violation"] = True
+    return resolved
+
+
+
 def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
     """Gantt chart for the resolved schedule.
 
@@ -2801,7 +2898,7 @@ def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
             action = row.get("resolution_action", "kept")
             original = row.get("original_expert", expert)
 
-            if action == "reassigned":
+            if action in ("reassigned", "gap_reassigned"):
                 bar_color = REASSIGNED_COLOR
                 line_dict = dict(color="#27ae60", width=3)
             elif action == "unresolved":
@@ -2814,6 +2911,8 @@ def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
             reassign_tag = ""
             if action == "reassigned":
                 reassign_tag = "<br><b>↪ Reassigned from " + str(original) + "</b>"
+            elif action == "gap_reassigned":
+                reassign_tag = "<br><b>🕐 Gap-moved (10-min rule) from " + str(original) + "</b>"
             elif action == "unresolved":
                 reassign_tag = "<br><b>⚠️ UNRESOLVED — no free expert</b>"
 
@@ -2911,16 +3010,18 @@ def render_resolution_summary(resolved, selected_date):
     retained = int((resolved["resolution_action"] == "retained").sum())
     reassigned = int((resolved["resolution_action"] == "reassigned").sum())
     unresolved = int((resolved["resolution_action"] == "unresolved").sum())
+    gap_moved = int((resolved["resolution_action"] == "gap_reassigned").sum())
 
-    k = st.columns(5)
+    k = st.columns(6)
     k[0].metric("Total Interviews", total)
     k[1].metric("No Change", kept)
     k[2].metric("Retained (1st in clash)", retained)
     k[3].metric("✅ Reassigned", reassigned)
-    k[4].metric("❌ Unresolved", unresolved)
+    k[4].metric("🕐 Gap-Moved (10-min)", gap_moved)
+    k[5].metric("❌ Unresolved", unresolved)
 
     # ── Reassignment details ─────────────────────────────────────
-    reassigned_df = resolved[resolved["resolution_action"] == "reassigned"]
+    reassigned_df = resolved[resolved["resolution_action"].isin(["reassigned", "gap_reassigned"])]
     if not reassigned_df.empty:
         st.markdown("##### ✅ Reassigned Interviews")
         ra_display = reassigned_df[[
@@ -3046,17 +3147,21 @@ def render_schedule_view(all_data, active_expert_df):
     # ═════════════════════════════════════════════════════════════
     #  🧠 INTELLIGENT CLASH RESOLUTION
     # ═════════════════════════════════════════════════════════════
-    if clash_count > 0:
+    if True:  # optimizer always runs: clash fix (priority 1) + 10-min gap rule (priority 2)
         st.markdown("---")
         st.header("🧠 Intelligent Clash Resolution")
         st.caption(
-            "When an expert has overlapping interviews, the system keeps the "
-            "first interview and attempts to reassign the rest to the next "
-            "available expert. Interviews that cannot be reassigned (all "
-            "experts busy) are highlighted in red."
+            "Priority 1 - Clashes: when an expert has overlapping interviews, "
+            "the system keeps the first and reassigns the rest to the next "
+            "available expert. Priority 2 - 10-minute rule: every interview "
+            "must have at least 10 minutes of gap around it; where possible "
+            "it is moved to another expert that has room (teal bars = moved). "
+            "Interviews that could not be fixed (all experts busy) are "
+            "highlighted in red."
         )
 
         resolved = resolve_clashes(sched, all_expert_names)
+        resolved = enforce_gap_policy(resolved, all_expert_names)
 
         # ── Resolution Summary KPIs & Tables ─────────────────────
         render_resolution_summary(resolved, selected_date)
