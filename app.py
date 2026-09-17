@@ -2608,9 +2608,12 @@ def render_availability_summary(sched, selected_date, all_expert_names=None):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  INTELLIGENT CLASH RESOLUTION
-#  When an expert has multiple overlapping interviews, keep the first
-#  and try to reassign the rest to free experts.
+#  INTELLIGENT CLASH RESOLUTION  (3 priorities)
+#  1. Clashes: split overlapping interviews across experts.
+#  2. Round preference: Technical Coding / Final Round stay with
+#     their original expert wherever possible.
+#  3. 10-minute gap rule: at least 10 min between an expert's interviews.
+#  Self / HCR experts and interviews are never touched.
 # ═══════════════════════════════════════════════════════════════════
 
 def _get_expert_busy_intervals(sched, expert_name):
@@ -2640,16 +2643,62 @@ def _is_expert_free(busy_intervals, start_min, end_min):
     return True
 
 
+def is_protected_round(round_name):
+    """True if this interview round should prefer to stay with its original
+    expert: Technical Coding or Final Round (case-insensitive match on the
+    round_name text)."""
+    if round_name is None:
+        return False
+    try:
+        r = str(round_name).strip().lower()
+    except Exception:
+        return False
+    return "coding" in r or "final" in r
+
+
+def _pick_interviews_to_keep(resolved, group_idxs):
+    """Greedily pick the interviews of a clash group that stay with the
+    original expert. Protected rounds (Technical Coding / Final Round) get
+    first claim; among the same priority, the classic end-time greedy keeps
+    the maximum number of non-overlapping interviews."""
+    protected = [i for i in group_idxs
+                 if is_protected_round(resolved.loc[i, "round_name"])]
+    normal = [i for i in group_idxs
+              if not is_protected_round(resolved.loc[i, "round_name"])]
+
+    keep = []
+
+    def _try_keep(idx):
+        s = resolved.loc[idx, "start_min"]
+        e = resolved.loc[idx, "end_min"]
+        for k in keep:
+            ks = resolved.loc[k, "start_min"]
+            ke = resolved.loc[k, "end_min"]
+            if s < ke and ks < e:
+                return False
+        keep.append(idx)
+        return True
+
+    for idx in sorted(protected,
+                      key=lambda i: (resolved.loc[i, "end_min"], resolved.loc[i, "start_min"])):
+        _try_keep(idx)
+    for idx in sorted(normal,
+                      key=lambda i: (resolved.loc[i, "end_min"], resolved.loc[i, "start_min"])):
+        _try_keep(idx)
+    return keep
+
+
 def resolve_clashes(sched, all_expert_names):
     """Intelligently resolve clashing interviews.
 
-    Algorithm (per expert with clashes):
-      1. Sort the expert's interviews by start_min.
-      2. The FIRST interview in each time-overlap group stays with the
-         original expert.
-      3. Every subsequent overlapping interview is offered — in order —
-         to each other expert who is FREE during that window.  The first
-         free expert gets the assignment.
+    Priorities:
+      1. "Self" / "HCR" experts and their interviews are NEVER touched
+         (never moved, never marked, never used as targets).
+      2. Protected rounds (Technical Coding / Final Round) get first
+         claim to stay with their original expert.
+      3. Remaining clashing interviews are offered - in order - to each
+         other expert who is FREE during that window.  The first free
+         expert gets the assignment.
       4. If no expert is free, mark the interview as "unresolved".
 
     Returns
@@ -2658,10 +2707,10 @@ def resolve_clashes(sched, all_expert_names):
         Copy of *sched* with two extra columns:
         - ``original_expert``  : the expert before resolution
         - ``resolution_action``: one of
-            "kept"       – no clash, stays as-is
-            "retained"   – was in a clash group but kept as first
-            "reassigned" – moved to a different expert
-            "unresolved" – no free expert found (highlighted)
+            "kept"       - no clash, stays as-is
+            "retained"   - kept with the original expert
+            "reassigned" - moved to a different expert
+            "unresolved" - no free expert found (highlighted)
     """
     resolved = sched.copy()
     resolved["original_expert"] = resolved["expert_name"]
@@ -2674,8 +2723,11 @@ def resolve_clashes(sched, all_expert_names):
         if e.strip().lower() not in EXCLUDE
     ]
 
-    # Identify experts with clashes
-    clash_experts = resolved.loc[resolved["has_clash"], "expert_name"].unique()
+    # Only real experts are processed - Self / HCR interviews stay untouched
+    clash_experts = [
+        e for e in resolved.loc[resolved["has_clash"], "expert_name"].unique()
+        if str(e).strip().lower() not in EXCLUDE
+    ]
 
     for expert in clash_experts:
         expert_mask = resolved["expert_name"] == expert
@@ -2712,12 +2764,17 @@ def resolve_clashes(sched, all_expert_names):
                 overlap_groups.append(group)
 
         for group_idxs in overlap_groups:
-            # Sort by start time; first one stays
-            sorted_idxs = sorted(group_idxs,
-                                  key=lambda i: resolved.loc[i, "start_min"])
-            resolved.loc[sorted_idxs[0], "resolution_action"] = "retained"
+            # Protected rounds (Technical Coding / Final Round) stay first
+            keep_idxs = _pick_interviews_to_keep(resolved, group_idxs)
+            for idx in keep_idxs:
+                resolved.loc[idx, "resolution_action"] = "retained"
 
-            for idx in sorted_idxs[1:]:
+            # Every interview that could not stay is offered to other experts
+            movers = sorted(
+                (i for i in group_idxs if i not in keep_idxs),
+                key=lambda i: resolved.loc[i, "start_min"],
+            )
+            for idx in movers:
                 s = resolved.loc[idx, "start_min"]
                 e = resolved.loc[idx, "end_min"]
 
@@ -2759,7 +2816,7 @@ def resolve_clashes(sched, all_expert_names):
 
 
 # ═════════════════════════════════════════════════════════════════
-#  10-MINUTE GAP POLICY  (2nd priority)
+#  10-MINUTE GAP POLICY  (3rd priority)
 #  Every expert must have at least GAP_MINUTES between two interviews.
 #  Where possible, gap-violating interviews are moved to another
 #  expert that has room WITH the buffer. If all experts are busy,
@@ -2797,13 +2854,14 @@ def _try_relocate_with_gap(resolved, idx, current_expert, candidate_experts, min
 
 
 def enforce_gap_policy(resolved, all_expert_names, min_gap=GAP_MINUTES):
-    """SECOND-PRIORITY RULE - call AFTER resolve_clashes().
+    """THIRD-PRIORITY RULE - call AFTER resolve_clashes().
 
     For each expert, every pair of consecutive interviews must be at least
     `min_gap` minutes apart. If a pair is too close (or overlapping):
-      1. try to move the LATER interview to another expert that has room
-         WITH the buffer respected;
-      2. if that fails, try to move the EARLIER interview;
+      1. try to move the NON-protected interview of the pair first, so
+         Technical Coding / Final Round prefer to stay with their expert;
+      2. try to move the other interview of the pair to another expert
+         that has room WITH the buffer respected;
       3. if every expert is busy, leave it as-is (no issue, just marked).
     Iterates until the schedule is stable. Returns the updated DataFrame
     with an extra column `gap_violation` (True = still violates the
@@ -2829,10 +2887,23 @@ def enforce_gap_policy(resolved, all_expert_names, min_gap=GAP_MINUTES):
                 s2 = resolved.loc[i2, "start_min"]
                 if s2 - e1 >= min_gap:
                     continue  # already fine
-                if _try_relocate_with_gap(resolved, i2, expert, candidate_experts, min_gap):
-                    changed = True
-                    continue
-                if _try_relocate_with_gap(resolved, i1, expert, candidate_experts, min_gap):
+                # Try to move the non-protected interview first so protected
+                # rounds (Technical Coding / Final Round) prefer to stay
+                # with their original expert.
+                p1 = is_protected_round(resolved.loc[i1, "round_name"])
+                p2 = is_protected_round(resolved.loc[i2, "round_name"])
+                if p1 == p2:
+                    order = [i2, i1]
+                elif p2:
+                    order = [i1, i2]
+                else:
+                    order = [i2, i1]
+                moved = False
+                for idx in order:
+                    if _try_relocate_with_gap(resolved, idx, expert, candidate_experts, min_gap):
+                        moved = True
+                        break
+                if moved:
                     changed = True
                     continue
                 resolved.loc[i1, "gap_violation"] = True
@@ -2857,6 +2928,7 @@ def enforce_gap_policy(resolved, all_expert_names, min_gap=GAP_MINUTES):
 def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
     """Gantt chart for the resolved schedule.
 
+    "Self" interviews are untouched and never shown here.
     Colour scheme by resolution_action:
       kept / retained → original status colour
       reassigned      → teal (#1abc9c) + dashed green border
@@ -2870,11 +2942,18 @@ def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
     resolved["end_dt"] = resolved["end_min"].apply(
         lambda m: ref + timedelta(minutes=int(m)))
 
+    # Self interviews are untouched - never shown in the resolved Gantt
+    resolved = resolved[
+        ~resolved["expert_name"].astype(str).str.strip().str.lower().eq("self")
+    ]
+
     experts_with = (resolved.groupby("expert_name")["start_min"]
                     .min().sort_values().index.tolist())
 
     if all_expert_names:
-        extras = [e for e in all_expert_names if e not in experts_with]
+        extras = [e for e in all_expert_names
+                  if e not in experts_with
+                  and str(e).strip().lower() != "self"]
         expert_order = experts_with + sorted(extras)
     else:
         expert_order = experts_with
@@ -3005,6 +3084,10 @@ def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
 
 def render_resolution_summary(resolved, selected_date):
     """Show KPIs and tables summarizing what the resolver did."""
+    # Self interviews are untouched - exclude them from resolution stats
+    resolved = resolved[
+        ~resolved["expert_name"].astype(str).str.strip().str.lower().eq("self")
+    ]
     total = len(resolved)
     kept = int((resolved["resolution_action"] == "kept").sum())
     retained = int((resolved["resolution_action"] == "retained").sum())
@@ -3015,7 +3098,7 @@ def render_resolution_summary(resolved, selected_date):
     k = st.columns(6)
     k[0].metric("Total Interviews", total)
     k[1].metric("No Change", kept)
-    k[2].metric("Retained (1st in clash)", retained)
+    k[2].metric("Retained (original expert)", retained)
     k[3].metric("✅ Reassigned", reassigned)
     k[4].metric("🕐 Gap-Moved (10-min)", gap_moved)
     k[5].metric("❌ Unresolved", unresolved)
@@ -3147,17 +3230,18 @@ def render_schedule_view(all_data, active_expert_df):
     # ═════════════════════════════════════════════════════════════
     #  🧠 INTELLIGENT CLASH RESOLUTION
     # ═════════════════════════════════════════════════════════════
-    if True:  # optimizer always runs: clash fix (priority 1) + 10-min gap rule (priority 2)
+    if True:  # optimizer always runs: clash (1) + round preference (2) + 10-min gap (3)
         st.markdown("---")
         st.header("🧠 Intelligent Clash Resolution")
         st.caption(
-            "Priority 1 - Clashes: when an expert has overlapping interviews, "
-            "the system keeps the first and reassigns the rest to the next "
-            "available expert. Priority 2 - 10-minute rule: every interview "
-            "must have at least 10 minutes of gap around it; where possible "
-            "it is moved to another expert that has room (teal bars = moved). "
-            "Interviews that could not be fixed (all experts busy) are "
-            "highlighted in red."
+            "Priority 1 - Clashes: overlapping interviews are split across "
+            "experts. Priority 2 - Round preference: Technical Coding and "
+            "Final Round interviews stay with their original expert wherever "
+            "possible. Priority 3 - 10-minute rule: every interview must have "
+            "at least 10 minutes of gap around it; where possible it is moved "
+            "to another expert that has room (teal bars = moved). Interviews "
+            "that could not be fixed (all experts busy) are highlighted in "
+            "red. Self interviews/experts are never touched or shown here."
         )
 
         resolved = resolve_clashes(sched, all_expert_names)
