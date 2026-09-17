@@ -2539,6 +2539,440 @@ def render_schedule_gantt(sched, selected_date, all_expert_names=None):
 
     st.plotly_chart(fig, use_container_width=True)
 
+
+# ── AVAILABILITY SUMMARY ─────────────────────────────────────
+def render_availability_summary(sched, selected_date, all_expert_names=None):
+    """Show expert availability — free slots between interviews."""
+    st.subheader("Expert Availability — " + str(selected_date) + " (EDT)")
+    st.caption("Free gaps between scheduled interviews (working hours: 8 AM – 10 PM EDT)")
+
+    work_start = 8 * 60
+    work_end = 22 * 60
+
+    avail_rows = []
+
+    if not sched.empty:
+        for expert, grp in sched.groupby("expert_name"):
+            intervals = sorted(zip(grp["start_min"], grp["end_min"]))
+            merged = [intervals[0]]
+            for s, e in intervals[1:]:
+                if s <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                else:
+                    merged.append((s, e))
+
+            free_slots = []
+            prev_end = work_start
+            for s, e in merged:
+                gap_start = max(prev_end, work_start)
+                gap_end = min(s, work_end)
+                if gap_end > gap_start and (gap_end - gap_start) >= 15:
+                    free_slots.append(_minutes_to_label(gap_start) + " – " + _minutes_to_label(gap_end) +
+                                      " (" + str(int(gap_end - gap_start)) + " min)")
+                prev_end = max(prev_end, e)
+
+            if prev_end < work_end and (work_end - prev_end) >= 15:
+                free_slots.append(_minutes_to_label(prev_end) + " – " + _minutes_to_label(work_end) +
+                                  " (" + str(int(work_end - prev_end)) + " min)")
+
+            total_busy = sum(e - s for s, e in merged)
+            total_interviews = len(grp)
+            has_clash = grp["has_clash"].any()
+
+            avail_rows.append({
+                "Expert": expert,
+                "Interviews": total_interviews,
+                "Busy Time": str(int(total_busy)) + " min",
+                "Clashes": "⚠️ Yes" if has_clash else "No",
+                "Free Slots": " | ".join(free_slots) if free_slots else "No free slots",
+            })
+
+    if all_expert_names:
+        experts_in_sched = set(sched["expert_name"].unique()) if not sched.empty else set()
+        for expert in sorted(all_expert_names):
+            if expert not in experts_in_sched:
+                avail_rows.append({
+                    "Expert": expert,
+                    "Interviews": 0,
+                    "Busy Time": "0 min",
+                    "Clashes": "No",
+                    "Free Slots": "Fully available (8:00 AM – 10:00 PM EDT)",
+                })
+
+    if not avail_rows:
+        st.info("No expert data available.")
+        return
+
+    avail_df = pd.DataFrame(avail_rows).sort_values("Interviews", ascending=False)
+    st.dataframe(avail_df, use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  INTELLIGENT CLASH RESOLUTION
+#  When an expert has multiple overlapping interviews, keep the first
+#  and try to reassign the rest to free experts.
+# ═══════════════════════════════════════════════════════════════════
+
+def _get_expert_busy_intervals(sched, expert_name):
+    """Return sorted list of (start_min, end_min) merged busy intervals
+    for a given expert from the schedule DataFrame."""
+    if sched.empty:
+        return []
+    grp = sched[sched["expert_name"] == expert_name]
+    if grp.empty:
+        return []
+    intervals = sorted(zip(grp["start_min"].values, grp["end_min"].values))
+    merged = [intervals[0]]
+    for s, e in intervals[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _is_expert_free(busy_intervals, start_min, end_min):
+    """Return True if the expert has no overlapping busy interval
+    for the window [start_min, end_min)."""
+    for bs, be in busy_intervals:
+        if start_min < be and bs < end_min:
+            return False
+    return True
+
+
+def resolve_clashes(sched, all_expert_names):
+    """Intelligently resolve clashing interviews.
+
+    Algorithm (per expert with clashes):
+      1. Sort the expert's interviews by start_min.
+      2. The FIRST interview in each time-overlap group stays with the
+         original expert.
+      3. Every subsequent overlapping interview is offered — in order —
+         to each other expert who is FREE during that window.  The first
+         free expert gets the assignment.
+      4. If no expert is free, mark the interview as "unresolved".
+
+    Returns
+    -------
+    resolved : pd.DataFrame
+        Copy of *sched* with two extra columns:
+        - ``original_expert``  : the expert before resolution
+        - ``resolution_action``: one of
+            "kept"       – no clash, stays as-is
+            "retained"   – was in a clash group but kept as first
+            "reassigned" – moved to a different expert
+            "unresolved" – no free expert found (highlighted)
+    """
+    resolved = sched.copy()
+    resolved["original_expert"] = resolved["expert_name"]
+    resolved["resolution_action"] = "kept"
+
+    # Experts that can accept interviews (exclude HCR, Self)
+    EXCLUDE = {"hcr", "self"}
+    candidate_experts = [
+        e for e in all_expert_names
+        if e.strip().lower() not in EXCLUDE
+    ]
+
+    # Identify experts with clashes
+    clash_experts = resolved.loc[resolved["has_clash"], "expert_name"].unique()
+
+    for expert in clash_experts:
+        expert_mask = resolved["expert_name"] == expert
+        expert_rows = resolved.loc[expert_mask].sort_values("start_min")
+
+        if len(expert_rows) < 2:
+            continue
+
+        # Build overlap groups for this expert (connected components)
+        idxs = expert_rows.index.tolist()
+        visited = set()
+        overlap_groups = []
+
+        for i, idx_a in enumerate(idxs):
+            if idx_a in visited:
+                continue
+            group = [idx_a]
+            visited.add(idx_a)
+            queue = [idx_a]
+            while queue:
+                cur = queue.pop(0)
+                s1 = resolved.loc[cur, "start_min"]
+                e1 = resolved.loc[cur, "end_min"]
+                for idx_b in idxs:
+                    if idx_b in visited:
+                        continue
+                    s2 = resolved.loc[idx_b, "start_min"]
+                    e2 = resolved.loc[idx_b, "end_min"]
+                    if s1 < e2 and s2 < e1:
+                        group.append(idx_b)
+                        visited.add(idx_b)
+                        queue.append(idx_b)
+            if len(group) >= 2:
+                overlap_groups.append(group)
+
+        for group_idxs in overlap_groups:
+            # Sort by start time; first one stays
+            sorted_idxs = sorted(group_idxs,
+                                  key=lambda i: resolved.loc[i, "start_min"])
+            resolved.loc[sorted_idxs[0], "resolution_action"] = "retained"
+
+            for idx in sorted_idxs[1:]:
+                s = resolved.loc[idx, "start_min"]
+                e = resolved.loc[idx, "end_min"]
+
+                assigned = False
+                for alt_expert in candidate_experts:
+                    if alt_expert == expert:
+                        continue
+                    # Build current busy intervals for alt_expert
+                    # (use the *resolved* DataFrame so earlier reassignments
+                    #  are taken into account)
+                    busy = _get_expert_busy_intervals(resolved, alt_expert)
+                    if _is_expert_free(busy, s, e):
+                        resolved.loc[idx, "expert_name"] = alt_expert
+                        resolved.loc[idx, "resolution_action"] = "reassigned"
+                        assigned = True
+                        break
+
+                if not assigned:
+                    resolved.loc[idx, "resolution_action"] = "unresolved"
+
+    # Re-compute has_clash on the resolved schedule
+    resolved["has_clash"] = False
+    for exp, grp in resolved.groupby("expert_name"):
+        if len(grp) < 2:
+            continue
+        grp_idxs = grp.index.tolist()
+        for a in range(len(grp_idxs)):
+            for b in range(a + 1, len(grp_idxs)):
+                s1 = resolved.loc[grp_idxs[a], "start_min"]
+                e1 = resolved.loc[grp_idxs[a], "end_min"]
+                s2 = resolved.loc[grp_idxs[b], "start_min"]
+                e2 = resolved.loc[grp_idxs[b], "end_min"]
+                if s1 < e2 and s2 < e1:
+                    resolved.loc[grp_idxs[a], "has_clash"] = True
+                    resolved.loc[grp_idxs[b], "has_clash"] = True
+
+    return resolved
+
+
+def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
+    """Gantt chart for the resolved schedule.
+
+    Colour scheme by resolution_action:
+      kept / retained → original status colour
+      reassigned      → teal (#1abc9c) + dashed green border
+      unresolved      → dark red (#c0392b) + thick red border
+    """
+
+    ref = datetime(2000, 1, 1)
+    resolved = resolved.copy()
+    resolved["start_dt"] = resolved["start_min"].apply(
+        lambda m: ref + timedelta(minutes=int(m)))
+    resolved["end_dt"] = resolved["end_min"].apply(
+        lambda m: ref + timedelta(minutes=int(m)))
+
+    experts_with = (resolved.groupby("expert_name")["start_min"]
+                    .min().sort_values().index.tolist())
+
+    if all_expert_names:
+        extras = [e for e in all_expert_names if e not in experts_with]
+        expert_order = experts_with + sorted(extras)
+    else:
+        expert_order = experts_with
+
+    if not expert_order:
+        st.info("No experts found for resolved view.")
+        return
+
+    status_colors = {
+        "completed": "#2ecc71", "rescheduled": "#f39c12",
+        "cancelled": "#e74c3c", "pending": "#3498db",
+    }
+    REASSIGNED_COLOR = "#1abc9c"
+    UNRESOLVED_COLOR = "#c0392b"
+
+    fig = go.Figure()
+
+    for expert in experts_with:
+        expert_df = resolved[resolved["expert_name"] == expert].sort_values("start_min")
+        for _, row in expert_df.iterrows():
+            action = row.get("resolution_action", "kept")
+            original = row.get("original_expert", expert)
+
+            if action == "reassigned":
+                bar_color = REASSIGNED_COLOR
+                line_dict = dict(color="#27ae60", width=3)
+            elif action == "unresolved":
+                bar_color = UNRESOLVED_COLOR
+                line_dict = dict(color="#ff0000", width=4)
+            else:
+                bar_color = status_colors.get(row["task_status"], "#95a5a6")
+                line_dict = dict(color="white", width=1)
+
+            reassign_tag = ""
+            if action == "reassigned":
+                reassign_tag = "<br><b>↪ Reassigned from " + str(original) + "</b>"
+            elif action == "unresolved":
+                reassign_tag = "<br><b>⚠️ UNRESOLVED — no free expert</b>"
+
+            hover = (
+                "<b>" + str(row.get("candidate_name", "") or "") + "</b><br>"
+                + "Company: " + str(row.get("company_name", "") or "") + "<br>"
+                + "Round: " + str(row.get("round_name", "") or "") + "<br>"
+                + "Status: " + str(row.get("task_status", "") or "") + "<br>"
+                + "Time: " + str(row["start_label"]) + " - " + str(row["end_label"]) + "<br>"
+                + "Duration: " + str(row["duration"]) + " min<br>"
+                + "Original Expert: " + str(original)
+                + reassign_tag
+            )
+
+            fig.add_trace(go.Bar(
+                y=[expert],
+                x=[(row["end_dt"] - row["start_dt"]).total_seconds() * 1000],
+                base=[row["start_dt"]], orientation="h",
+                marker=dict(color=bar_color, line=line_dict),
+                hovertext=hover, hoverinfo="text",
+                showlegend=False, width=0.6,
+            ))
+
+    # Placeholder bars for experts with no interviews
+    for expert in expert_order:
+        if expert not in set(experts_with):
+            fig.add_trace(go.Bar(
+                y=[expert], x=[0],
+                base=[ref + timedelta(hours=8)],
+                orientation="h",
+                marker=dict(color="rgba(0,0,0,0)"),
+                hovertext="No interviews scheduled",
+                hoverinfo="text", showlegend=False, width=0.6,
+            ))
+
+    # Legend entries
+    for status, color in status_colors.items():
+        fig.add_trace(go.Bar(y=[None], x=[None], marker=dict(color=color),
+                             name=TASK_LABEL.get(status, status.title()), showlegend=True))
+    fig.add_trace(go.Bar(y=[None], x=[None],
+                         marker=dict(color=REASSIGNED_COLOR, line=dict(color="#27ae60", width=3)),
+                         name="Reassigned (teal/green)", showlegend=True))
+    fig.add_trace(go.Bar(y=[None], x=[None],
+                         marker=dict(color=UNRESOLVED_COLOR, line=dict(color="#ff0000", width=4)),
+                         name="Unresolved (no free expert)", showlegend=True))
+
+    if not resolved.empty:
+        min_s = resolved["start_min"].min()
+        max_e = resolved["end_min"].max()
+    else:
+        min_s, max_e = 480, 1080
+
+    range_start = ref + timedelta(minutes=max(0, int(min_s) - 30))
+    range_end = ref + timedelta(minutes=min(1440, int(max_e) + 30))
+
+    # Shift window lines
+    fig.add_vline(x=ref + timedelta(minutes=SHIFT_START_MIN),
+                  line_dash="dash", line_color="#2ecc71", opacity=0.6,
+                  annotation_text="Shift Start 3:30 AM", annotation_position="top")
+    fig.add_vline(x=ref + timedelta(minutes=SHIFT_END_MIN),
+                  line_dash="dash", line_color="#2ecc71", opacity=0.6,
+                  annotation_text="Shift End 12:30 PM", annotation_position="top")
+
+    fig.update_layout(
+        title="🧠 Resolved Expert Schedule — " + str(selected_date) + " (EDT)",
+        height=max(500, len(expert_order) * 45),
+        xaxis=dict(type="date", tickformat="%I:%M %p",
+                   range=[range_start, range_end], title="Time (EDT)",
+                   dtick=30 * 60 * 1000),
+        yaxis=dict(categoryorder="array", categoryarray=expert_order[::-1],
+                   title="Expert"),
+        barmode="overlay",
+        legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
+        hovermode="closest",
+    )
+
+    # Current time marker
+    EDT = timezone(timedelta(hours=-4))
+    now_edt = datetime.now(EDT)
+    if selected_date == now_edt.date():
+        now_marker = ref.replace(hour=now_edt.hour, minute=now_edt.minute,
+                                  second=0, microsecond=0)
+        fig.add_vline(x=now_marker, line_width=2, line_dash="dash",
+                      line_color="#FF00FF", annotation_text="Now",
+                      annotation_position="top",
+                      annotation_font_size=12, annotation_font_color="#FF00FF")
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_resolution_summary(resolved, selected_date):
+    """Show KPIs and tables summarizing what the resolver did."""
+    total = len(resolved)
+    kept = int((resolved["resolution_action"] == "kept").sum())
+    retained = int((resolved["resolution_action"] == "retained").sum())
+    reassigned = int((resolved["resolution_action"] == "reassigned").sum())
+    unresolved = int((resolved["resolution_action"] == "unresolved").sum())
+
+    k = st.columns(5)
+    k[0].metric("Total Interviews", total)
+    k[1].metric("No Change", kept)
+    k[2].metric("Retained (1st in clash)", retained)
+    k[3].metric("✅ Reassigned", reassigned)
+    k[4].metric("❌ Unresolved", unresolved)
+
+    # ── Reassignment details ─────────────────────────────────────
+    reassigned_df = resolved[resolved["resolution_action"] == "reassigned"]
+    if not reassigned_df.empty:
+        st.markdown("##### ✅ Reassigned Interviews")
+        ra_display = reassigned_df[[
+            "candidate_name", "company_name", "round_name", "task_status",
+            "start_label", "end_label", "original_expert", "expert_name",
+        ]].copy()
+        ra_display.columns = [
+            "Candidate", "Company", "Round", "Status",
+            "Start", "End", "From Expert", "To Expert",
+        ]
+        st.dataframe(ra_display.sort_values("Start"),
+                     use_container_width=True, hide_index=True)
+
+    # ── Unresolved details ───────────────────────────────────────
+    unresolved_df = resolved[resolved["resolution_action"] == "unresolved"]
+    if not unresolved_df.empty:
+        st.markdown("##### ❌ Unresolved — No Free Expert Available")
+        st.caption(
+            "These interviews could not be reassigned because all experts "
+            "are busy during the same time window. Consider adding capacity "
+            "or rescheduling."
+        )
+        ur_display = unresolved_df[[
+            "candidate_name", "company_name", "round_name", "task_status",
+            "start_label", "end_label", "original_expert",
+        ]].copy()
+        ur_display.columns = [
+            "Candidate", "Company", "Round", "Status",
+            "Start", "End", "Original Expert",
+        ]
+
+        # Style unresolved rows with red background
+        def _highlight_unresolved(row):
+            return ["background-color: #ffcccc"] * len(row)
+
+        st.dataframe(
+            ur_display.sort_values("Start").style.apply(_highlight_unresolved, axis=1),
+            use_container_width=True, hide_index=True,
+        )
+
+    # ── Before / After clash comparison ──────────────────────────
+    remaining_clashes = int(resolved["has_clash"].sum())
+    original_clashes = int((resolved["resolution_action"].isin(
+        ["retained", "reassigned", "unresolved"])).sum())
+
+    ba_cols = st.columns(3)
+    ba_cols[0].metric("Original Clashing Interviews", original_clashes)
+    ba_cols[1].metric("Remaining Clashes After Resolution", remaining_clashes)
+    ba_cols[2].metric("Clashes Resolved",
+                      max(0, original_clashes - remaining_clashes - reassigned))
+
+
 def render_schedule_view(all_data, active_expert_df):
     """Main renderer for the Schedule View page."""
     st.header("Schedule View")
@@ -2594,8 +3028,10 @@ def render_schedule_view(all_data, active_expert_df):
     clash_count = int(sched["has_clash"].sum())
     experts_with_clash = sched[sched["has_clash"]]["expert_name"].nunique()
     if clash_count > 0:
-        st.warning("⚠️ **" + str(clash_count) + " interview(s) have clashes** across **" +
-                   str(experts_with_clash) + " expert(s)**. Look for red borders in the timeline.")
+        st.warning(
+            "⚠️ **" + str(clash_count) + " interview(s) have clashes** across **"
+            + str(experts_with_clash) + " expert(s)**. See the 🧠 Intelligent Clash Resolution section below."
+        )
 
     st.caption("Showing Interview Support only")
 
@@ -2607,11 +3043,58 @@ def render_schedule_view(all_data, active_expert_df):
     st.markdown("---")
     render_availability_summary(sched, selected_date, all_expert_names)
 
+    # ═════════════════════════════════════════════════════════════
+    #  🧠 INTELLIGENT CLASH RESOLUTION
+    # ═════════════════════════════════════════════════════════════
+    if clash_count > 0:
+        st.markdown("---")
+        st.header("🧠 Intelligent Clash Resolution")
+        st.caption(
+            "When an expert has overlapping interviews, the system keeps the "
+            "first interview and attempts to reassign the rest to the next "
+            "available expert. Interviews that cannot be reassigned (all "
+            "experts busy) are highlighted in red."
+        )
+
+        resolved = resolve_clashes(sched, all_expert_names)
+
+        # ── Resolution Summary KPIs & Tables ─────────────────────
+        render_resolution_summary(resolved, selected_date)
+
+        # ── Resolved Gantt Chart ─────────────────────────────────
+        st.markdown("---")
+        render_resolved_gantt(resolved, selected_date, all_expert_names)
+
+        # ── Updated Availability After Resolution ────────────────
+        st.markdown("---")
+        render_availability_summary(resolved, selected_date, all_expert_names)
+
+        # ── Download Resolved Schedule ───────────────────────────
+        resolved_display = resolved[[
+            c for c in [
+                "expert_name", "original_expert", "resolution_action",
+                "candidate_name", "company_name", "round_name",
+                "support_name", "task_status",
+                "start_label", "end_label", "duration",
+                "has_clash", "is_oos",
+            ] if c in resolved.columns
+        ]].copy()
+        resolved_display.columns = [
+            c.replace("_", " ").title() for c in resolved_display.columns
+        ]
+
+        st.download_button(
+            label="📥 Download Resolved Schedule",
+            data=to_excel_bytes(resolved_display),
+            file_name="resolved_schedule_" + str(selected_date) + ".xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
     # ── CLASH DETAILS ────────────────────────────────────────────
     clash_df = sched[sched["has_clash"]].copy()
     if not clash_df.empty:
         st.markdown("---")
-        st.subheader("Clash Details — " + str(selected_date))
+        st.subheader("Original Clash Details — " + str(selected_date))
         clash_display = clash_df[["expert_name", "candidate_name", "company_name",
                                    "round_name", "support_name", "task_status",
                                    "start_label", "end_label", "duration"]].copy()
@@ -2703,6 +3186,7 @@ def render_schedule_view(all_data, active_expert_df):
         display.columns = [c.replace("_", " ").title() for c in table_cols]
         st.dataframe(display.sort_values(["Expert Name", "Start Label"]),
                      use_container_width=True, hide_index=True)
+
 def render_top_candidates_analysis(df, title_suffix="", min_interviews=5):
     """Render Top 10 Strong and Top 10 Weak candidates based on avg sentiment.
     
@@ -3122,71 +3606,6 @@ def render_top_candidates_analysis(df, title_suffix="", min_interviews=5):
         all_disp.index.name = "Rank"
         st.dataframe(all_disp, use_container_width=True)
 
-# ── AVAILABILITY SUMMARY ─────────────────────────────────────
-def render_availability_summary(sched, selected_date, all_expert_names=None):
-    """Show expert availability — free slots between interviews."""
-    st.subheader("Expert Availability — " + str(selected_date) + " (EDT)")
-    st.caption("Free gaps between scheduled interviews (working hours: 8 AM – 10 PM EDT)")
-
-    work_start = 8 * 60
-    work_end = 22 * 60
-
-    avail_rows = []
-
-    if not sched.empty:
-        for expert, grp in sched.groupby("expert_name"):
-            intervals = sorted(zip(grp["start_min"], grp["end_min"]))
-            merged = [intervals[0]]
-            for s, e in intervals[1:]:
-                if s <= merged[-1][1]:
-                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-                else:
-                    merged.append((s, e))
-
-            free_slots = []
-            prev_end = work_start
-            for s, e in merged:
-                gap_start = max(prev_end, work_start)
-                gap_end = min(s, work_end)
-                if gap_end > gap_start and (gap_end - gap_start) >= 15:
-                    free_slots.append(_minutes_to_label(gap_start) + " – " + _minutes_to_label(gap_end) +
-                                      " (" + str(int(gap_end - gap_start)) + " min)")
-                prev_end = max(prev_end, e)
-
-            if prev_end < work_end and (work_end - prev_end) >= 15:
-                free_slots.append(_minutes_to_label(prev_end) + " – " + _minutes_to_label(work_end) +
-                                  " (" + str(int(work_end - prev_end)) + " min)")
-
-            total_busy = sum(e - s for s, e in merged)
-            total_interviews = len(grp)
-            has_clash = grp["has_clash"].any()
-
-            avail_rows.append({
-                "Expert": expert,
-                "Interviews": total_interviews,
-                "Busy Time": str(int(total_busy)) + " min",
-                "Clashes": "⚠️ Yes" if has_clash else "No",
-                "Free Slots": " | ".join(free_slots) if free_slots else "No free slots",
-            })
-
-    if all_expert_names:
-        experts_in_sched = set(sched["expert_name"].unique()) if not sched.empty else set()
-        for expert in sorted(all_expert_names):
-            if expert not in experts_in_sched:
-                avail_rows.append({
-                    "Expert": expert,
-                    "Interviews": 0,
-                    "Busy Time": "0 min",
-                    "Clashes": "No",
-                    "Free Slots": "Fully available (8:00 AM – 10:00 PM EDT)",
-                })
-
-    if not avail_rows:
-        st.info("No expert data available.")
-        return
-
-    avail_df = pd.DataFrame(avail_rows).sort_values("Interviews", ascending=False)
-    st.dataframe(avail_df, use_container_width=True, hide_index=True)
 
 # ═══════════════════════════════════════════════════════════════════
 #  ASSESSMENT CONVERSION ANALYTICS
@@ -5029,7 +5448,7 @@ def main():
         render_schedule_view(all_case_df, active_expert_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v22.0 | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection (Completed/non-Self)")
+    st.sidebar.caption("Vizva Dashboard v23.0 | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -5090,4 +5509,3 @@ if _check_session():
     main()
 else:
     login()
-
