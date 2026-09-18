@@ -2169,6 +2169,10 @@ def build_prospect_analysis(df, threshold=PROSPECT_COMPANY_SIM_THRESHOLD):
         "companies": int(combos_df["Company (matched)"].nunique()),
         "with_feedback": int((combos_df["Feedback Count"] > 0).sum()),
         "raw_advanced_rounds": int(len(adv)),
+        "candidates_all": int(d["candidate_name"].nunique()),
+        "avg_companies_per_candidate": round(float(per_cand.mean()), 2) if len(per_cand) else 0.0,
+        "max_companies_per_candidate": int(per_cand.max()) if len(per_cand) else 0,
+        "single_company_candidates": int((per_cand == 1).sum()),
     }
     result["combos"] = combos_df
     result["rows"] = prospect_rows
@@ -2229,6 +2233,15 @@ def render_prospect_analysis(completed_iv, sel_cr_month):
     k[4].metric("Both Rounds (counted as Final)", summary["both_rounds"])
     k[5].metric("Multi-Company Candidates", summary["multi_company"])
 
+    k2 = st.columns(4)
+    k2[0].metric("Candidates in Scope", summary["candidates_all"],
+                 help="All distinct candidates in this scope, before the advanced-round filter.")
+    k2[1].metric("Single-Company Candidates", summary["single_company_candidates"],
+                 help="Prospective candidates with only one company.")
+    k2[2].metric("Avg Companies / Candidate", summary["avg_companies_per_candidate"],
+                 help="Average number of different companies per prospective candidate.")
+    k2[3].metric("Max Companies / Candidate", summary["max_companies_per_candidate"])
+
     st.caption(
         "Raw advanced rounds in this scope: **" + str(summary["raw_advanced_rounds"]) +
         "** collapsed to **" + str(summary["prospect_units"]) + "** prospects across **" +
@@ -2246,12 +2259,20 @@ def render_prospect_analysis(completed_iv, sel_cr_month):
         st.plotly_chart(fig_t, use_container_width=True)
     with c2:
         comp_counts = combos["Company (matched)"].value_counts().head(12)
-        fig_c = go.Figure(go.Bar(y=comp_counts.index[::-1], x=comp_counts.values[::-1],
-                                 orientation="h", marker_color="#16a085",
-                                 text=comp_counts.values[::-1], textposition="outside"))
-        fig_c.update_layout(title="Prospects by Company (Top 12)",
-                            height=max(380, len(comp_counts) * 32),
-                            xaxis_title="Prospects")
+        comp_cands = (combos.groupby("Company (matched)")["Candidate"]
+                      .nunique().reindex(comp_counts.index).fillna(0).astype(int))
+        fig_c = go.Figure()
+        fig_c.add_trace(go.Bar(y=comp_counts.index[::-1], x=comp_counts.values[::-1],
+                               orientation="h", name="Prospects", marker_color="#16a085",
+                               text=comp_counts.values[::-1], textposition="outside"))
+        fig_c.add_trace(go.Bar(y=comp_cands.index[::-1], x=comp_cands.values[::-1],
+                               orientation="h", name="Candidates", marker_color="#e67e22",
+                               text=comp_cands.values[::-1], textposition="outside"))
+        fig_c.update_layout(barmode="group",
+                            title="Prospects & Candidates by Company (Top 12)",
+                            height=max(420, len(comp_counts) * 42),
+                            xaxis_title="Count",
+                            legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center"))
         st.plotly_chart(fig_c, use_container_width=True)
 
     if scope.startswith("All Months") and "month" in base.columns:
@@ -2274,6 +2295,78 @@ def render_prospect_analysis(completed_iv, sel_cr_month):
                                  height=400, yaxis_title="Prospects",
                                  legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
             st.plotly_chart(fig_tr, use_container_width=True)
+
+    # ── CANDIDATE-WISE COMPANY COUNTS ───────────────────────────
+    st.markdown("---")
+    st.markdown("##### 👤 Candidate-wise Company Counts")
+    st.caption(
+        "How many different companies each candidate has advanced-round prospects at. "
+        "A candidate with more than one company holds multiple options, but only one offer "
+        "can be signed — which is why they collapse to a single prospective candidate."
+    )
+
+    cand_counts = (combos.groupby("Candidate")
+                   .agg(Companies=("Company (matched)", "nunique"),
+                        Prospects=("Company (matched)", "size"),
+                        Finals=("Prospect Type", lambda x: int((x == "Final").sum())),
+                        Technical=("Prospect Type", lambda x: int((x == "Technical/Coding").sum())),
+                        Avg_Sentiment=("Avg Sentiment", "mean"))
+                   .reset_index())
+    cand_counts["Company Names"] = cand_counts["Candidate"].map(
+        combos.groupby("Candidate")["Company (matched)"]
+        .apply(lambda x: ", ".join(sorted(set(str(v) for v in x)))))
+    cand_counts["Avg_Sentiment"] = cand_counts["Avg_Sentiment"].round(1)
+
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        top_cand = cand_counts.sort_values(["Companies", "Prospects"], ascending=False).head(20)
+        top_cand_plot = top_cand.sort_values("Companies", ascending=True)
+        bar_colors = ["#e74c3c" if c > 1 else "#2ecc71" for c in top_cand_plot["Companies"]]
+        fig_cc = go.Figure(go.Bar(
+            y=top_cand_plot["Candidate"], x=top_cand_plot["Companies"],
+            orientation="h", marker_color=bar_colors,
+            text=top_cand_plot["Companies"], textposition="outside",
+            customdata=top_cand_plot["Company Names"],
+            hovertemplate="<b>%{y}</b><br>Companies: %{x}<br>%{customdata}<extra></extra>",
+        ))
+        fig_cc.update_layout(title="Top 20 Candidates by Company Count "
+                                   "(red = multi-company)",
+                             height=max(420, len(top_cand_plot) * 32),
+                             xaxis_title="Number of Companies")
+        st.plotly_chart(fig_cc, use_container_width=True)
+    with cc2:
+        dist = cand_counts["Companies"].value_counts().sort_index()
+        fig_cd = go.Figure(go.Bar(
+            x=[str(i) for i in dist.index], y=dist.values,
+            marker_color="#3498db", text=dist.values, textposition="outside",
+        ))
+        fig_cd.update_layout(title="Candidate Distribution by Company Count",
+                             height=420,
+                             xaxis_title="Companies per Candidate",
+                             yaxis_title="Candidates")
+        st.plotly_chart(fig_cd, use_container_width=True)
+
+    with st.expander("👤 Candidate-wise Company Counts — Full Data"):
+        cand_display = cand_counts.rename(columns={
+            "Companies": "Companies", "Prospects": "Prospects",
+            "Finals": "Final Prospects", "Technical": "Technical/Coding Prospects",
+            "Avg_Sentiment": "Avg Sentiment",
+        })
+        st.dataframe(
+            cand_display[["Candidate", "Companies", "Prospects", "Final Prospects",
+                          "Technical/Coding Prospects", "Avg Sentiment", "Company Names"]]
+            .sort_values(["Companies", "Prospects"], ascending=False),
+            use_container_width=True, hide_index=True,
+        )
+        st.download_button(
+            label="📥 Download Candidate-wise Company Counts (CSV)",
+            data=cand_display[["Candidate", "Companies", "Prospects", "Final Prospects",
+                               "Technical/Coding Prospects", "Avg Sentiment", "Company Names"]]
+            .sort_values(["Companies", "Prospects"], ascending=False)
+            .to_csv(index=False).encode("utf-8"),
+            file_name="candidate_company_counts_" + str(sel_cr_month) + ".csv",
+            mime="text/csv",
+        )
 
     # ── Sentiment of the full candidate + company combination data ──
     st.markdown("---")
