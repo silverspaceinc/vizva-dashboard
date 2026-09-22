@@ -3275,15 +3275,26 @@ def is_protected_round(round_name):
     return "coding" in r or "final" in r
 
 
-def _pick_interviews_to_keep(resolved, group_idxs):
-    """Greedily pick the interviews of a clash group that stay with the
-    original expert. Protected rounds (Technical Coding / Final Round) get
-    first claim; among the same priority, the classic end-time greedy keeps
-    the maximum number of non-overlapping interviews."""
-    protected = [i for i in group_idxs
-                 if is_protected_round(resolved.loc[i, "round_name"])]
-    normal = [i for i in group_idxs
-              if not is_protected_round(resolved.loc[i, "round_name"])]
+def _pick_interviews_to_keep(resolved, group_idxs, presence_map=None):
+    """Greedily pick the interviews of a clash group that stay where they are.
+
+    Claim order (first claim wins, then the classic end-time greedy keeps the
+    maximum number of non-overlapping interviews):
+        1. PRIORITY 1 - the owner is PRESENT.
+        2. Protected round (Technical Coding / Final Round).
+    A protected round owned by an ABSENT expert therefore loses its claim and
+    is offered to another expert, exactly like any other interview.
+    """
+    def _owner_of(idx):
+        if "original_expert" in resolved.columns:
+            return resolved.loc[idx, "original_expert"]
+        return resolved.loc[idx, "expert_name"]
+
+    def _claim_key(idx):
+        absent = 0 if is_present(_owner_of(idx), presence_map or {}) else 1
+        protected = 0 if is_protected_round(resolved.loc[idx, "round_name"]) else 1
+        return (absent, protected,
+                resolved.loc[idx, "end_min"], resolved.loc[idx, "start_min"])
 
     keep = []
 
@@ -3298,13 +3309,107 @@ def _pick_interviews_to_keep(resolved, group_idxs):
         keep.append(idx)
         return True
 
-    for idx in sorted(protected,
-                      key=lambda i: (resolved.loc[i, "end_min"], resolved.loc[i, "start_min"])):
-        _try_keep(idx)
-    for idx in sorted(normal,
-                      key=lambda i: (resolved.loc[i, "end_min"], resolved.loc[i, "start_min"])):
+    for idx in sorted(group_idxs, key=_claim_key):
         _try_keep(idx)
     return keep
+
+
+def recompute_clash_flags(df):
+    """Recompute has_clash for the CURRENT expert assignment (strict overlap)."""
+    out = df.copy()
+    out["has_clash"] = False
+    for exp, grp in out.groupby("expert_name"):
+        if len(grp) < 2:
+            continue
+        gi = grp.index.tolist()
+        for a in range(len(gi)):
+            for b in range(a + 1, len(gi)):
+                s1 = out.loc[gi[a], "start_min"]
+                e1 = out.loc[gi[a], "end_min"]
+                s2 = out.loc[gi[b], "start_min"]
+                e2 = out.loc[gi[b], "end_min"]
+                if s1 < e2 and s2 < e1:
+                    out.loc[gi[a], "has_clash"] = True
+                    out.loc[gi[b], "has_clash"] = True
+    return out
+
+
+def enforce_presence_first(resolved, all_expert_names, expertise_map=None,
+                           round_map=None, presence_map=None,
+                           expertise_source="round", min_gap=GAP_MINUTES,
+                           enabled=True):
+    """PRIORITY 1 - PRESENCE FIRST.  Run BEFORE every other pass.
+
+    A task may never stay with an ABSENT expert while a PRESENT expert can
+    take it.  Protected rounds (Technical Coding / Final Round) are NOT
+    exempt: they are offered to another expert with the SAME expertise
+    first and then through the configured fallback cycle
+    (Data/Business -> Software -> DevOps, and so on).
+
+    If no Present expert is free, the task stays where it is and is marked
+    `presence_violation` so it is visible instead of silently kept.
+    Self / HCR are never touched.  Adds:
+        presence_moved     - True when the task was moved off an absent expert
+        presence_violation - True when it still sits with an absent expert
+    """
+    resolved = resolved.copy()
+    resolved["presence_moved"] = False
+    resolved["presence_violation"] = False
+    if "original_expert" not in resolved.columns:
+        resolved["original_expert"] = resolved["expert_name"]
+    if "resolution_action" not in resolved.columns:
+        resolved["resolution_action"] = "kept"
+    resolved = recompute_clash_flags(resolved)
+
+    presence_map = presence_map or {}
+    pool = eligible_experts(all_expert_names, presence_map)
+
+    if enabled and pool:
+        for idx in list(resolved.index):
+            current = resolved.loc[idx, "expert_name"]
+            if str(current).strip().lower() in ("hcr", "self"):
+                continue
+            if is_present(current, presence_map):
+                continue
+
+            task_exp = task_expertise_for_row(resolved, idx, expertise_map or {},
+                                              round_map, expertise_source)
+            ranked = (rank_candidate_experts(pool, task_exp, expertise_map or {})
+                      if task_exp else list(pool))
+            s = resolved.loc[idx, "start_min"]
+            e = resolved.loc[idx, "end_min"]
+            for alt in ranked:
+                if alt == current:
+                    continue
+                busy = _get_expert_busy_intervals(resolved, alt)
+                if _is_expert_free_with_gap(busy, s, e, min_gap):
+                    resolved.loc[idx, "expert_name"] = alt
+                    resolved.loc[idx, "presence_moved"] = True
+                    break
+
+        resolved = recompute_clash_flags(resolved)
+
+    for idx in resolved.index:
+        current = resolved.loc[idx, "expert_name"]
+        if str(current).strip().lower() in ("hcr", "self"):
+            continue
+        if not is_present(current, presence_map):
+            resolved.loc[idx, "presence_violation"] = True
+    return resolved
+
+
+def apply_presence_first_labels(resolved, presence_map=None):
+    """Label every task that was carried off an Absent expert (Priority 1)."""
+    df = resolved.copy()
+    if "presence_moved" not in df.columns:
+        return df
+    if "resolution_action" not in df.columns:
+        df["resolution_action"] = "kept"
+    moved = df["presence_moved"].fillna(False).astype(bool)
+    if "original_expert" in df.columns:
+        moved = moved & (df["expert_name"].astype(str) != df["original_expert"].astype(str))
+    df.loc[moved, "resolution_action"] = "presence_reassigned"
+    return df
 
 
 def resolve_clashes(sched, all_expert_names, expertise_map=None, presence_map=None,
@@ -3316,8 +3421,8 @@ def resolve_clashes(sched, all_expert_names, expertise_map=None, presence_map=No
          (never moved, never marked, never used as targets).
       2. Protected rounds (Technical Coding / Final Round) get first
          claim to stay with their original expert.
-      3. PRIORITY 5 - only experts marked PRESENT may receive a task.
-      4. PRIORITY 4 - candidates are tried in expertise-fit order for the
+      3. PRIORITY 1 - only experts marked PRESENT may receive a task.
+      4. PRIORITY 5 - candidates are tried in expertise-fit order for the
          task (same expertise first, then the fallback chain), so an offer
          goes to the best-suited free expert.
       5. Remaining clashing interviews are offered - in order - to each
@@ -3336,10 +3441,15 @@ def resolve_clashes(sched, all_expert_names, expertise_map=None, presence_map=No
             "unresolved" - no free expert found (highlighted)
     """
     resolved = sched.copy()
-    resolved["original_expert"] = resolved["expert_name"]
-    resolved["resolution_action"] = "kept"
+    if "original_expert" not in resolved.columns:
+        resolved["original_expert"] = resolved["expert_name"]
+    if "resolution_action" not in resolved.columns:
+        resolved["resolution_action"] = "kept"
 
-    # Experts that can accept interviews (exclude HCR, Self; Priority 5 = Present only)
+    # Priority 1 may have re-seated tasks - rebuild the clash picture first
+    resolved = recompute_clash_flags(resolved)
+
+    # Experts that can accept interviews (exclude HCR, Self; PRIORITY 1 = Present only)
     EXCLUDE = {"hcr", "self"}
     candidate_experts = eligible_experts(all_expert_names, presence_map)
 
@@ -3385,9 +3495,10 @@ def resolve_clashes(sched, all_expert_names, expertise_map=None, presence_map=No
 
         for group_idxs in overlap_groups:
             # Protected rounds (Technical Coding / Final Round) stay first
-            keep_idxs = _pick_interviews_to_keep(resolved, group_idxs)
+            keep_idxs = _pick_interviews_to_keep(resolved, group_idxs, presence_map)
             for idx in keep_idxs:
-                resolved.loc[idx, "resolution_action"] = "retained"
+                if resolved.loc[idx, "resolution_action"] == "kept":
+                    resolved.loc[idx, "resolution_action"] = "retained"
 
             # Every interview that could not stay is offered to other experts
             movers = sorted(
@@ -3605,7 +3716,10 @@ def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
             action = row.get("resolution_action", "kept")
             original = row.get("original_expert", expert)
 
-            if action == "expertise_reassigned":
+            if action in ("presence_reassigned", "absent_reassigned"):
+                bar_color = ABSENT_COLOR
+                line_dict = dict(color="#d35400", width=3)
+            elif action == "expertise_reassigned":
                 bar_color = EXPERTISE_COLOR
                 line_dict = dict(color="#8e44ad", width=3)
             elif action == "absent_reassigned":
@@ -3629,9 +3743,12 @@ def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
             elif action == "expertise_reassigned":
                 reassign_tag = ("<br><b>🎯 Expertise re-aligned (P4) from "
                                 + str(original) + "</b>")
+            elif action == "presence_reassigned":
+                reassign_tag = ("<br><b>🚫 Moved off ABSENT expert " + str(original)
+                                + " (P1 - presence)</b>")
             elif action == "absent_reassigned":
                 reassign_tag = ("<br><b>🚫 Moved off Absent expert " + str(original)
-                                + " (P5)</b>")
+                                + " (P1 - presence)</b>")
             elif action == "unresolved":
                 reassign_tag = "<br><b>⚠️ UNRESOLVED — no free expert</b>"
 
@@ -3682,7 +3799,7 @@ def render_resolved_gantt(resolved, selected_date, all_expert_names=None):
                          name="Expertise re-aligned (P4)", showlegend=True))
     fig.add_trace(go.Bar(y=[None], x=[None],
                          marker=dict(color=ABSENT_COLOR, line=dict(color="#d35400", width=3)),
-                         name="Moved off Absent expert (P5)", showlegend=True))
+                         name="Moved off Absent expert (P1 - presence)", showlegend=True))
 
     if not resolved.empty:
         min_s = resolved["start_min"].min()
@@ -3743,6 +3860,8 @@ def render_resolution_summary(resolved, selected_date):
     expertise_moved = int((resolved["resolution_action"] == "expertise_reassigned").sum())
     absent_moved = int((resolved["resolution_action"] == "absent_reassigned").sum())
     off_expertise = int(resolved["expertise_violation"].sum()) if "expertise_violation" in resolved.columns else 0
+    presence_moved = int((resolved["resolution_action"] == "presence_reassigned").sum())
+    still_absent = int(resolved["presence_violation"].sum()) if "presence_violation" in resolved.columns else 0
 
     k = st.columns(6)
     k[0].metric("Total Interviews", total)
@@ -3752,18 +3871,25 @@ def render_resolution_summary(resolved, selected_date):
     k[4].metric("🕐 Gap-Moved (10-min)", gap_moved)
     k[5].metric("❌ Unresolved", unresolved)
 
-    k2 = st.columns(4)
-    k2[0].metric("🎯 Expertise Re-aligned (P4)", expertise_moved)
-    k2[1].metric("🚫 Moved off Absent (P5)", absent_moved)
-    k2[2].metric("⚠️ Still Off-Expertise", off_expertise,
+    k2 = st.columns(5)
+    k2[0].metric("🚫 Moved off Absent expert (P1)", presence_moved + absent_moved,
+                 help="Tasks that were sitting with an Absent expert and were given to a "
+                      "Present expert - Technical/Final rounds included. Same expertise is "
+                      "tried first, then the configured fallback cycle.")
+    k2[1].metric("⚠️ Still with Absent expert", still_absent,
+                 help="Nobody Present was free for these, so they stayed put. They will be "
+                      "picked up as soon as someone Present is free.")
+    k2[2].metric("🎯 Expertise Re-aligned (P5)", expertise_moved)
+    k2[3].metric("⚠️ Still Off-Expertise", off_expertise,
                  help="Task stayed on a fallback/expertise-mismatched expert because "
                       "no better-suited Present expert was free.")
-    k2[3].metric("✅ Fully Matched", max(0, total - off_expertise),
-                 help="Tasks sitting on an expert of the required expertise (tier 1).")
+    k2[4].metric("✅ Fully Matched", max(0, total - off_expertise - still_absent),
+                 help="Tasks on a Present expert of the required expertise.")
 
     # ── Reassignment details ─────────────────────────────────────
     reassigned_df = resolved[resolved["resolution_action"].isin(
-        ["reassigned", "gap_reassigned", "expertise_reassigned", "absent_reassigned"])]
+        ["reassigned", "gap_reassigned", "expertise_reassigned", "absent_reassigned",
+         "presence_reassigned"])]
     if not reassigned_df.empty:
         st.markdown("##### ✅ Reassigned Interviews")
         ra_display = reassigned_df[[
@@ -3883,8 +4009,8 @@ def _expert_config_path():
 
 def _empty_expert_config():
     return {"expertise": {}, "presence": {}, "round_expertise": {},
-            "reallocate_absent": False, "task_expertise_source": "round",
-            "updated_at": None}
+            "presence_first": True, "reallocate_absent": True,
+            "task_expertise_source": "round", "updated_at": None}
 
 
 def load_expert_config():
@@ -3900,7 +4026,12 @@ def load_expert_config():
                     val = loaded.get(key)
                     if isinstance(val, dict):
                         cfg[key] = {str(k): str(v) for k, v in val.items()}
-                cfg["reallocate_absent"] = bool(loaded.get("reallocate_absent", False))
+                cfg["reallocate_absent"] = bool(loaded.get("reallocate_absent", True))
+                # PRIORITY 1 defaults to ON for EVERYONE, including config files
+                # written by an older revision (those only carry the legacy
+                # "reallocate_absent" key, usually False). Presence-first is the
+                # new intended behaviour; switch it off in the panel if needed.
+                cfg["presence_first"] = bool(loaded.get("presence_first", True))
                 cfg["task_expertise_source"] = (
                     "owner" if str(loaded.get("task_expertise_source", "round")).lower() == "owner"
                     else "round")
@@ -4184,7 +4315,7 @@ def render_expert_config_panel(all_expert_names, all_rounds):
     presence_map = get_presence_map(cfg)
     round_map = {str(k): str(v) for k, v in (cfg.get("round_expertise") or {}).items()
                  if str(v) in EXPERTISE_FALLBACK}
-    reallocate_absent = bool(cfg.get("reallocate_absent", False))
+    reallocate_absent = bool(cfg.get("presence_first", True))
     updated_at = cfg.get("updated_at")
 
     n_classified = sum(1 for e in all_expert_names if e in expertise_map)
@@ -4245,10 +4376,13 @@ def render_expert_config_panel(all_expert_names, all_rounds):
 
         st.markdown("---")
         opt_reallocate = st.checkbox(
-            "Reallocate tasks that sit with an Absent expert to a Present expert",
+            "PRIORITY 1 — move tasks off an Absent expert to a Present expert",
             value=reallocate_absent,
-            help="Off = Absent experts simply stop receiving NEW tasks; their existing "
-                 "ones stay listed so you can see them.")
+            help="ON (recommended): a task can never stay with an Absent expert while a "
+                 "Present expert can take it — Technical/Final rounds included. The same "
+                 "expertise is tried first, then the configured fallback cycle. "
+                 "OFF: Absent experts only stop receiving NEW tasks; their existing ones "
+                 "stay listed and are flagged.")
         opt_source = st.selectbox(
             "The task's required expertise comes from",
             ["Round type (recommended)", "Owner expert's expertise"],
@@ -4272,6 +4406,7 @@ def render_expert_config_panel(all_expert_names, all_rounds):
                          {str(k): str(v) for k, v in new_presence.items()}),
             "round_expertise": {str(k): str(v) for k, v in new_round_map.items()
                                 if str(v) in EXPERTISE_FALLBACK},
+            "presence_first": bool(opt_reallocate),
             "reallocate_absent": bool(opt_reallocate),
             "task_expertise_source": ("owner" if str(opt_source).startswith("Owner") else "round"),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -4404,24 +4539,30 @@ def render_schedule_view(all_data, active_expert_df):
     # ═════════════════════════════════════════════════════════════
     #  🧠 INTELLIGENT CLASH RESOLUTION
     # ═════════════════════════════════════════════════════════════
-    if True:  # always: clash (1) + round pref (2) + 10-min gap (3) + expertise (4) + presence (5)
+    if True:  # presence (1) + clash (2) + round pref (3) + 10-min gap (4) + expertise (5)
         st.markdown("---")
         st.header("🧠 Intelligent Clash Resolution")
         st.caption(
-            "Priority 1 - Clashes: overlapping interviews are split across "
-            "experts. Priority 2 - Round preference: Technical Coding and "
-            "Final Round interviews stay with their original expert wherever "
-            "possible. Priority 3 - 10-minute rule: every interview must have "
-            "at least 10 minutes of gap around it. Priority 4 - Expertise: a "
-            "task is re-aligned to an expert of the required profile (purple "
-            "bars) following the configured fallback order. Priority 5 - "
-            "Presence: only experts marked Present can receive a task, and "
-            "tasks sitting with an Absent expert can be reallocated (orange "
-            "bars). Interviews that could not be fixed are highlighted in "
-            "red. Self interviews/experts are never touched or shown here."
+            "Priority 1 - PRESENCE: a task is never left with an Absent expert while a "
+            "Present expert can take it. Technical Coding / Final Round interviews are "
+            "moved too - the same expertise is tried first, then the configured fallback "
+            "cycle (orange bars). Priority 2 - Clashes: overlapping interviews are split "
+            "across experts. Priority 3 - Round preference: Technical Coding / Final Round "
+            "prefer to stay with their original expert when that expert is Present. "
+            "Priority 4 - 10-minute rule: at least 10 minutes of gap between interviews. "
+            "Priority 5 - Expertise: re-align to the required profile (purple bars). "
+            "Anything that could not be fixed is highlighted in red. Self / HCR are never "
+            "touched."
         )
 
-        resolved = resolve_clashes(sched, all_expert_names,
+        # PRIORITY 1 - presence: move tasks off Absent experts first
+        resolved = enforce_presence_first(
+            sched, all_expert_names, expertise_map=expertise_map,
+            round_map=round_map, presence_map=presence_map,
+            expertise_source=expertise_source,
+            enabled=reallocate_absent)
+        # PRIORITY 2-4 - clashes, round preference, 10-minute gap
+        resolved = resolve_clashes(resolved, all_expert_names,
                                    expertise_map=expertise_map,
                                    presence_map=presence_map,
                                    round_map=round_map,
@@ -4431,11 +4572,13 @@ def render_schedule_view(all_data, active_expert_df):
                                       presence_map=presence_map,
                                       round_map=round_map,
                                       expertise_source=expertise_source)
+        # PRIORITY 5 - expertise routing
         resolved = optimize_expertise_match(
             resolved, all_expert_names, expertise_map=expertise_map,
             round_map=round_map, presence_map=presence_map,
-            reallocate_absent=reallocate_absent,
+            reallocate_absent=False,
             expertise_source=expertise_source)
+        resolved = apply_presence_first_labels(resolved, presence_map)
 
         # ── Expert pool actually used for allocation (P4/P5) ──────
         pool_rows = expert_pool_summary(all_expert_names, expertise_map, presence_map)
@@ -4474,7 +4617,7 @@ def render_schedule_view(all_data, active_expert_df):
                 "support_name", "task_status",
                 "start_label", "end_label", "duration",
                 "has_clash", "is_oos", "gap_violation",
-                "expertise_fit", "expertise_violation",
+                "expertise_fit", "expertise_violation", "presence_violation",
             ] if c in resolved.columns
         ]].copy()
         resolved_display.columns = [
