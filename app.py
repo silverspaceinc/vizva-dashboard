@@ -3262,6 +3262,11 @@ def _is_expert_free(busy_intervals, start_min, end_min):
     return True
 
 
+# Minimum gap (minutes) every expert must have between two interviews.
+# Defined here, BEFORE any function that uses it as a default argument.
+GAP_MINUTES = 10
+
+
 def is_protected_round(round_name):
     """True if this interview round should prefer to stay with its original
     expert: Technical Coding or Final Round (case-insensitive match on the
@@ -3556,9 +3561,6 @@ def resolve_clashes(sched, all_expert_names, expertise_map=None, presence_map=No
 #  expert that has room WITH the buffer. If all experts are busy,
 #  the interview stays where it is (marked gap_violation=True).
 # ═════════════════════════════════════════════════════════════════
-
-GAP_MINUTES = 10
-
 
 def _is_expert_free_with_gap(busy_intervals, start_min, end_min, min_gap=GAP_MINUTES):
     """True if [start_min, end_min) fits on the expert with a min_gap-minute
