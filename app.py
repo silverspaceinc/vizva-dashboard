@@ -5698,50 +5698,153 @@ def render_assessment_conversion_charts(conv_df, title_suffix=""):
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════
+#  PERFORMANCE LAYER — cached computations & lazy rendering
+#
+#  Streamlit re-runs this script top-to-bottom on EVERY interaction, so
+#  everything expensive is computed once per data version here instead
+#  of once per click:
+#     * the whole API -> clean -> sentiment pipeline
+#     * the per-support-type frame (start time + out-of-shift columns)
+#     * the sidebar clash / blockage / OOS indicators
+#     * the Excel payload for the download button
+#     * the monthly live frame
+# ═══════════════════════════════════════════════════════════════════
+
+CACHE_TTL = 600  # seconds — matches the documented refresh window
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner="Loading data pipeline...")
+def load_data_pipeline():
+    """Fetch -> normalize -> filter -> Self-row fixup -> sentiment, cached."""
+    raw = fetch_all_data()
+    if raw is None or raw.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None
+    raw = normalize(raw)
+    raw = filter_current_year(raw)
+    if raw.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None
+    if "expert_name" in raw.columns:
+        self_mask = raw["expert_name"].str.strip().str.lower() == "self"
+        if "task_status" in raw.columns:
+            raw.loc[self_mask, "task_status"] = "completed"
+        feedback_text = ("This Interview is given by Candidate himself and so "
+                         "no support was required.")
+        for col in ["feedback", "expert_feedback", "client_feedback"]:
+            if col in raw.columns:
+                raw.loc[self_mask, col] = feedback_text
+    all_case_df = raw.copy()
+    active_expert_df = filter_active_experts(raw)
+    all_interview_support_df = all_case_df[
+        all_case_df["support_name"].str.lower() == "interview support"
+    ].copy()
+    if "start_time" in all_interview_support_df.columns:
+        all_interview_support_df = add_start_time_columns(all_interview_support_df)
+    active_expert_df, fb_col = add_sentiment_column(active_expert_df)
+    return all_case_df, active_expert_df, all_interview_support_df, fb_col
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def build_support_df(active_expert_df, selected_support):
+    """Per-support-type frame with start-time and out-of-shift columns."""
+    support_df = get_by_support(active_expert_df, selected_support)
+    if support_df.empty:
+        return support_df
+    if selected_support == "Interview Support" and "start_time" in support_df.columns:
+        support_df = add_start_time_columns(support_df)
+        support_df = add_out_of_shift_column(support_df)
+    return support_df
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def cached_sidebar_indicators(support_df, all_interview_support_df):
+    """Heavy sidebar numbers as plain scalars (tiny cache payload).
+
+    Previously detect_expert_clashes / detect_blockages / get_oos_valid_df
+    all ran on every single rerun.
+    """
+    out = {"clash_groups": 0, "clash_experts": 0, "blockages": 0,
+           "blockage_days": 0, "oos_total": 0, "oos_pct": 0}
+    try:
+        if "_parsed_start" in support_df.columns:
+            clash_groups, _pairs = detect_expert_clashes(support_df)
+            if clash_groups is not None and not clash_groups.empty:
+                out["clash_groups"] = int(len(clash_groups))
+                out["clash_experts"] = int(clash_groups["expert_name"].nunique())
+            blockages = detect_blockages(support_df, all_experts_df=all_interview_support_df)
+            if blockages is not None and not blockages.empty:
+                out["blockages"] = int(len(blockages))
+                out["blockage_days"] = int(blockages["date"].dt.date.nunique())
+        if "out_of_shift" in support_df.columns:
+            oos_valid = get_oos_valid_df(support_df, analytics_filter=True)
+            if oos_valid is not None and not oos_valid.empty:
+                total_valid = len(oos_valid)
+                oos_total = int(oos_valid["out_of_shift"].sum())
+                out["oos_total"] = oos_total
+                out["oos_pct"] = round(oos_total / total_valid * 100, 1) if total_valid else 0
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def cached_excel_bytes(df):
+    """Excel payload for the download button, built once per data version."""
+    return to_excel_bytes(df)
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def cached_live_monthly(support_df):
+    return live_monthly(support_df)
+
+
+def lazy_tab_selector(tab_names, key, label="Section"):
+    """Lazy tab switcher.
+
+    st.tabs() executes EVERY tab body on every rerun.  This selector
+    renders only the chosen section, so unopened tabs cost nothing.
+    Uses st.segmented_control when available, else a horizontal radio.
+    """
+    names = list(tab_names)
+    if not names:
+        return None
+    seg = getattr(st, "segmented_control", None)
+    choice = None
+    if callable(seg):
+        try:
+            choice = seg(label, names, default=names[0], key=key,
+                         label_visibility="collapsed")
+        except Exception:
+            choice = None
+    if not choice:
+        choice = st.radio(label, names, horizontal=True, key=key,
+                          label_visibility="collapsed")
+    return choice if choice else names[0]
+
+
 def main():
-    auto = st.sidebar.checkbox("Auto-refresh every 2 min", value=True)
+    auto = st.sidebar.checkbox(
+        "Auto-refresh every 2 min", value=False,
+        help="Off by default: each refresh re-runs the whole script. Data is already "
+             "cached for 10 minutes, so enable this only for live polling.")
     if auto:
         st_autorefresh(interval=2 * 60 * 1000, key="data_autorefresh")
     title_col, dl_col = st.columns([4, 1])
     with title_col:
         st.title("Vizva Interview Dashboard")
 
-    raw = fetch_all_data()
-    if raw.empty:
-        st.error("No data returned from API.")
+    # ── CACHED: one call instead of the whole eager pipeline ─────
+    all_case_df, active_expert_df, all_interview_support_df, _fb_col = \
+        load_data_pipeline()
+
+    if all_case_df is None or all_case_df.empty:
+        st.error("No data returned from the API (or none for the current year).")
         st.stop()
-
-    raw = normalize(raw)
-    raw = filter_current_year(raw)
-    if raw.empty:
-        st.error("No data found for current year.")
-        st.stop()
-    # ── AUTO-UPDATE: Self-expert rows ─────────────────────────────
-    if "expert_name" in raw.columns:
-        self_mask = raw["expert_name"].str.strip().str.lower() == "self"
-        if "task_status" in raw.columns:
-            raw.loc[self_mask, "task_status"] = "completed"
-        # Update whichever feedback column(s) exist
-        feedback_text = "This Interview is given by Candidate himself and so no support was required."
-        for col in ["feedback", "expert_feedback", "client_feedback"]:
-            if col in raw.columns:
-                raw.loc[self_mask, col] = feedback_text
-
-    all_case_df = raw.copy()
-    active_expert_df = filter_active_experts(raw)
-    # All Interview Support data (no active expert filter) for blockage lookback
-    all_interview_support_df = all_case_df[all_case_df["support_name"].str.lower() == "interview support"].copy()
-    if "start_time" in all_interview_support_df.columns:
-        all_interview_support_df = add_start_time_columns(all_interview_support_df)
-
-
-    # ── Add sentiment scores to the active expert data ONCE ──────
-    active_expert_df, _fb_col = add_sentiment_column(active_expert_df)
 
     with dl_col:
         st.write("")
         st.write("")
-        excel_data = to_excel_bytes(all_case_df)
+        excel_data = cached_excel_bytes(all_case_df)
         st.download_button(
             label="Download Raw Data",
             data=excel_data,
@@ -5753,12 +5856,8 @@ def main():
     selected_support = st.sidebar.selectbox("Select Support Type", SUPPORT_TYPES, index=0)
     support_label = selected_support
 
-    support_df = get_by_support(active_expert_df, selected_support)
-
-    # ── Add start_time columns ONCE for Interview Support ────────
-    if selected_support == "Interview Support" and "start_time" in support_df.columns:
-        support_df = add_start_time_columns(support_df)
-        support_df = add_out_of_shift_column(support_df)
+    # ── CACHED per support type (start time + OOS columns) ───────
+    support_df = build_support_df(active_expert_df, selected_support)
 
     st.sidebar.markdown("---")
     st.sidebar.metric("Total Cases (This Year)", len(all_case_df))
@@ -5800,34 +5899,22 @@ def main():
 
     # ── Sidebar: Clash indicator for Interview Support ───────────
     if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
-        clash_groups_check, _ = detect_expert_clashes(support_df)
-        if not clash_groups_check.empty:
+        _sb = cached_sidebar_indicators(support_df, all_interview_support_df)
+        if _sb["clash_groups"] > 0:
             st.sidebar.markdown("---")
-            st.sidebar.metric("⚠️ Total Clash Groups", len(clash_groups_check))
-            st.sidebar.metric("Experts with Clashes", clash_groups_check["expert_name"].nunique())
-
-        # Blockage sidebar indicator
-        blockage_check = detect_blockages(support_df, all_experts_df=all_interview_support_df)
-
-        if not blockage_check.empty:
-            st.sidebar.metric("🚨 Total Blockages", len(blockage_check))
-            st.sidebar.metric("Days with Blockage", blockage_check["date"].dt.date.nunique())
-            # Out-of-Shift sidebar indicator
-        
-        if "out_of_shift" in support_df.columns:
-            oos_valid_sb = get_oos_valid_df(support_df, analytics_filter=True)
-            if not oos_valid_sb.empty:
-                oos_total = int(oos_valid_sb["out_of_shift"].sum())
-                if oos_total > 0:
-                    total_valid = len(oos_valid_sb)
-                    oos_pct_sb = round(oos_total / total_valid * 100, 1) if total_valid > 0 else 0
-                    st.sidebar.markdown("---")
-                    st.sidebar.metric("⏰ OOS (Completed, non-Self)", oos_total)
-                    st.sidebar.metric("OOS %", f"{oos_pct_sb}%")
+            st.sidebar.metric("⚠️ Total Clash Groups", _sb["clash_groups"])
+            st.sidebar.metric("Experts with Clashes", _sb["clash_experts"])
+        if _sb["blockages"] > 0:
+            st.sidebar.metric("🚨 Total Blockages", _sb["blockages"])
+            st.sidebar.metric("Days with Blockage", _sb["blockage_days"])
+        if _sb["oos_total"] > 0:
+            st.sidebar.markdown("---")
+            st.sidebar.metric("⏰ OOS (Completed, non-Self)", _sb["oos_total"])
+            st.sidebar.metric("OOS %", str(_sb["oos_pct"]) + "%")
 
 
     hist = hist_monthly_df(selected_support)
-    live = live_monthly(support_df)
+    live = cached_live_monthly(support_df)
     if not hist.empty and not live.empty:
         monthly = pd.concat([hist, live], ignore_index=True).drop_duplicates("month", keep="last")
     elif not hist.empty:
