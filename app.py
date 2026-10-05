@@ -41,7 +41,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v25 ACTIVE]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -2300,6 +2300,215 @@ def render_advanced_round_kpi(df, label="", key_prefix="adv"):
     )
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  ACTIVE-CANDIDATE OVERALL ANALYSIS
+#
+#  Overall (all-time) advanced-round performance, restricted to
+#  candidates whose Status flag is TRUE (candidate_status_flag).
+#
+#    Overall Ratio      = Overall Interviews / Overall Advanced Rounds
+#    P(PO)              = 1 / Advanced Rounds
+#    P(Advanced Round)  = Advanced Rounds / Total Interviews
+#
+#  Advanced rounds use the same rule as the rest of the app: one
+#  Candidate x Company combination that reached a Final or a
+#  Technical/Coding round (Final wins when a combination has both).
+#  Completed interviews only; Self rounds excluded.
+# ═══════════════════════════════════════════════════════════════════
+
+_ACTIVE_OVERALL_COLS = ["Candidate", "Total Interviews", "Advanced Rounds", "Overall Ratio",
+                        "P(PO) %", "P(Advanced) %", "Final Combos", "Technical Combos",
+                        "Companies", "Experts"]
+
+
+def _truthy_flag(series):
+    """Coerce a status-flag series to boolean, tolerating bools and strings."""
+    def _one(v):
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return False
+        try:
+            if pd.isna(v):
+                return False
+        except Exception:
+            pass
+        return str(v).strip().lower() in ("true", "1", "yes", "y", "active", "enabled")
+    return series.map(_one).astype(bool)
+
+
+def has_candidate_status(df):
+    """True when the frame carries the candidate status flag."""
+    return df is not None and not df.empty and "candidate_status_flag" in df.columns
+
+
+def filter_active_candidates(df):
+    """Keep only rows whose candidate_status_flag is TRUE.
+
+    Returns the frame unchanged when the column is absent, so callers can
+    fall back to all candidates instead of showing an empty section.
+    """
+    if df is None or df.empty or "candidate_status_flag" not in df.columns:
+        return df
+    return df[_truthy_flag(df["candidate_status_flag"])].copy()
+
+
+def active_candidate_overall_table(df, min_interviews=1):
+    """Overall (all-time) advanced-round metrics for ACTIVE candidates only.
+
+    Columns:
+      Total Interviews  completed, non-Self interviews for the candidate
+      Advanced Rounds   distinct advanced Candidate x Company combinations
+      Overall Ratio     Total Interviews / Advanced Rounds      (lower better)
+      P(PO) %           1 / Advanced Rounds                     (higher better)
+      P(Advanced) %     Advanced Rounds / Total Interviews      (higher better)
+    """
+    if (df is None or df.empty or "candidate_name" not in df.columns
+            or "round_name" not in df.columns):
+        return pd.DataFrame(columns=_ACTIVE_OVERALL_COLS)
+
+    d = filter_active_candidates(df)
+    d = _completed_only(d)
+    if d is None or d.empty:
+        return pd.DataFrame(columns=_ACTIVE_OVERALL_COLS)
+
+    d = mark_advanced_rounds(d)
+    u = d[d["_combo_has_final"] | d["_combo_has_tech"]]
+    if u.empty:
+        return pd.DataFrame(columns=_ACTIVE_OVERALL_COLS)
+
+    total_by_cand = d.groupby("_cand").size()
+    adv_by_cand = u.groupby("_cand")["_combo_key"].nunique()
+    fin_by_cand = u[u["_combo_has_final"]].groupby("_cand")["_combo_key"].nunique()
+    comp_by_cand = u.groupby("_cand")["_comp_norm"].nunique()
+    exp_by_cand = (u.groupby("_cand")["expert_name"].nunique()
+                   if "expert_name" in u.columns else adv_by_cand * 0)
+
+    rows = []
+    for cand, n_adv in adv_by_cand.items():
+        total = int(total_by_cand.get(cand, 0))
+        n_adv = int(n_adv)
+        if total < int(min_interviews) or n_adv == 0 or total == 0:
+            continue
+        n_final = int(fin_by_cand.get(cand, 0))
+        rows.append({
+            "Candidate": cand,
+            "Total Interviews": total,
+            "Advanced Rounds": n_adv,
+            "Overall Ratio": round(total / n_adv, 2),
+            "P(PO) %": round(1.0 / n_adv * 100, 1),
+            "P(Advanced) %": round(n_adv / total * 100, 1),
+            "Final Combos": n_final,
+            "Technical Combos": n_adv - n_final,
+            "Companies": int(comp_by_cand.get(cand, 0)),
+            "Experts": int(exp_by_cand.get(cand, 0)),
+        })
+    if not rows:
+        return pd.DataFrame(columns=_ACTIVE_OVERALL_COLS)
+    return (pd.DataFrame(rows, columns=_ACTIVE_OVERALL_COLS)
+            .sort_values(["P(PO) %", "Total Interviews"], ascending=[False, False])
+            .reset_index(drop=True))
+
+
+def render_active_candidate_overall_analysis(df, title_suffix="", min_interviews=1):
+    """Overall (all-time) advanced-round analysis for ACTIVE candidates."""
+    st.markdown("---")
+    st.subheader("📊 Overall Advanced-Round Analysis — Active Candidates" + title_suffix)
+    st.caption(
+        "Overall (all-time) view, restricted to candidates whose **Status is TRUE**. "
+        "Overall Ratio = Overall Interviews ÷ Overall Advanced Rounds · "
+        "P(PO) = 1 ÷ Advanced Rounds · P(Advanced Round) = Advanced Rounds ÷ Total Interviews. "
+        "Advanced round = one Candidate × Company combination that reached a Final or a "
+        "Technical/Coding round (Final wins when a combination has both). "
+        "Completed interviews only, Self rounds excluded."
+    )
+    if not has_candidate_status(df):
+        st.warning("`candidate_status_flag` is not available in the loaded data, so the ACTIVE "
+                   "filter cannot be applied here — all candidates are shown.")
+
+    active_df = filter_active_candidates(df)
+    n_active = 0
+    if active_df is not None and not active_df.empty and "candidate_name" in active_df.columns:
+        n_active = int(active_df["candidate_name"].astype(str).str.strip().nunique())
+    if n_active == 0:
+        st.info("No active-candidate interviews found" + title_suffix + ".")
+        return
+
+    st.markdown("**Active candidates in scope: " + str(n_active) + "**")
+
+    min_iv = st.slider("Minimum interviews per candidate", 1, 20, int(min_interviews),
+                       key="active_overall_min")
+    tbl = active_candidate_overall_table(active_df, min_interviews=min_iv)
+    if tbl.empty:
+        st.info("No active candidate has both an advanced round and at least " + str(min_iv) +
+                " completed interviews" + title_suffix + ".")
+        return
+
+    overall_iv = int(tbl["Total Interviews"].sum())
+    overall_adv = int(tbl["Advanced Rounds"].sum())
+    overall_ratio = round(overall_iv / overall_adv, 2) if overall_adv else None
+    p_po = round(1.0 / overall_adv * 100, 1) if overall_adv else None
+    p_adv = round(overall_adv / overall_iv * 100, 1) if overall_iv else None
+
+    k = st.columns(6)
+    k[0].metric("Active Candidates Ranked", len(tbl))
+    k[1].metric("Overall Interviews", overall_iv)
+    k[2].metric("Overall Advanced Rounds", overall_adv)
+    k[3].metric("Overall Ratio", f"{overall_ratio:.2f}" if overall_ratio is not None else "N/A",
+                delta="Lower is better", delta_color="inverse")
+    k[4].metric("P(PO)", f"{p_po:.1f}%" if p_po is not None else "N/A",
+                delta="1 ÷ Advanced Rounds", delta_color="off")
+    k[5].metric("P(Advanced Round)", f"{p_adv:.1f}%" if p_adv is not None else "N/A",
+                delta="Higher is better", delta_color="normal")
+
+    team_ratio = round(float(tbl["Overall Ratio"].mean()), 2)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        top = tbl.sort_values("Overall Ratio", ascending=True).head(20)
+        plot_t = top.sort_values("Overall Ratio", ascending=False)
+        fig = go.Figure(go.Bar(
+            y=plot_t["Candidate"], x=plot_t["Overall Ratio"], orientation="h",
+            marker_color=["#27ae60" if v <= team_ratio else "#e74c3c" for v in plot_t["Overall Ratio"]],
+            text=plot_t["Overall Ratio"].apply(lambda v: f"{v:.2f}"), textposition="outside",
+            customdata=plot_t[["Total Interviews", "Advanced Rounds", "P(PO) %"]],
+            hovertemplate="%{y}<br>Ratio: %{x:.2f}<br>Interviews: %{customdata[0]}"
+                          "<br>Advanced rounds: %{customdata[1]}<br>P(PO): %{customdata[2]:.1f}%"
+                          "<extra></extra>",
+        ))
+        fig.add_vline(x=team_ratio, line_dash="dash", line_color="#f39c12",
+                      annotation_text=f"Avg: {team_ratio:.2f}")
+        fig.update_layout(title="Top 20 by Overall Ratio (Lower = Better)",
+                          height=max(430, len(plot_t) * 32),
+                          xaxis_title="Overall Interviews ÷ Advanced Rounds")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        tp = tbl.sort_values("P(PO) %", ascending=True).head(20)
+        fig2 = go.Figure()
+        fig2.add_trace(go.Bar(y=tp["Candidate"], x=tp["P(PO) %"], name="P(PO) %",
+                              orientation="h", marker_color="#8e44ad",
+                              text=tp["P(PO) %"].apply(lambda v: f"{v:.1f}%"),
+                              textposition="inside"))
+        fig2.add_trace(go.Bar(y=tp["Candidate"], x=tp["P(Advanced) %"], name="P(Advanced) %",
+                              orientation="h", marker_color="#2980b9",
+                              text=tp["P(Advanced) %"].apply(lambda v: f"{v:.1f}%"),
+                              textposition="inside"))
+        fig2.update_layout(barmode="group", title="Top 20 by P(PO) — vs P(Advanced)",
+                           height=max(430, len(tp) * 32),
+                           xaxis_title="Probability %",
+                           legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"))
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with st.expander("Full Overall Active-Candidate table" + title_suffix):
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
+        st.caption(
+            "Sorted by P(PO) descending. Overall Ratio and P(PO) are driven by the number of "
+            "advanced rounds; P(Advanced Round) is the share of the candidate's interviews that "
+            "reached an advanced round."
+        )
+
+
 def cluster_company_names(raw_names, threshold=PROSPECT_COMPANY_SIM_THRESHOLD):
     """Cluster the raw company spellings of ONE candidate.
 
@@ -2838,7 +3047,7 @@ def fetch_all_data():
 
 def normalize(df):
     cols_to_drop = ["case_candidate_phone", "status", "filled_by_username", "candidate_resume",
-                    "case_candidate_email", "candidate_phone", "candidate_email", "candidate_status_flag",
+                    "case_candidate_email", "candidate_phone", "candidate_email",
                     "expert_is_team_lead", "expert_date_of_joining", "filled_by_first_name",
                     "filled_by_last_name", "filled_by_email"]
     id_cols = [c for c in df.columns if c.endswith("_id") or c == "id"]
@@ -2853,6 +3062,12 @@ def normalize(df):
         df.loc[~df["task_status"].isin(["completed", "rescheduled", "cancelled", "pending"]), "task_status"] = "pending"
     if "support_name" in df.columns:
         df["support_name"] = df["support_name"].astype(str).str.strip()
+    if "candidate_status_flag" in df.columns:
+        _cs = df["candidate_status_flag"]
+        df["candidate_status_flag"] = _cs.map(
+            lambda v: v if isinstance(v, bool)
+            else str(v).strip().lower() in ("true", "1", "yes", "y", "active", "enabled")
+        ).astype(bool)
     return df
 
 
@@ -6029,9 +6244,14 @@ def render_assessment_conversion_charts(conv_df, title_suffix=""):
 
 CACHE_TTL = 600  # seconds — matches the documented refresh window
 
+# Bump this string whenever the data pipeline changes. It is passed into
+# load_data_pipeline() so it becomes part of the @st.cache_data cache key,
+# forcing a fresh run instead of serving a stale cached DataFrame.
+DATA_PIPELINE_VERSION = "v25-active-candidates"
+
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner="Loading data pipeline...")
-def load_data_pipeline():
+def load_data_pipeline(pipeline_version=DATA_PIPELINE_VERSION):
     """Fetch -> normalize -> filter -> Self-row fixup -> sentiment, cached."""
     raw = fetch_all_data()
     if raw is None or raw.empty:
@@ -6139,6 +6359,7 @@ def lazy_tab_selector(tab_names, key, label="Section"):
 
 
 def main():
+    st.markdown("## 🚀 BUILD v25.0 — ADVANCED ROUNDS + ACTIVE CANDIDATES (deploy canary — if you do not see this, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -7344,11 +7565,24 @@ def main():
                 
             # ── CANDIDATE STRENGTH ANALYSIS (All Data) ──────────
             if selected_support == "Interview Support":
-                render_top_candidates_analysis(support_df,
-                                                title_suffix=" — All Data",
+                _active_ok = has_candidate_status(support_df)
+                if _active_ok:
+                    st.caption("Overall analyses below include **ACTIVE candidates only** "
+                               "(candidate_status_flag = TRUE).")
+                    _active_df = filter_active_candidates(support_df)
+                else:
+                    st.warning("`candidate_status_flag` is not present in the loaded data — "
+                               "the overall analyses below fall back to ALL candidates.")
+                    _active_df = support_df
+
+                render_active_candidate_overall_analysis(support_df,
+                                                         title_suffix=" — All Data",
+                                                         min_interviews=1)
+                render_top_candidates_analysis(_active_df,
+                                                title_suffix=" — All Data (Active Candidates)",
                                                 min_interviews=5)
-                render_candidate_quality_analysis(support_df,
-                                                  title_suffix=" — All Data",
+                render_candidate_quality_analysis(_active_df,
+                                                  title_suffix=" — All Data (Active Candidates)",
                                                   min_interviews=5)
     
 
@@ -7402,7 +7636,7 @@ def main():
         render_schedule_view(all_case_df, active_expert_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v24.0 — ADVANCED ROUNDS | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
+    st.sidebar.caption("Vizva Dashboard v25.0 — ADVANCED ROUNDS + ACTIVE CANDIDATES | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
 
 
 # ═══════════════════════════════════════════════════════════════════
