@@ -1984,6 +1984,322 @@ def classify_round_type(round_name):
     return "Other"
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  ADVANCED-ROUND MODEL — the single source of truth for every
+#  Final / Technical-Coding conversion KPI.
+#
+#  An "advanced round" is a Candidate x Company COMBINATION that reached
+#  a Final round or a Technical/Coding round.
+#
+#     * combination has BOTH Final and Technical/Coding
+#           -> only the FINAL counts as the advanced round; every
+#              Technical/Coding round of that combination is EXCLUDED
+#              from the Technical/Coding analysis (it counts only in
+#              the Final round).
+#     * combination has ONLY Technical/Coding
+#           -> the Technical/Coding round is the advanced round.
+#     * combination has ONLY Final
+#           -> the Final round is the advanced round.
+#
+#  One combination = ONE advanced round (repeat rounds of the same
+#  combination count once, exactly like the Prospect Analysis model).
+#
+#  Every ratio below is therefore:
+#        Total Interviews  /  Total Advanced Rounds
+#  and LOWER IS BETTER.
+# ═══════════════════════════════════════════════════════════════════
+
+ADV_FINAL = "Final"
+ADV_TECH = "Technical/Coding"
+
+_QUALITY_COLS = ["Candidate", "Total Interviews", "Advanced Rounds", "Quality Score",
+                 "Final Combos", "Technical Combos", "Companies", "Experts"]
+
+
+def mark_advanced_rounds(df):
+    """Annotate an interview frame with the advanced-round columns.
+
+    Adds (all underscore-prefixed, safe to ignore elsewhere):
+      _cand              candidate name (stripped)
+      _comp_norm         normalized company name
+      _combo_key         candidate + normalized company (the combination)
+      _rt                classify_round_type(round_name)
+      _is_final_row      row is a Final round
+      _is_tech_row       row is a Technical/Coding round
+      _combo_has_final   the combination has >= 1 Final round
+      _combo_has_tech    the combination has >= 1 Technical/Coding round
+      _adv_round_type    'Final' | 'Technical/Coding' | None  (per combination)
+      _is_advanced       row is the Final, or a Technical in a tech-only combo
+      _is_excluded_tech  row is a Technical but the combo also has a Final
+      _adv_repr          the single representative row of the combination
+    """
+    out = df.copy()
+    if out.empty:
+        for c in ("_cand", "_comp_norm", "_combo_key", "_rt", "_adv_round_type"):
+            out[c] = pd.Series(dtype=object)
+        for c in ("_is_final_row", "_is_tech_row", "_combo_has_final",
+                  "_combo_has_tech", "_is_advanced", "_is_excluded_tech", "_adv_repr"):
+            out[c] = pd.Series(dtype=bool)
+        return out
+
+    out["_cand"] = (out["candidate_name"].astype(str).str.strip()
+                    if "candidate_name" in out.columns else "")
+    if "company_name" in out.columns:
+        out["_comp_norm"] = out["company_name"].apply(_normalize_company)
+    else:
+        out["_comp_norm"] = ""
+    out["_comp_norm"] = out["_comp_norm"].replace("", "(not specified)")
+    out["_combo_key"] = out["_cand"].astype(str) + " ||| " + out["_comp_norm"].astype(str)
+
+    out["_rt"] = (out["round_name"].apply(classify_round_type)
+                  if "round_name" in out.columns else ADV_FINAL * 0)
+    if "round_name" not in out.columns:
+        out["_rt"] = "Other"
+    out["_is_final_row"] = out["_rt"] == ADV_FINAL
+    out["_is_tech_row"] = out["_rt"] == ADV_TECH
+
+    grp = out.groupby("_combo_key", sort=False)
+    out["_combo_has_final"] = grp["_is_final_row"].transform("max").astype(bool)
+    out["_combo_has_tech"] = grp["_is_tech_row"].transform("max").astype(bool)
+
+    out["_adv_round_type"] = [
+        ADV_FINAL if f else (ADV_TECH if t else None)
+        for f, t in zip(out["_combo_has_final"].tolist(), out["_combo_has_tech"].tolist())
+    ]
+    out["_is_advanced"] = out["_is_final_row"] | (out["_is_tech_row"] & ~out["_combo_has_final"])
+    out["_is_excluded_tech"] = out["_is_tech_row"] & out["_combo_has_final"]
+
+    # one representative row per advanced combination: the first Final if the
+    # combination has one, otherwise the first Technical/Coding round
+    out["_adv_repr"] = False
+    for _, idx in out.groupby("_combo_key", sort=False).groups.items():
+        sub = out.loc[idx]
+        finals = sub.index[sub["_is_final_row"].tolist()]
+        if len(finals):
+            out.loc[finals[0], "_adv_repr"] = True
+            continue
+        techs = sub.index[sub["_is_tech_row"].tolist()]
+        if len(techs):
+            out.loc[techs[0], "_adv_repr"] = True
+    return out
+
+
+def advanced_round_units(df):
+    """One row per Candidate x Company combination that reached an advanced round."""
+    cols = ["Candidate", "Company", "Advanced Round Type", "Final Rounds",
+            "Technical Rounds", "Total Rounds", "Experts", "First Date"]
+    if df is None or df.empty or "round_name" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    d = mark_advanced_rounds(df)
+    d = d[d["_combo_has_final"] | d["_combo_has_tech"]]
+    if d.empty:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for key, grp in d.groupby("_combo_key", sort=False):
+        experts = sorted(set(str(x).strip() for x in grp.get("expert_name", pd.Series(dtype=str)).tolist()
+                             if str(x).strip() and str(x).strip().lower() != "nan"))
+        first_date = grp["date"].min() if "date" in grp.columns else None
+        rows.append({
+            "Candidate": grp["_cand"].iloc[0],
+            "Company": grp["_comp_norm"].iloc[0],
+            "Advanced Round Type": ADV_FINAL if bool(grp["_combo_has_final"].iloc[0]) else ADV_TECH,
+            "Final Rounds": int(grp["_is_final_row"].sum()),
+            "Technical Rounds": int(grp["_is_tech_row"].sum()),
+            "Total Rounds": int(len(grp)),
+            "Experts": ", ".join(experts),
+            "First Date": first_date,
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
+def advanced_round_metrics(df):
+    """Headline numbers for the advanced-round KPI."""
+    empty = {"total_interviews": 0, "advanced_rounds": 0, "ratio": None,
+             "final_units": 0, "tech_units": 0, "excluded_tech": 0,
+             "final_round_rows": 0, "tech_round_rows": 0}
+    if df is None or df.empty or "round_name" not in df.columns:
+        return empty
+    d = mark_advanced_rounds(df)
+    u = d[d["_combo_has_final"] | d["_combo_has_tech"]]
+    if u.empty:
+        return empty
+    n_units = int(u["_combo_key"].nunique())
+    n_final = int(u.loc[u["_combo_has_final"], "_combo_key"].nunique())
+    total = int(len(d))
+    return {
+        "total_interviews": total,
+        "advanced_rounds": n_units,
+        "ratio": round(total / n_units, 2) if n_units > 0 else None,
+        "final_units": n_final,
+        "tech_units": n_units - n_final,
+        "excluded_tech": int(d["_is_excluded_tech"].sum()),
+        "final_round_rows": int(d["_is_final_row"].sum()),
+        "tech_round_rows": int(d["_is_tech_row"].sum()),
+    }
+
+
+def _completed_only(df):
+    """Completed rows only, excluding the candidate's own (Self) rounds."""
+    d = df
+    if "task_status" in d.columns:
+        d = d[d["task_status"].astype(str).str.strip().str.lower() == "completed"]
+    if "candidate_name" in d.columns and "expert_name" in d.columns:
+        d = d[d["expert_name"].astype(str).str.strip().str.lower() != "self"]
+    return d
+
+
+def candidate_quality_table(df, min_interviews=1):
+    """Candidate-wise Advanced-Round Quality Score.
+
+    Quality Score = the candidate's Total Interviews / Total Advanced Rounds.
+    LOWER IS BETTER (fewer interviews to reach an advanced round).
+    One Candidate x Company combination = one advanced round.
+    Completed interviews only; the candidate's own (Self) rounds are excluded.
+    """
+    if df is None or df.empty or "round_name" not in df.columns or "candidate_name" not in df.columns:
+        return pd.DataFrame(columns=_QUALITY_COLS)
+    d = _completed_only(df)
+    if d.empty:
+        return pd.DataFrame(columns=_QUALITY_COLS)
+    d = mark_advanced_rounds(d)
+    u = d[d["_combo_has_final"] | d["_combo_has_tech"]]
+    if u.empty:
+        return pd.DataFrame(columns=_QUALITY_COLS)
+
+    total_by_cand = d.groupby("_cand").size()
+    adv_by_cand = u.groupby("_cand")["_combo_key"].nunique()
+    fin_by_cand = u[u["_combo_has_final"]].groupby("_cand")["_combo_key"].nunique()
+    comp_by_cand = u.groupby("_cand")["_comp_norm"].nunique()
+    exp_by_cand = (u.groupby("_cand")["expert_name"].nunique()
+                   if "expert_name" in u.columns else adv_by_cand * 0)
+
+    rows = []
+    for cand, n_adv in adv_by_cand.items():
+        total = int(total_by_cand.get(cand, 0))
+        n_adv = int(n_adv)
+        if total < int(min_interviews) or n_adv == 0:
+            continue
+        n_final = int(fin_by_cand.get(cand, 0))
+        rows.append({
+            "Candidate": cand,
+            "Total Interviews": total,
+            "Advanced Rounds": n_adv,
+            "Quality Score": round(total / n_adv, 2),
+            "Final Combos": n_final,
+            "Technical Combos": n_adv - n_final,
+            "Companies": int(comp_by_cand.get(cand, 0)),
+            "Experts": int(exp_by_cand.get(cand, 0)),
+        })
+    if not rows:
+        return pd.DataFrame(columns=_QUALITY_COLS)
+    return (pd.DataFrame(rows, columns=_QUALITY_COLS)
+            .sort_values(["Quality Score", "Total Interviews"], ascending=[True, False])
+            .reset_index(drop=True))
+
+
+def render_candidate_quality_analysis(df, title_suffix="", min_interviews=5):
+    """Top 10 BEST (lowest score) and Top 10 WEAKEST (highest score)."""
+    st.markdown("---")
+    st.subheader("🎯 Candidate Quality Score — Advanced Rounds" + title_suffix)
+    st.caption(
+        "Quality Score = the candidate's Total Interviews ÷ Total Advanced Rounds. "
+        "An advanced round is a Candidate × Company combination that reached a Final or a "
+        "Technical/Coding round; if a combination has both, only the Final counts. "
+        "LOWER IS BETTER — fewer interviews were needed to reach an advanced round. "
+        "Completed interviews only, Self rounds excluded, minimum " + str(min_interviews) + " interviews."
+    )
+    q = candidate_quality_table(df, min_interviews=min_interviews)
+    if q.empty:
+        st.info("No candidate with an advanced round and at least " + str(min_interviews) +
+                " completed interviews was found" + title_suffix + ".")
+        return
+
+    best = q.head(10).reset_index(drop=True)
+    worst = q.tail(10).sort_values("Quality Score", ascending=False).reset_index(drop=True)
+    team_avg = round(float(q["Quality Score"].mean()), 2)
+
+    k = st.columns(4)
+    k[0].metric("Ranked Candidates", len(q))
+    k[1].metric("Team Avg Quality Score", f"{team_avg:.2f}",
+                delta="Lower is better", delta_color="inverse")
+    if not best.empty:
+        k[2].metric("Best Candidate", str(best.iloc[0]["Candidate"]),
+                    delta=f"{best.iloc[0]['Quality Score']:.2f}", delta_color="inverse")
+    if not worst.empty:
+        k[3].metric("Weakest Candidate", str(worst.iloc[0]["Candidate"]),
+                    delta=f"{worst.iloc[0]['Quality Score']:.2f}", delta_color="normal")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### ✅ Top 10 Best Candidates (lowest score)")
+        plot_best = best.sort_values("Quality Score", ascending=False)
+        fig = go.Figure(go.Bar(
+            y=plot_best["Candidate"], x=plot_best["Quality Score"], orientation="h",
+            marker_color=["#27ae60" if v <= team_avg else "#2ecc71" for v in plot_best["Quality Score"]],
+            text=plot_best["Quality Score"].apply(lambda v: f"{v:.2f}"), textposition="outside",
+            customdata=plot_best[["Total Interviews", "Advanced Rounds"]],
+            hovertemplate="%{y}<br>Score: %{x:.2f}<br>Interviews: %{customdata[0]}"
+                          "<br>Advanced rounds: %{customdata[1]}<extra></extra>",
+        ))
+        fig.add_vline(x=team_avg, line_dash="dash", line_color="#f39c12",
+                      annotation_text=f"Avg: {team_avg:.2f}")
+        fig.update_layout(title="Top 10 Best (Lower = Better)",
+                          height=max(420, len(plot_best) * 38),
+                          xaxis_title="Quality Score (Interviews per Advanced Round)")
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        st.markdown("### ⚠️ Top 10 Weakest Candidates (highest score)")
+        plot_worst = worst.sort_values("Quality Score", ascending=False)
+        fig2 = go.Figure(go.Bar(
+            y=plot_worst["Candidate"], x=plot_worst["Quality Score"], orientation="h",
+            marker_color=["#c0392b" if v > team_avg * 1.5 else "#e74c3c" for v in plot_worst["Quality Score"]],
+            text=plot_worst["Quality Score"].apply(lambda v: f"{v:.2f}"), textposition="outside",
+            customdata=plot_worst[["Total Interviews", "Advanced Rounds"]],
+            hovertemplate="%{y}<br>Score: %{x:.2f}<br>Interviews: %{customdata[0]}"
+                          "<br>Advanced rounds: %{customdata[1]}<extra></extra>",
+        ))
+        fig2.add_vline(x=team_avg, line_dash="dash", line_color="#f39c12",
+                       annotation_text=f"Avg: {team_avg:.2f}")
+        fig2.update_layout(title="Top 10 Weakest (Higher = More Interviews per Advanced Round)",
+                           height=max(420, len(plot_worst) * 38),
+                           xaxis_title="Quality Score (Interviews per Advanced Round)")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with st.expander("Full Candidate Quality Score table" + title_suffix):
+        st.dataframe(q, use_container_width=True, hide_index=True)
+
+
+def render_advanced_round_kpi(df, label="", key_prefix="adv"):
+    """The Interviews-per-Advanced-Round KPI row + combination split."""
+    st.subheader("Interview Conversion Rate — Advanced Rounds " + label)
+    st.caption(
+        "Total Interviews ÷ Total Advanced Rounds. An advanced round is a Candidate × Company "
+        "combination that reached a Final or a Technical/Coding round. If a combination has both, "
+        "only the Final counts as the advanced round and its Technical/Coding rounds are excluded "
+        "from the Technical analysis. One combination counts once. LOWER IS BETTER."
+    )
+    m = advanced_round_metrics(df)
+    if m["total_interviews"] == 0:
+        st.info("No interview data for the advanced-round conversion KPI" + label + ".")
+        return
+    cols = st.columns(5)
+    cols[0].metric("Total Completed", m["total_interviews"])
+    cols[1].metric("Advanced Rounds", m["advanced_rounds"])
+    cols[2].metric("Combos → Final", m["final_units"])
+    cols[3].metric("Combos → Technical only", m["tech_units"])
+    if m["ratio"] is not None:
+        cols[4].metric("Interviews per Advanced Round", f"{m['ratio']:.2f}",
+                       delta="Lower is better", delta_color="inverse")
+    else:
+        cols[4].metric("Interviews per Advanced Round", "N/A")
+    st.caption(
+        "Raw Final rounds: " + str(m["final_round_rows"]) +
+        " · Raw Technical/Coding rounds: " + str(m["tech_round_rows"]) +
+        " · Technical rounds excluded because the combination also reached a Final: " +
+        str(m["excluded_tech"]) + "."
+    )
+
+
 def cluster_company_names(raw_names, threshold=PROSPECT_COMPANY_SIM_THRESHOLD):
     """Cluster the raw company spellings of ONE candidate.
 
@@ -6316,8 +6632,15 @@ def main():
                                                 # ── TECHNICAL / CODING ROUND — GIVEN BY WHOM ─────
                         st.markdown("---")
                         st.subheader("Technical / Coding Round — Given By Whom (" + sel_cr_month + ")")
-                        tech_mask = cr_month_data["round_name"].str.lower().str.contains("technical|coding", na=False)
-                        tech_data = cr_month_data[tech_mask]
+                        _tech_annot = mark_advanced_rounds(cr_month_data)
+                        tech_data = _tech_annot[_tech_annot["_is_tech_row"] & ~_tech_annot["_is_excluded_tech"]]
+                        _tech_excluded = int(_tech_annot["_is_excluded_tech"].sum())
+                        if _tech_excluded:
+                            st.caption(
+                                "Advanced-round rule: " + str(_tech_excluded) + " Technical/Coding round(s) "
+                                "are excluded here because the same Candidate × Company combination also reached "
+                                "a Final round — they count only in the Final round above."
+                            )
 
                         if tech_data.empty:
                             st.info("No 'Technical / Coding' rounds found in completed interviews for " + sel_cr_month)
@@ -6400,52 +6723,30 @@ def main():
                             with st.expander("Monthly Finals + Technical/Coding Data"):
                                 st.dataframe(ft_monthly, use_container_width=True, hide_index=True)
 
-                        # ── CONVERSION KPI: INTERVIEWS PER FINAL+TECHNICAL ──
+                        # ── CONVERSION KPI: INTERVIEWS PER ADVANCED ROUND ──
                         st.markdown("---")
-                        st.subheader("Interview Conversion Rate — " + sel_cr_month)
+                        render_advanced_round_kpi(cr_month_data, "— " + sel_cr_month)
+
+                        # ── MONTHLY CONVERSION TREND (ADVANCED ROUNDS) ─────
+                        st.markdown("---")
+                        st.subheader("Monthly Conversion Trend — Advanced Rounds")
                         st.caption(
-                            "Total Completed Interviews ÷ (Finals + Technical/Coding) = "
-                            "how many interviews it takes on average to reach a Final or Technical/Coding round. "
-                            "Lower is better."
+                            "Completed Interviews ÷ Advanced Rounds per month. An advanced round is a "
+                            "Candidate × Company combination that reached a Final or a Technical/Coding "
+                            "round (Final wins when a combination has both). Lower means faster conversion."
                         )
-
-                        total_completed_month = len(cr_month_data)
-                        final_count_month = len(cr_month_data[cr_month_data["round_name"].str.lower().str.contains("final", na=False)])
-                        tech_count_month = len(cr_month_data[cr_month_data["round_name"].str.lower().str.contains("technical|coding", na=False)])
-                        ft_total_month = final_count_month + tech_count_month
-
-                        conv_cols = st.columns(5)
-                        conv_cols[0].metric("Total Completed", total_completed_month)
-                        conv_cols[1].metric("Final Rounds", final_count_month)
-                        conv_cols[2].metric("Technical/Coding Rounds", tech_count_month)
-                        conv_cols[3].metric("Finals + Technical/Coding", ft_total_month)
-                        if ft_total_month > 0:
-                            ratio = round(total_completed_month / ft_total_month, 2)
-                            conv_cols[4].metric("Interviews per Final+Tech", f"{ratio:.2f}",
-                                                delta="Lower is better", delta_color="inverse")
-                        else:
-                            conv_cols[4].metric("Interviews per Final+Tech", "N/A")
-
-                        # ── MONTHLY CONVERSION TREND ─────────────────
-                        st.markdown("---")
-                        st.subheader("Monthly Conversion Trend")
-                        st.caption("Completed Interviews ÷ (Finals + Technical/Coding) per month — lower means faster conversion")
 
                         conv_rows = []
                         for m in sorted(completed_iv["month"].unique()):
-                            m_data = completed_iv[completed_iv["month"] == m]
-                            m_total = len(m_data)
-                            m_final = len(m_data[m_data["round_name"].str.lower().str.contains("final", na=False)])
-                            m_tech = len(m_data[m_data["round_name"].str.lower().str.contains("technical|coding", na=False)])
-                            m_ft = m_final + m_tech
-                            m_ratio = round(m_total / m_ft, 2) if m_ft > 0 else None
+                            m_metrics = advanced_round_metrics(completed_iv[completed_iv["month"] == m])
                             conv_rows.append({
                                 "Month": m,
-                                "Completed": m_total,
-                                "Finals": m_final,
-                                "Technical/Coding": m_tech,
-                                "Finals+Tech": m_ft,
-                                "Ratio": m_ratio,
+                                "Completed": m_metrics["total_interviews"],
+                                "Advanced Rounds": m_metrics["advanced_rounds"],
+                                "Combos → Final": m_metrics["final_units"],
+                                "Combos → Technical": m_metrics["tech_units"],
+                                "Excluded Technical": m_metrics["excluded_tech"],
+                                "Ratio": m_metrics["ratio"],
                             })
                         conv_df = pd.DataFrame(conv_rows)
 
@@ -6459,60 +6760,65 @@ def main():
                                 textposition="top center",
                                 line=dict(color="#e67e22", width=3),
                                 marker=dict(size=10),
-                                name="Interviews per Final+Tech",
+                                name="Interviews per Advanced Round",
                             ))
                             fig_conv.add_trace(go.Bar(
-                                x=valid_conv["Month"], y=valid_conv["Finals+Tech"],
-                                name="Finals+Tech Count", marker_color="#8e44ad", opacity=0.3,
-                                text=valid_conv["Finals+Tech"], textposition="outside",
+                                x=valid_conv["Month"], y=valid_conv["Advanced Rounds"],
+                                name="Advanced Rounds", marker_color="#8e44ad", opacity=0.3,
+                                text=valid_conv["Advanced Rounds"], textposition="outside",
                                 yaxis="y2",
                             ))
                             fig_conv.update_layout(
-                                title="Monthly Conversion: Interviews per Final+Technical Round",
+                                title="Monthly Conversion: Interviews per Advanced Round",
                                 height=450,
                                 yaxis=dict(title="Ratio (lower = better)", side="left"),
-                                yaxis2=dict(title="Finals+Tech Count", side="right", overlaying="y"),
+                                yaxis2=dict(title="Advanced Rounds", side="right", overlaying="y"),
                                 legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
                             )
                             st.plotly_chart(fig_conv, use_container_width=True)
 
-                        with st.expander("Monthly Conversion Data"):
+                        with st.expander("Monthly Conversion Data (Advanced Rounds)"):
                             st.dataframe(conv_df, use_container_width=True, hide_index=True)
 
-                        # ── EXPERT-WISE CONVERSION KPI ───────────────
+                        # ── EXPERT-WISE CONVERSION KPI (ADVANCED ROUNDS) ─────
                         st.markdown("---")
                         st.subheader("Expert-wise Conversion Rate — " + sel_cr_month)
                         st.caption(
-                            "Each expert's Completed Interviews ÷ (Finals + Technical/Coding). "
-                            "Lower ratio = expert reaches advanced rounds faster."
+                            "Each expert's Completed Interviews ÷ Advanced Rounds they closed. "
+                            "An advanced round is attributed to the expert who gave the deciding round "
+                            "(the Final when the combination reached one, otherwise the Technical/Coding). "
+                            "Technical/Coding rounds of a combination that also reached a Final are excluded. "
+                            "Lower ratio = the expert reaches advanced rounds faster."
                         )
 
                         if "expert_name" in cr_month_data.columns:
+                            _adv_month = mark_advanced_rounds(cr_month_data)
+                            _units_month = _adv_month[_adv_month["_adv_repr"]]
                             expert_conv_rows = []
                             for expert in sorted(cr_month_data["expert_name"].unique()):
-                                e_data = cr_month_data[cr_month_data["expert_name"] == expert]
+                                e_data = _adv_month[_adv_month["expert_name"] == expert]
                                 e_total = len(e_data)
-                                e_final = len(e_data[e_data["round_name"].str.lower().str.contains("final", na=False)])
-                                e_tech = len(e_data[e_data["round_name"].str.lower().str.contains("technical|coding", na=False)])
-                                e_ft = e_final + e_tech
-                                e_ratio = round(e_total / e_ft, 2) if e_ft > 0 else None
+                                e_units = _units_month[_units_month["expert_name"] == expert]
+                                e_adv = int(len(e_units))
+                                e_final = int((e_units["_adv_round_type"] == ADV_FINAL).sum())
+                                e_tech = int((e_units["_adv_round_type"] == ADV_TECH).sum())
+                                e_ratio = round(e_total / e_adv, 2) if e_adv > 0 else None
                                 expert_conv_rows.append({
                                     "Expert": expert,
                                     "Completed": e_total,
-                                    "Finals": e_final,
-                                    "Technical/Coding": e_tech,
-                                    "Finals+Tech": e_ft,
+                                    "Advanced Rounds": e_adv,
+                                    "Combos → Final": e_final,
+                                    "Combos → Technical": e_tech,
+                                    "Excluded Technical": int(e_data["_is_excluded_tech"].sum()),
                                     "Ratio": e_ratio,
                                 })
                             expert_conv_df = pd.DataFrame(expert_conv_rows)
 
-                            # Show KPI cards for top/bottom performers
                             valid_expert_conv = expert_conv_df.dropna(subset=["Ratio"])
+                            avg_ratio = round(valid_expert_conv["Ratio"].mean(), 2) if not valid_expert_conv.empty else None
                             if not valid_expert_conv.empty:
                                 best = valid_expert_conv.loc[valid_expert_conv["Ratio"].idxmin()]
                                 worst = valid_expert_conv.loc[valid_expert_conv["Ratio"].idxmax()]
-                                avg_ratio = round(valid_expert_conv["Ratio"].mean(), 2)
-
                                 perf_cols = st.columns(3)
                                 perf_cols[0].metric("Best Converter", str(best["Expert"]),
                                                     delta=f"{best['Ratio']:.2f} ratio", delta_color="inverse")
@@ -6520,11 +6826,11 @@ def main():
                                                     delta=f"{worst['Ratio']:.2f} ratio", delta_color="normal")
                                 perf_cols[2].metric("Team Average", f"{avg_ratio:.2f}")
 
-                            # Bar chart of expert conversion ratios
-                            valid_sorted = valid_expert_conv.sort_values("Ratio", ascending=True) if not valid_expert_conv.empty else pd.DataFrame()
+                            valid_sorted = (valid_expert_conv.sort_values("Ratio", ascending=True)
+                                            if not valid_expert_conv.empty else pd.DataFrame())
                             if not valid_sorted.empty:
                                 bar_colors = ["#2ecc71" if r <= avg_ratio else "#e74c3c"
-                                              for r in valid_sorted["Ratio"]] if not valid_expert_conv.empty else []
+                                              for r in valid_sorted["Ratio"]]
                                 fig_ec = go.Figure(go.Bar(
                                     y=valid_sorted["Expert"], x=valid_sorted["Ratio"],
                                     orientation="h", marker_color=bar_colors,
@@ -6534,7 +6840,7 @@ def main():
                                 fig_ec.add_vline(x=avg_ratio, line_dash="dash", line_color="#f39c12",
                                                  annotation_text=f"Avg: {avg_ratio:.2f}")
                                 fig_ec.update_layout(
-                                    title="Expert Conversion Rate — Interviews per Final+Technical (" + sel_cr_month + ")",
+                                    title="Expert Conversion Rate — Interviews per Advanced Round (" + sel_cr_month + ")",
                                     height=max(450, len(valid_sorted) * 35),
                                     xaxis_title="Ratio (lower = better)",
                                     yaxis=dict(autorange="reversed"),
@@ -6554,6 +6860,11 @@ def main():
                         # ── PROSPECT ANALYSIS (Candidate x Company) ──────
                         st.markdown("---")
                         render_prospect_analysis(completed_iv, sel_cr_month)
+
+                        # ── CANDIDATE QUALITY SCORE (ADVANCED ROUNDS) ────
+                        render_candidate_quality_analysis(completed_iv,
+                                                          title_suffix=" — " + sel_cr_month,
+                                                          min_interviews=5)
         # ── ASSESSMENT CONVERSION ANALYTICS ──────────────────────
         if selected_support == "Assessment Support":
             st.markdown("---")
@@ -6777,6 +7088,12 @@ def main():
                                             if c in final_data.columns]
                             st.dataframe(final_data[display_cols] if display_cols else final_data,
                                          use_container_width=True, hide_index=True)
+
+                    st.markdown("---")
+                    render_advanced_round_kpi(completed_p, "— " + str(start) + " to " + str(end))
+                    render_candidate_quality_analysis(completed_p,
+                                                      title_suffix=" — " + str(start) + " to " + str(end),
+                                                      min_interviews=5)
 
                     st.markdown("---")
                     st.subheader("Sentiment — All Completed Interviews (" + str(start) + " to " + str(end) + ")")
@@ -7030,6 +7347,9 @@ def main():
                 render_top_candidates_analysis(support_df,
                                                 title_suffix=" — All Data",
                                                 min_interviews=5)
+                render_candidate_quality_analysis(support_df,
+                                                  title_suffix=" — All Data",
+                                                  min_interviews=5)
     
 
         with tabs[6]:
