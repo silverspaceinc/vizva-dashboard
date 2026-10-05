@@ -7402,7 +7402,7 @@ def main():
         render_schedule_view(all_case_df, active_expert_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v23.0 | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
+    st.sidebar.caption("Vizva Dashboard v24.0 — ADVANCED ROUNDS | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
 
 
 # ═══════════════════════════════════════════════════════════════════
