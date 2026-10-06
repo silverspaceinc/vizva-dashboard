@@ -41,7 +41,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v25 ACTIVE]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v25.1 MONTH-FIX]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -6359,7 +6359,7 @@ def lazy_tab_selector(tab_names, key, label="Section"):
 
 
 def main():
-    st.markdown("## 🚀 BUILD v25.0 — ADVANCED ROUNDS + ACTIVE CANDIDATES (deploy canary — if you do not see this, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v25.1 — MONTH-SCOPED CANDIDATE QUALITY (deploy canary — if you do not see this, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -7083,9 +7083,12 @@ def main():
                         render_prospect_analysis(completed_iv, sel_cr_month)
 
                         # ── CANDIDATE QUALITY SCORE (ADVANCED ROUNDS) ────
-                        render_candidate_quality_analysis(completed_iv,
+                        # NOTE: must be fed cr_month_data (the SELECTED month),
+                        # not completed_iv (all months), so a candidate with no
+                        # interviews in the selected month cannot appear.
+                        render_candidate_quality_analysis(cr_month_data,
                                                           title_suffix=" — " + sel_cr_month,
-                                                          min_interviews=5)
+                                                          min_interviews=1)
         # ── ASSESSMENT CONVERSION ANALYTICS ──────────────────────
         if selected_support == "Assessment Support":
             st.markdown("---")
@@ -7636,7 +7639,7 @@ def main():
         render_schedule_view(all_case_df, active_expert_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v25.0 — ADVANCED ROUNDS + ACTIVE CANDIDATES | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
+    st.sidebar.caption("Vizva Dashboard v25.1 — MONTH-SCOPED CANDIDATE QUALITY | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
 
 
 # ═══════════════════════════════════════════════════════════════════
