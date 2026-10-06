@@ -6464,8 +6464,8 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
-                                            "Daily Drill-Down", "Deep-Dive Analytics",
-                                            "Schedule View"], label_visibility="collapsed")
+                                            "Daily Drill-Down", "Deep-Dive Analytics"],
+                                            label_visibility="collapsed")
 
     # ======= TODAY =======
     if view == "Todays Snapshot":
@@ -7634,12 +7634,8 @@ def main():
                     render_assessment_conversion_charts(conv_df_deep, " - All Data")
                 else:
                     st.info("No assessment data available for conversion analysis.")
-    # ====== SCHEDULE VIEW ======
-    elif view == "Schedule View":
-        render_schedule_view(all_case_df, active_expert_df)
-
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v25.1 — MONTH-SCOPED CANDIDATE QUALITY | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
+    st.sidebar.caption("Vizva Dashboard v25.2 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
 
 
 # ═══════════════════════════════════════════════════════════════════
