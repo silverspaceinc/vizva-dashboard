@@ -1,3 +1,10 @@
+# ═══════════════════════════════════════════════════════════════════
+# Vizva Interview Dashboard — v25.3 (sticky section navigation)
+# Base: v25.1 MONTH-FIX file supplied 2026-10-20.
+# Added: vz_nav_css() / vz_anchor() / vz_nav() plus a sticky "Jump to" bar
+#        on Todays Snapshot, Monthly Overview, Daily Drill-Down and the
+#        Deep-Dive > Candidates tab. 27 jump targets in total.
+# ═══════════════════════════════════════════════════════════════════
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -56,6 +63,111 @@ CLR = {"completed": "#2ecc71", "rescheduled": "#f39c12",
 SUPPORT_TYPES = ["Interview Support", "Assessment Support", "Mock Interview", "Resume Understanding"]
 
 ILLEGAL_CHARACTERS_RE = re.compile(r'[\000-\010]|[\013-\014]|[\016-\037]')
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  STICKY SECTION NAVIGATION
+#  Anchor chips pinned under the page title: click a chip to jump
+#  straight to that analysis, the bar stays put while you scroll.
+# ═══════════════════════════════════════════════════════════════════
+
+_VZ_NAV_TOKENS = {
+    "light": {
+        "bg": "rgba(255, 255, 255, 0.94)",
+        "border": "rgba(49, 51, 63, 0.12)",
+        "shadow": "rgba(15, 23, 42, 0.08)",
+        "chip_bg": "#f1f3f9",
+        "chip_fg": "#1f2937",
+        "chip_border": "rgba(49, 51, 63, 0.14)",
+        "label": "#6b7280",
+        "accent": "#2f6fed",
+    },
+    "dark": {
+        "bg": "rgba(20, 22, 29, 0.92)",
+        "border": "rgba(255, 255, 255, 0.12)",
+        "shadow": "rgba(0, 0, 0, 0.45)",
+        "chip_bg": "rgba(255, 255, 255, 0.07)",
+        "chip_fg": "#e7eaf3",
+        "chip_border": "rgba(255, 255, 255, 0.14)",
+        "label": "#9aa3b2",
+        "accent": "#4f8bf5",
+    },
+}
+
+
+def vz_nav_css():
+    """Inject the jump-bar stylesheet (the DOM is rebuilt on every rerun)."""
+    try:
+        base = str(st.get_option("theme.base") or "light").lower()
+    except Exception:
+        base = "light"
+    t = _VZ_NAV_TOKENS["dark" if base == "dark" else "light"]
+    css = (
+        "<style>\n"
+        "  .vz-anchor { height: 0; margin: 0; padding: 0; line-height: 0; scroll-margin-top: 9.5rem; }\n"
+        "  .vz-navbar {\n"
+        "    position: -webkit-sticky; position: sticky; top: 3.5rem; z-index: 1001;\n"
+        "    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;\n"
+        "    margin: 0 0 1.1rem 0; padding: 8px 10px; border-radius: 14px;\n"
+        "    background: " + t["bg"] + "; border: 1px solid " + t["border"] + ";\n"
+        "    box-shadow: 0 4px 16px " + t["shadow"] + ";\n"
+        "    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);\n"
+        "  }\n"
+        "  .vz-navbar .vz-nav-label {\n"
+        "    font-size: 10.5px; font-weight: 700; letter-spacing: 0.09em;\n"
+        "    text-transform: uppercase; color: " + t["label"] + "; padding: 0 4px 0 2px;\n"
+        "  }\n"
+        "  .vz-navbar a.vz-chip {\n"
+        "    display: inline-flex; align-items: center; padding: 5px 11px;\n"
+        "    border-radius: 999px; font-size: 12.5px; font-weight: 600; line-height: 1.15;\n"
+        "    text-decoration: none !important; white-space: nowrap;\n"
+        "    color: " + t["chip_fg"] + " !important; background: " + t["chip_bg"] + ";\n"
+        "    border: 1px solid " + t["chip_border"] + ";\n"
+        "    transition: background 0.15s ease, color 0.15s ease, "
+        "border-color 0.15s ease, transform 0.15s ease;\n"
+        "  }\n"
+        "  .vz-navbar a.vz-chip:hover {\n"
+        "    background: " + t["accent"] + "; color: #ffffff !important; border-color: "
+        + t["accent"] + ";\n"
+        "    transform: translateY(-1px);\n"
+        "  }\n"
+        "  .vz-navbar a.vz-chip:active { transform: translateY(0); }\n"
+        "  .vz-navbar a.vz-top { margin-left: auto; background: transparent; }\n"
+        "  .vz-navbar a.vz-top { color: " + t["label"] + " !important; }\n"
+        "  .vz-navbar a.vz-top:hover { color: #ffffff !important; }\n"
+        "  html, body, [data-testid='stAppViewContainer'], [data-testid='stMain'],\n"
+        "  section.main, .main { scroll-behavior: smooth; }\n"
+        "  @media (max-width: 1400px) { .vz-anchor { scroll-margin-top: 12rem; } }\n"
+        "</style>"
+    )
+    st.markdown(css, unsafe_allow_html=True)
+
+
+def vz_anchor(anchor_id):
+    """Drop an invisible jump target at the current position in the page."""
+    st.markdown('<div id="vz-' + anchor_id + '" class="vz-anchor"></div>',
+                unsafe_allow_html=True)
+
+
+def vz_nav(items, key):
+    """Sticky chip bar. ``items`` = [(anchor_id, label), ...] in reading order."""
+    items = [(a, l) for a, l in items if a and l]
+    if not items:
+        return
+    chips = "".join(
+        '<a class="vz-chip" href="#vz-' + a + '">' + l + "</a>" for a, l in items
+    )
+    html = (
+        '<div id="vz-top-' + key + '"></div>'
+        '<div class="vz-navbar">'
+        '<span class="vz-nav-label">Jump to</span>'
+        + chips
+        + '<a class="vz-chip vz-top" href="#vz-top-' + key + '">&#8593; Top</a>'
+        "</div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
 
 HIST = {
     "Interview Support": {
@@ -6359,7 +6471,8 @@ def lazy_tab_selector(tab_names, key, label="Section"):
 
 
 def main():
-    st.markdown("## 🚀 BUILD v25.1 — MONTH-SCOPED CANDIDATE QUALITY (deploy canary — if you do not see this, the app is running an OLD file)")
+    vz_nav_css()
+    st.markdown("## 🚀 BUILD v25.3 — STICKY SECTION NAV (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -6474,6 +6587,23 @@ def main():
         today_df = support_df[support_df["date"].dt.date == today]
 
         st.caption(today.strftime("%A, %B %d, %Y"))
+        # ── sticky jump bar ─────────────────────────────────────
+        _nav_today = [("t-kpi", "KPIs")]
+        if not today_df.empty:
+            _nav_today.append(("t-sent-kpi", "Sentiment KPI"))
+        if selected_support == "Interview Support" and not today_df.empty and "start_hour" in today_df.columns:
+            _nav_today.append(("t-start", "Start Times"))
+        if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
+            _nav_today.append(("t-clash", "Clashes"))
+            _nav_today.append(("t-block", "Blockage"))
+        if selected_support == "Interview Support" and not today_df.empty and "out_of_shift" in today_df.columns:
+            _nav_today.append(("t-oos", "Out of Shift"))
+        if not today_df.empty:
+            if selected_support == "Interview Support":
+                _nav_today.append(("t-rounds", "Rounds"))
+            _nav_today.append(("t-sent", "Sentiment & Words"))
+        _nav_today.append(("t-market", "To Market"))
+        vz_nav(_nav_today, "today")
 
         if today_df.empty:
             st.info("No " + support_label + " scheduled for today.")
@@ -6483,16 +6613,19 @@ def main():
             kd = {s: int(tc.get(s, 0)) for s in TASK_ORDER}
             kd["candidates"] = today_df["candidate_name"].nunique()
 
+        vz_anchor("t-kpi")
         kpi_row(kd)
 
         # ── TODAY'S SENTIMENT KPI ────────────────────────────────
         if not today_df.empty:
             today_stats = get_sentiment_stats(today_df)
             if today_stats:
+                vz_anchor("t-sent-kpi")
                 st.markdown("---")
                 render_sentiment_kpi(today_stats, title="Today's Feedback Sentiment")
 
         # ── TODAY'S START TIME INSIGHTS ──────────────────────────
+        vz_anchor("t-start")
         if selected_support == "Interview Support" and not today_df.empty and "start_hour" in today_df.columns:
             st.markdown("---")
             render_start_time_insights(today_df, title_suffix=" - " + str(today))
@@ -6500,18 +6633,21 @@ def main():
         # ── TODAY'S CLASH DETECTION ──────────────────────────────
         if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
             st.markdown("---")
+            vz_anchor("t-clash")
             st.subheader("Scheduling Clashes - " + str(today))
             render_today_clash_summary(today_df)
 
         # ── TODAY'S BLOCKAGE DETECTION ───────────────────────────
         if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
             st.markdown("---")
+            vz_anchor("t-block")
             st.subheader("Blockage Indicator - " + str(today))
             render_today_blockage(today_df, all_experts_df=all_interview_support_df)
             
         # ── TODAY'S OUT-OF-SHIFT DETECTION ───────────────────────
         if selected_support == "Interview Support" and not today_df.empty and "out_of_shift" in today_df.columns:
             st.markdown("---")
+            vz_anchor("t-oos")
             st.subheader("Out-of-Shift Interviews - " + str(today))
             render_oos_compact(today_df, " - " + str(today))
 
@@ -6537,11 +6673,13 @@ def main():
 
             if selected_support == "Interview Support":
                 st.markdown("---")
+                vz_anchor("t-rounds")
                 st.subheader("Round Breakdown - " + str(today))
                 round_charts(today_df, " - " + str(today))
 
             # ── SENTIMENT DONUT + HISTOGRAM — TODAY ──────────────
             st.markdown("---")
+            vz_anchor("t-sent")
             render_sentiment_section(today_df, section_title="Sentiment Analysis - " + str(today))
 
             # ── FEEDBACK WORD CLOUD — TODAY ──────────────────────
@@ -6557,6 +6695,7 @@ def main():
 
         # ── ABOUT TO MOVE TO MARKET ──────────────────────────────
         st.markdown("---")
+        vz_anchor("t-market")
         st.subheader("About to Move to Market")
         st.caption("Resume Understanding candidates with pending status — ready to enter the market")
 
@@ -6615,6 +6754,24 @@ def main():
         has_hist = selected_support in HIST
         title_range = "(Jul 2025 - Present)" if has_hist else "(2026 - Present)"
         st.header("Monthly Overview - " + support_label + " " + title_range)
+        # ── sticky jump bar ─────────────────────────────────────
+        _nav_monthly = [("m-kpi", "KPIs")]
+        if selected_support == "Interview Support" and "start_hour" in support_df.columns:
+            _nav_monthly.append(("m-start", "Start Times"))
+        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
+            _nav_monthly.append(("m-clash", "Clashes"))
+            _nav_monthly.append(("m-block", "Blockage"))
+        if selected_support == "Interview Support" and "out_of_shift" in support_df.columns:
+            _nav_monthly.append(("m-oos", "Out of Shift"))
+        _nav_monthly.append(("m-sent", "Sentiment Trend"))
+        if selected_support == "Interview Support":
+            _nav_monthly.append(("m-rounds", "Round Breakdown"))
+            _nav_monthly.append(("m-experts", "Expert Breakdown"))
+            _nav_monthly.append(("m-finals", "Finals & Technical"))
+        if selected_support == "Assessment Support":
+            _nav_monthly.append(("m-conv", "Assessment to Interview"))
+        _nav_monthly.append(("m-cand", "Candidate Counts"))
+        vz_nav(_nav_monthly, "monthly")
 
         current_month_str = date.today().strftime("%Y-%m")
         current_month_row = monthly[monthly["month"] == current_month_str]
@@ -6623,6 +6780,7 @@ def main():
         else:
             latest = monthly.iloc[-1]
 
+        vz_anchor("m-kpi")
         c = st.columns(6)
         c[0].metric("Month", latest["month"])
         c[1].metric("Completed", int(latest["completed"]))
@@ -6663,6 +6821,7 @@ def main():
         st.plotly_chart(trend_line(monthly, "total", "Total " + support_label + " per Month", "#8e44ad"), use_container_width=True)
 
         # ── START TIME INSIGHTS — OVERALL ────────────────────────
+        vz_anchor("m-start")
         if selected_support == "Interview Support" and "start_hour" in support_df.columns:
             st.markdown("---")
             render_start_time_insights(support_df, title_suffix=" - All Months")
@@ -6672,16 +6831,19 @@ def main():
         # ── CLASH DETECTION — OVERALL ────────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
             st.markdown("---")
+            vz_anchor("m-clash")
             render_clash_summary(support_df, title_suffix=" - All Months")
 
         # ── BLOCKAGE ANALYSIS — OVERALL ──────────────────────────
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
             st.markdown("---")
+            vz_anchor("m-block")
             render_blockage_summary(support_df, title_suffix=" - All Months", all_experts_df=all_interview_support_df)
             
         # ──         # ── OUT-OF-SHIFT ANALYSIS ── SELECTED MONTH ────────────────
         if selected_support == "Interview Support" and "out_of_shift" in support_df.columns:
             st.markdown("---")
+            vz_anchor("m-oos")
             st.subheader("Out-of-Shift Analysis - Monthly")
 
             support_df_oos = support_df.copy()
@@ -6711,6 +6873,7 @@ def main():
 
         # ── MONTHLY SENTIMENT TRENDS ─────────────────────────────
         st.markdown("---")
+        vz_anchor("m-sent")
         st.subheader("Monthly Sentiment Trends")
         sent_monthly = monthly_sentiment_trend(support_df)
         if not sent_monthly.empty:
@@ -6731,6 +6894,7 @@ def main():
         # ── MONTHLY (Interview Support Only) ─────────────────────
         if selected_support == "Interview Support":
             st.markdown("---")
+            vz_anchor("m-rounds")
             st.subheader("Round-wise Monthly Breakdown")
             if "round_name" in support_df.columns:
                 support_df_copy = support_df.copy()
@@ -6748,6 +6912,7 @@ def main():
                         st.dataframe(month_round_df, use_container_width=True)
 
             st.markdown("---")
+            vz_anchor("m-experts")
             st.subheader("Expert-wise Monthly Breakdown")
             month_exp = expert_monthly(support_df)
             if not month_exp.empty:
@@ -6762,6 +6927,7 @@ def main():
         # ── COMPLETED ROUNDS ANALYSIS & FINAL BY WHOM ────────────
         if selected_support == "Interview Support":
             st.markdown("---")
+            vz_anchor("m-finals")
             st.subheader("Completed Rounds Analysis & Final Given By Whom")
             st.caption("Shows only completed interviews — which rounds were completed, who gave the Final round, and their sentiment scores.")
 
@@ -7092,6 +7258,7 @@ def main():
         # ── ASSESSMENT CONVERSION ANALYTICS ──────────────────────
         if selected_support == "Assessment Support":
             st.markdown("---")
+            vz_anchor("m-conv")
             st.subheader("Assessment to Interview Conversion Analytics")
             st.caption("Tracks which assessments led to interviews within 60 days using fuzzy company name matching")
 
@@ -7114,6 +7281,7 @@ def main():
         
         # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────
         st.markdown("---")
+        vz_anchor("m-cand")
         st.subheader("Candidate-wise Monthly Counts (All Support Types)")
         cand_monthly = candidate_monthly_support(active_expert_df)
         if not cand_monthly.empty:
@@ -7140,6 +7308,12 @@ def main():
 
         mask = (support_df["date"].dt.date >= start) & (support_df["date"].dt.date <= end)
         period = support_df[mask]
+        # ── sticky jump bar ─────────────────────────────────────
+        _nav_drill = [("d-period", "Period Breakdown")]
+        if selected_support == "Interview Support" and "round_name" in period.columns:
+            _nav_drill.append(("d-rounds", "Rounds"))
+        _nav_drill.append(("d-single", "Single Day"))
+        vz_nav(_nav_drill, "drill")
         dd = daily_agg(period)
 
         if dd.empty:
@@ -7199,6 +7373,7 @@ def main():
 
             # ── EXPERT / COMPANY / CANDIDATE BARS (period) ───────
             st.markdown("---")
+            vz_anchor("d-period")
             st.subheader("Period Breakdown (" + str(start) + " to " + str(end) + ")")
             p_c1, p_c2 = st.columns(2)
             with p_c1:
@@ -7223,6 +7398,7 @@ def main():
                                 use_container_width=True)
 
             # ── ROUND INSIGHTS (Interview Support, completed only) ─
+            vz_anchor("d-rounds")
             if selected_support == "Interview Support" and "round_name" in period.columns:
                 st.markdown("---")
                 st.subheader("Round Distribution — Completed Only (" + str(start) + " to " + str(end) + ")")
@@ -7370,6 +7546,7 @@ def main():
 
         # ── SINGLE DAY DRILL-DOWN ────────────────────────────────
         st.markdown("---")
+        vz_anchor("d-single")
         st.subheader("Single Day Details")
         single = st.date_input("Select a day", value=max_d, min_value=min_d, max_value=max_d,
                                 key="single_day")
@@ -7536,6 +7713,12 @@ def main():
                 st.plotly_chart(fig2, use_container_width=True)
 
         with tabs[5]:
+            _nav_cand = [("dd-table", "Table")]
+            if selected_support == "Interview Support":
+                _nav_cand.append(("dd-active", "Active Candidates"))
+                _nav_cand.append(("dd-top", "Top Candidates"))
+                _nav_cand.append(("dd-quality", "Quality"))
+            vz_nav(_nav_cand, "candidates")
             if "candidate_name" in support_df.columns:
                 ca_agg = support_df.groupby("candidate_name").agg(
                     Total=("task_status", "size"),
@@ -7549,6 +7732,7 @@ def main():
                 ).reset_index()
                 ca_agg["Completion_Pct"] = (ca_agg["Completed"] / ca_agg["Total"] * 100).round(1)
                 ca_agg = ca_agg.sort_values("Total", ascending=False)
+                vz_anchor("dd-table")
                 st.subheader("Candidate Performance Table")
                 st.dataframe(ca_agg, use_container_width=True)
 
@@ -7578,12 +7762,15 @@ def main():
                                "the overall analyses below fall back to ALL candidates.")
                     _active_df = support_df
 
+                vz_anchor("dd-active")
                 render_active_candidate_overall_analysis(support_df,
                                                          title_suffix=" — All Data",
                                                          min_interviews=1)
+                vz_anchor("dd-top")
                 render_top_candidates_analysis(_active_df,
                                                 title_suffix=" — All Data (Active Candidates)",
                                                 min_interviews=5)
+                vz_anchor("dd-quality")
                 render_candidate_quality_analysis(_active_df,
                                                   title_suffix=" — All Data (Active Candidates)",
                                                   min_interviews=5)
@@ -7635,7 +7822,7 @@ def main():
                 else:
                     st.info("No assessment data available for conversion analysis.")
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v25.2 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
+    st.sidebar.caption("Vizva Dashboard v25.3 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
 
 
 # ═══════════════════════════════════════════════════════════════════
