@@ -48,7 +48,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v25.1 MONTH-FIX]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v25.5]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -183,6 +183,241 @@ HIST = {
         "2026-04": {"completed": 71, "rescheduled": 9,  "cancelled": 24, "candidates": 52},
     },
 }
+
+# ═══════════════════════════════════════════════════════════════════
+#  CANONICALISATION LAYER — technology families + company / end-client
+#  Runs ONCE inside the cached data pipeline, so every rerun is free.
+#  All lookups afterwards are plain dict hits (microseconds).
+# ═══════════════════════════════════════════════════════════════════
+
+CANON_VERSION = "v1"
+
+# ── technology: ordered (family, regex). First match wins. ─────────
+_TECH_RULES = [
+    ("Cyber Security & SOC",       r"cyber|soc analyst|security engineer|infosec|penetration"),
+    ("Data Science & AI",          r"\bai\b|artificial|machine learning|\bml\b|data scien|enigneer & python"),
+    ("Data Engineering",           r"data engineer|\betl\b|big data|azure data|lead data eng"),
+    ("Data Analytics & BI",        r"data analy|data & analytics|data analytics|business intelligence|\bbi\b|analytics professional|power bi|tableau|reporting analyst"),
+    ("Business Analyst",           r"business analy|service ?now business"),
+    ("DevOps, Cloud & Platform",   r"devops|cloud|sre|site reliability|platform eng|infrastructure|network eng|architect|kubernetes|aws|service desk|it support"),
+    ("QA & Test Engineering",      r"\bqa\b|test engineer|testing|tester|automation test|selenium|quality assurance|sdet"),
+    ("ERP & CRM Platforms",        r"servicenow|service now|sap|salesforce|dynamics|oracle fusion|workday"),
+    ("Software Engineering",       r"software (engineer|developer|test)|developer|engineer.*software|full ?-? ?stack|front ?-?end|backend|back end|java|\.net|c\+\+|python developer|programmer|application architect"),
+    ("Finance & Banking Analysis", r"finance|financial|credit analy|investment|banking|economist|risk analy|actuar"),
+    ("Project & Programme Mgmt",   r"project manager|project and (operation|management)|operations and project|programme|agile|delivery manager|scrum"),
+    ("Supply Chain & Operations",  r"supply chain|logistics|operations and business|merchandis|procurement|warehouse"),
+    ("Marketing, Sales & BD",      r"marketing|sales|business development|\bbd\b"),
+    ("Product Management",         r"product manager|product owner"),
+    ("Engineering (non-IT)",       r"mechanical|electrical|civil|structural|chemical|aerospace|powertrain|bim|planning engineer|energy eng|food tech|3d prop|cad|design engineer|hvac"),
+    ("Healthcare & Other",         r"physio|healthcare|nurse|clinical|environmental|sustainab|policy"),
+]
+
+# ── company / end-client: curated high-confidence aliases ──────────
+# (regex on normalised name, canonical display name)
+_COMPANY_ALIAS = [
+    (r"\bmeta\b|\bfacebook\b|\binstagram\b", "Meta"),
+    (r"\bgoogle\b|\balphabet\b|\byoutube\b", "Google"),
+    (r"\bmicrosoft\b|\bmsft\b", "Microsoft"),
+    (r"jpmorgan|jp morgan|j p morgan|\bchase\b", "JPMorgan Chase"),
+    (r"\bamazon\b|\baws\b", "Amazon"),
+    (r"\bibm\b|international business machines", "IBM"),
+    (r"barclays", "Barclays"),
+    (r"\baccenture\b", "Accenture"),
+    (r"rolls[ -]?royce", "Rolls-Royce"),
+    (r"\bwise\b|transferwise", "Wise"),
+    (r"\bcognizant\b", "Cognizant"),
+    (r"gov ?uk|government digital|cabinet office", "GOV.UK"),
+    (r"\bdeloitte\b", "Deloitte"),
+    (r"\bhsbc\b", "HSBC"),
+    (r"\blloyds\b", "Lloyds Banking Group"),
+    (r"natwest|nat west|\brbs\b|royal bank of scotland", "NatWest Group"),
+    (r"\binfosys\b", "Infosys"),
+    (r"\btcs\b|tata consultancy", "TCS"),
+    (r"\bwipro\b", "Wipro"),
+    (r"\bcapgemini\b", "Capgemini"),
+    (r"\bepam\b", "EPAM"),
+    (r"\blendable\b", "Lendable"),
+    (r"\btesco\b", "Tesco"),
+    (r"\bvodafone\b", "Vodafone"),
+    (r"\bnhs\b", "NHS"),
+    (r"\bunilever\b", "Unilever"),
+    (r"\bbae systems\b", "BAE Systems"),
+    (r"standard chartered", "Standard Chartered"),
+    (r"morgan stanley", "Morgan Stanley"),
+    (r"goldman", "Goldman Sachs"),
+    (r"\buber\b", "Uber"),
+    (r"\bpaypal\b", "PayPal"),
+    (r"\bsalesforce\b", "Salesforce"),
+]
+
+_CANON_FUZZY_THRESHOLD = 0.90   # global dedupe is stricter than prospect matching
+_CANON_MIN_TOKEN_LEN = 4        # never fuzzy-merge very short single-token names
+
+
+def _canon_tech_one(label):
+    if label is None:
+        return "Unknown"
+    try:
+        if pd.isna(label):
+            return "Unknown"
+    except Exception:
+        pass
+    s = str(label).strip().lower()
+    if s in ("", "nan", "none", "na", "null", "-", "n/a"):
+        return "Unknown"
+    for fam, pat in _TECH_RULES:
+        if re.search(pat, s):
+            return fam
+    return "Other / Unmapped"
+
+
+def _display_company(norm_name):
+    """Turn a normalised key into a presentable label."""
+    if not norm_name:
+        return "(not specified)"
+    keep_upper = {"ibm", "hsbc", "nhs", "tcs", "bae", "bt", "smg", "aws", "sap", "epam", "uk"}
+    out = []
+    for w in norm_name.split():
+        out.append(w.upper() if w in keep_upper else w.capitalize())
+    return " ".join(out)
+
+
+def build_tech_map(labels):
+    """label -> family. 109 unique labels => instant."""
+    return {lab: _canon_tech_one(lab) for lab in labels}
+
+
+def build_company_map(raw_names, fuzzy_threshold=_CANON_FUZZY_THRESHOLD):
+    """raw company spelling -> canonical display name.
+
+    Three passes, cheapest first:
+      1. curated alias table  (Meta/Facebook, JP Morgan/Chase, ...)
+      2. normalised-key equality (punctuation, legal suffixes, word order)
+      3. blocked fuzzy clustering — only inside first-3-character blocks,
+         so ~1.2k names cost thousands of comparisons, not millions.
+    """
+    raws = [str(r) for r in raw_names if _clean_company_text(r)]
+    if not raws:
+        return {}, {"alias": 0, "exact": 0, "fuzzy": 0, "total": 0}
+
+    uniq = list(dict.fromkeys(raws))
+    norm_of = {r: _normalize_company(r) for r in uniq}
+
+    canon = {}                      # raw -> canonical display
+    stats = {"alias": 0, "exact": 0, "fuzzy": 0, "total": len(uniq)}
+
+    # pass 1 — curated aliases
+    pending = []
+    for r in uniq:
+        n = norm_of[r]
+        hit = None
+        for pat, display in _COMPANY_ALIAS:
+            if n and re.search(pat, n):
+                hit = display
+                break
+        if hit:
+            canon[r] = hit
+            stats["alias"] += 1
+        else:
+            pending.append(r)
+
+    # pass 2 — normalised key equality
+    by_key = {}
+    still = []
+    for r in pending:
+        k = norm_of[r]
+        if not k:
+            canon[r] = "(not specified)"
+            continue
+        if k in by_key:
+            canon[r] = by_key[k]
+            stats["exact"] += 1
+        else:
+            by_key[k] = _display_company(k)
+            canon[r] = by_key[k]
+            still.append(r)
+
+    # pass 3 — blocked fuzzy union-find
+    keys = [norm_of[r] for r in still]
+    blocks = {}
+    for r, k in zip(still, keys):
+        blocks.setdefault(k[:3], []).append(r)
+
+    def find(parent, x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for _blk, members in blocks.items():
+        if len(members) < 2 or len(members) > 120:
+            continue
+        parent = {m: m for m in members}
+        for i in range(len(members)):
+            a = norm_of[members[i]]
+            if len(a.split()) == 1 and len(a) < _CANON_MIN_TOKEN_LEN:
+                continue
+            for j in range(i + 1, len(members)):
+                b = norm_of[members[j]]
+                if len(b.split()) == 1 and len(b) < _CANON_MIN_TOKEN_LEN:
+                    continue
+                if abs(len(a) - len(b)) > 4:
+                    continue
+                if _company_sim_norm(a, b) >= fuzzy_threshold:
+                    ra, rb = find(parent, members[i]), find(parent, members[j])
+                    if ra != rb:
+                        parent[rb] = ra
+        groups = {}
+        for m in members:
+            groups.setdefault(find(parent, m), []).append(m)
+        for root, grp in groups.items():
+            if len(grp) < 2:
+                continue
+            # most frequent spelling wins the display label
+            best = max(grp, key=lambda x: raws.count(x))
+            label = canon.get(best) or _display_company(norm_of[best])
+            for m in grp:
+                if canon[m] != label:
+                    canon[m] = label
+                    stats["fuzzy"] += 1
+    return canon, stats
+
+
+def _company_sim_norm(a, b):
+    """Cheap similarity on two ALREADY-normalised names."""
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    sa, sb = set(a.split()), set(b.split())
+    if sa <= sb or sb <= sa:
+        return 0.95
+    sim_char = _cosine_counter(_char_ngrams(a), _char_ngrams(b))
+    if abs(len(a) - len(b)) <= 3:
+        return max(sim_char, difflib.SequenceMatcher(None, a, b).ratio())
+    return sim_char
+
+
+def add_canonical_columns(df):
+    """Attach tech_canon / company_canon. Called once, inside the cached pipeline."""
+    if df is None or df.empty:
+        return df
+    out = df
+
+    if "candidate_technology" in out.columns:
+        labels = out["candidate_technology"].dropna().astype(str).unique().tolist()
+        tmap = build_tech_map(labels)
+        out["tech_canon"] = (out["candidate_technology"].astype(str)
+                             .map(lambda x: tmap.get(x, _canon_tech_one(x))))
+
+    if "company_name" in out.columns:
+        raws = out["company_name"].dropna().astype(str).unique().tolist()
+        cmap, cstats = build_company_map(raws)
+        out["company_canon"] = (out["company_name"].astype(str)
+                                .map(lambda x: cmap.get(x, _display_company(_normalize_company(x)))))
+        out.attrs["company_canon_stats"] = cstats
+    return out
+
 
 # ── Domain-specific stopwords to exclude from analysis ───────────
 DOMAIN_STOPWORDS = {
@@ -6381,6 +6616,9 @@ def load_data_pipeline(pipeline_version=DATA_PIPELINE_VERSION):
         for col in ["feedback", "expert_feedback", "client_feedback"]:
             if col in raw.columns:
                 raw.loc[self_mask, col] = feedback_text
+    # canonical names computed ONCE here (inside the cached pipeline) so
+    # every rerun afterwards is a plain column read - no recompute cost
+    raw = add_canonical_columns(raw)
     all_case_df = raw.copy()
     active_expert_df = filter_active_experts(raw)
     all_interview_support_df = all_case_df[
@@ -6472,7 +6710,7 @@ def lazy_tab_selector(tab_names, key, label="Section"):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v25.3 — STICKY SECTION NAV (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v25.5 — NAME TOGGLE (original vs canonical) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -6579,6 +6817,21 @@ def main():
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
                                             "Daily Drill-Down", "Deep-Dive Analytics"],
                                             label_visibility="collapsed")
+
+    # ── NAME DISPLAY: original source names vs canonicalised categories ──
+    st.sidebar.markdown("---")
+    st.sidebar.header("Name Display")
+    _name_mode = st.sidebar.radio(
+        "Name style",
+        ["Original names", "Canonical names"],
+        index=0,
+        label_visibility="collapsed",
+        help="Original = exactly as stored in the source system. "
+             "Canonical = grouped categories (Meta/Facebook merged, "
+             "DevOps/Cloud/SRE merged). Toggle freely - nothing is lost.")
+    show_canon = (_name_mode == "Canonical names")
+    st.sidebar.caption("Showing " + ("canonical categories" if show_canon
+                                     else "original source names"))
 
     # ======= TODAY =======
     if view == "Todays Snapshot":
@@ -7654,12 +7907,38 @@ def main():
                 st.dataframe(ea.sort_values("Total", ascending=False), use_container_width=True)
 
         with tabs[1]:
-            fig = h_bar_by_task(support_df, "company_name", 20, "Top 20 Companies by Volume")
+            # Companies honour the sidebar Name Display toggle
+            cdf = support_df.copy()
+            if show_canon and "company_canon" in cdf.columns:
+                cdf["company_name"] = cdf["company_canon"]
+                st.caption("Canonical view: " + str(cdf["company_name"].nunique()) +
+                           " end-clients after merging (raw spellings: " +
+                           str(support_df["company_name"].nunique()) + ").")
+            elif "company_canon" in cdf.columns:
+                st.caption("Original view: " + str(cdf["company_name"].nunique()) +
+                           " distinct spellings as stored. Switch to Canonical in the "
+                           "sidebar to group brand variants.")
+            if show_canon and "company_canon" in support_df.columns:
+                with st.expander("What merged? (original spelling -> canonical name)"):
+                    _m = support_df[["company_name", "company_canon"]].copy()
+                    _m["company_name"] = _m["company_name"].astype(str)
+                    _g = (_m.groupby("company_canon")["company_name"]
+                            .agg(lambda s: sorted(set(s))).reset_index())
+                    _g = _g[_g["company_name"].apply(len) > 1]
+                    if _g.empty:
+                        st.caption("No variant spellings merged in this view.")
+                    else:
+                        _g["merged_spellings"] = _g["company_name"].apply(lambda v: ", ".join(v[:8]))
+                        _g["variants"] = _g["company_name"].apply(len)
+                        st.dataframe(_g[["company_canon", "variants", "merged_spellings"]]
+                                     .sort_values("variants", ascending=False),
+                                     use_container_width=True, height=320)
+            fig = h_bar_by_task(cdf, "company_name", 20, "Top 20 Companies by Volume")
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
-            if "company_name" in support_df.columns:
-                top = support_df["company_name"].value_counts().head(15).index
-                ct = support_df[support_df["company_name"].isin(top)]
+            if "company_name" in cdf.columns:
+                top = cdf["company_name"].value_counts().head(15).index
+                ct = cdf[cdf["company_name"].isin(top)]
                 pv = ct.groupby(["company_name", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
                                  color_continuous_scale="Blues", title="Company x Task Heatmap")
@@ -7778,11 +8057,34 @@ def main():
 
         with tabs[6]:
             if "candidate_technology" in support_df.columns:
-                fig = h_bar_by_task(support_df, "candidate_technology", 20, "Top 20 Technologies")
+                # Technology honours the sidebar Name Display toggle
+                tdf = support_df.copy()
+                if show_canon and "tech_canon" in tdf.columns:
+                    tdf["candidate_technology"] = tdf["tech_canon"]
+                    st.caption("Canonical view: " +
+                               str(tdf["candidate_technology"].nunique()) + " job families "
+                               "(raw labels: " + str(support_df["candidate_technology"].nunique()) + ").")
+                elif "tech_canon" in tdf.columns:
+                    st.caption("Original view: " +
+                               str(tdf["candidate_technology"].nunique()) +
+                               " distinct labels as stored. Switch to Canonical in the "
+                               "sidebar to group equivalent titles.")
+                if show_canon and "tech_canon" in support_df.columns:
+                    with st.expander("Which labels map to each job family?"):
+                        _t = support_df[["candidate_technology", "tech_canon"]].copy()
+                        _t["candidate_technology"] = _t["candidate_technology"].astype(str)
+                        _tg = (_t.groupby("tech_canon")["candidate_technology"]
+                                 .agg(lambda s: sorted(set(s))).reset_index())
+                        _tg["labels"] = _tg["candidate_technology"].apply(lambda v: ", ".join(v[:10]))
+                        _tg["n_labels"] = _tg["candidate_technology"].apply(len)
+                        st.dataframe(_tg[["tech_canon", "n_labels", "labels"]]
+                                     .sort_values("n_labels", ascending=False),
+                                     use_container_width=True, height=320)
+                fig = h_bar_by_task(tdf, "candidate_technology", 20, "Top 20 Technologies")
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
-                top_tech = support_df["candidate_technology"].value_counts().head(15).index
-                tt = support_df[support_df["candidate_technology"].isin(top_tech)]
+                top_tech = tdf["candidate_technology"].value_counts().head(15).index
+                tt = tdf[tdf["candidate_technology"].isin(top_tech)]
                 pv = tt.groupby(["candidate_technology", "task_status"]).size().unstack(fill_value=0)
                 fig2 = px.imshow(pv, text_auto=True, aspect="auto",
                                  color_continuous_scale="Greens", title="Technology x Task Heatmap")
@@ -7822,7 +8124,7 @@ def main():
                 else:
                     st.info("No assessment data available for conversion analysis.")
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v25.3 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution")
+    st.sidebar.caption("Vizva Dashboard v25.5 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle")
 
 
 # ═══════════════════════════════════════════════════════════════════
