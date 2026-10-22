@@ -48,7 +48,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v25.5]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v25.6]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -6710,7 +6710,7 @@ def lazy_tab_selector(tab_names, key, label="Section"):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v25.5 — NAME TOGGLE (original vs canonical) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v25.6 — TECH COUNTS (deep-dive) + TECHNOLOGY MONTHLY FILTER (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -7023,6 +7023,7 @@ def main():
             _nav_monthly.append(("m-finals", "Finals & Technical"))
         if selected_support == "Assessment Support":
             _nav_monthly.append(("m-conv", "Assessment to Interview"))
+        _nav_monthly.append(("m-tech", "Technology Mix"))
         _nav_monthly.append(("m-cand", "Candidate Counts"))
         vz_nav(_nav_monthly, "monthly")
 
@@ -7535,6 +7536,98 @@ def main():
         # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────
         st.markdown("---")
         vz_anchor("m-cand")
+        # ── TECHNOLOGY-WISE MONTHLY INTERVIEW COUNTS ─────────────
+        if "candidate_technology" in support_df.columns:
+            st.markdown("---")
+            vz_anchor("m-tech")
+            st.subheader("Technology-wise Monthly Interview Counts")
+
+            _mdf = support_df.copy()
+            _techcol = ("tech_canon" if (show_canon and "tech_canon" in _mdf.columns)
+                        else "candidate_technology")
+            _mdf["_tech"] = _mdf[_techcol].astype(str)
+            if show_canon and _techcol == "tech_canon":
+                st.caption("Canonical job families (" +
+                           str(_mdf["_tech"].nunique()) + "). Switch Name Display in the "
+                           "sidebar to see the 109 raw labels instead.")
+            else:
+                st.caption("Original technology labels as stored (" +
+                           str(_mdf["_tech"].nunique()) + ").")
+
+            _mdf = _mdf[_mdf["date"].notna()].copy()
+            _mdf["_month"] = _mdf["date"].dt.to_period("M").astype(str)
+            _mdf["_year"] = _mdf["date"].dt.year
+
+            _yrs = sorted([int(y) for y in _mdf["_year"].unique()])
+            _fy1, _fy2, _fy3 = st.columns([1, 1, 3])
+            _sel_years = _fy1.multiselect("Year", _yrs, default=_yrs, key="m_tech_year")
+            _status_pick = _fy2.multiselect("Status", TASK_ORDER,
+                                            default=TASK_ORDER, key="m_tech_status",
+                                            format_func=lambda s: TASK_LABEL.get(s, s))
+            _alltech = sorted(_mdf["_tech"].unique())
+            _pick = _fy3.multiselect("Tech filter (leave empty = all)", _alltech,
+                                     default=[], key="m_tech_filter",
+                                     placeholder="All technologies")
+
+            _mv = _mdf.copy()
+            if _sel_years:
+                _mv = _mv[_mv["_year"].isin(_sel_years)]
+            if _status_pick:
+                _mv = _mv[_mv["task_status"].isin(_status_pick)]
+            if _pick:
+                _mv = _mv[_mv["_tech"].isin(_pick)]
+
+            if _mv.empty:
+                st.info("No interviews match the current filters.")
+            else:
+                _piv = _mv.groupby(["_month", "_tech"]).size().unstack(fill_value=0)
+                _piv = _piv.reindex(sorted(_piv.index))
+
+                _mk1, _mk2, _mk3, _mk4 = st.columns(4)
+                _mk1.metric("Interviews in scope", int(_mv.shape[0]))
+                _mk2.metric("Technologies", int(_mv["_tech"].nunique()))
+                _mk3.metric("Candidates", int(_mv["candidate_name"].nunique()))
+                _mk4.metric("Completed %",
+                            str(round((_mv["task_status"] == "completed").mean() * 100, 1)) + "%")
+
+                _fig_m = go.Figure()
+                for _c in _piv.columns:
+                    _fig_m.add_trace(go.Bar(x=_piv.index, y=_piv[_c], name=str(_c),
+                                            hovertemplate="%{x}<br>" + str(_c) +
+                                                          ": %{y}<extra></extra>"))
+                _fig_m.update_layout(title="Monthly Interviews by Technology (stacked)",
+                                     barmode="stack", height=480,
+                                     xaxis_title="Month", yaxis_title="Interviews",
+                                     legend=dict(orientation="h", y=-0.35, font=dict(size=9)))
+                st.plotly_chart(_fig_m, use_container_width=True)
+
+                _pct = _piv.div(_piv.sum(axis=1).replace(0, 1), axis=0) * 100
+                _fig_p = go.Figure()
+                for _c in _pct.columns:
+                    _fig_p.add_trace(go.Bar(x=_pct.index, y=_pct[_c].round(1), name=str(_c)))
+                _fig_p.update_layout(title="Monthly Technology Mix (share %)",
+                                     barmode="stack", height=440,
+                                     xaxis_title="Month", yaxis_title="% of interviews",
+                                     yaxis_range=[0, 100],
+                                     legend=dict(orientation="h", y=-0.35, font=dict(size=9)))
+                st.plotly_chart(_fig_p, use_container_width=True)
+
+                _tbl = _piv.T.copy()
+                _tbl["TOTAL"] = _tbl.sum(axis=1)
+                _tbl = _tbl.sort_values("TOTAL", ascending=False)
+                _tbl["COMPLETED %"] = [
+                    round((_mv[_mv["_tech"] == _t]["task_status"] == "completed").mean() * 100, 1)
+                    for _t in _tbl.index
+                ]
+                st.markdown("**Monthly interview counts by technology**")
+                st.dataframe(_tbl, use_container_width=True, height=420)
+                st.download_button(
+                    "Download this table (CSV)",
+                    _tbl.to_csv().encode("utf-8"),
+                    file_name="vizva_tech_monthly_" + date.today().strftime("%Y%m%d") + ".csv",
+                    mime="text/csv",
+                    key="m_tech_csv")
+
         st.subheader("Candidate-wise Monthly Counts (All Support Types)")
         cand_monthly = candidate_monthly_support(active_expert_df)
         if not cand_monthly.empty:
@@ -8090,6 +8183,70 @@ def main():
                                  color_continuous_scale="Greens", title="Technology x Task Heatmap")
                 fig2.update_layout(height=500)
                 st.plotly_chart(fig2, use_container_width=True)
+
+                # ── CANDIDATES PER TECHNOLOGY ────────────────────
+                st.markdown("---")
+                st.subheader("Candidates per Technology")
+                _tc = (tdf.groupby("candidate_technology")
+                          .agg(Interviews=("task_status", "size"),
+                               Candidates=("candidate_name", "nunique"),
+                               Companies=("company_name", "nunique"),
+                               Completed=("task_status", lambda x: (x == "completed").sum()))
+                          .reset_index())
+                _tc["Completion_Pct"] = (_tc["Completed"] / _tc["Interviews"] * 100).round(1)
+                _tc["Interviews_per_candidate"] = (_tc["Interviews"] / _tc["Candidates"]).round(2)
+                _tc = _tc.sort_values("Candidates", ascending=False)
+
+                _unique_overall = int(tdf["candidate_name"].nunique())
+                _k1, _k2, _k3 = st.columns(3)
+                _k1.metric("Technologies", len(_tc))
+                _k2.metric("Candidates (unique)", _unique_overall)
+                _k3.metric("Interviews", int(_tc["Interviews"].sum()))
+                if int(_tc["Candidates"].sum()) != _unique_overall:
+                    st.caption("A candidate who appears under more than one technology is "
+                               "counted once per technology row, so the column sums to " +
+                               str(int(_tc["Candidates"].sum())) + " against " +
+                               str(_unique_overall) + " unique candidates overall.")
+
+                _top = _tc.head(20).sort_values("Candidates")
+                fig_c = go.Figure()
+                fig_c.add_trace(go.Bar(
+                    y=_top["candidate_technology"], x=_top["Candidates"],
+                    orientation="h", marker_color="#2f6fed",
+                    text=_top["Candidates"], textposition="outside",
+                    hovertemplate="%{y}<br>Candidates: %{x}<extra></extra>"))
+                fig_c.update_layout(
+                    title="Unique Candidates per Technology",
+                    height=max(380, 26 * len(_top)),
+                    yaxis=dict(autorange="reversed"),
+                    xaxis_title="Unique candidates", showlegend=False)
+                st.plotly_chart(fig_c, use_container_width=True)
+
+                _c1, _c2 = st.columns(2)
+                with _c1:
+                    _r = _tc.sort_values("Interviews_per_candidate", ascending=False).head(15)
+                    fig_r = go.Figure(go.Bar(
+                        x=_r["candidate_technology"], y=_r["Interviews_per_candidate"],
+                        marker_color="#e8734a",
+                        text=_r["Interviews_per_candidate"], textposition="outside",
+                        hovertemplate="%{x}<br>Interviews/candidate: %{y}<extra></extra>"))
+                    fig_r.update_layout(title="Interviews per Candidate (Top 15)",
+                                        height=430, xaxis_title="", yaxis_title="Interviews / candidate",
+                                        showlegend=False)
+                    st.plotly_chart(fig_r, use_container_width=True)
+                with _c2:
+                    _q = _tc.sort_values("Completion_Pct", ascending=False).head(15)
+                    fig_q = go.Figure(go.Bar(
+                        x=_q["candidate_technology"], y=_q["Completion_Pct"],
+                        marker_color="#2ecc71",
+                        text=_q["Completion_Pct"].astype(str) + "%", textposition="outside",
+                        hovertemplate="%{x}<br>Completion: %{y}%<extra></extra>"))
+                    fig_q.update_layout(title="Completion % (Top 15)",
+                                        height=430, xaxis_title="", yaxis_title="Completion %",
+                                        showlegend=False, yaxis_range=[0, 110])
+                    st.plotly_chart(fig_q, use_container_width=True)
+
+                st.dataframe(_tc, use_container_width=True, height=380)
             else:
                 st.info("No technology column found.")
         
@@ -8124,7 +8281,7 @@ def main():
                 else:
                     st.info("No assessment data available for conversion analysis.")
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v25.5 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle")
+    st.sidebar.caption("Vizva Dashboard v25.6 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly")
 
 
 # ═══════════════════════════════════════════════════════════════════
