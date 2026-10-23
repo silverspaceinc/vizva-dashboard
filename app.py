@@ -48,7 +48,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v25.6]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v25.7]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -396,6 +396,28 @@ def _company_sim_norm(a, b):
     if abs(len(a) - len(b)) <= 3:
         return max(sim_char, difflib.SequenceMatcher(None, a, b).ratio())
     return sim_char
+
+
+def canonical_view(df):
+    """Display view: company / technology replaced by their canonical names.
+
+    Applied ONCE per rerun to the frames main() renders, so every downstream
+    insight (company breakdowns, OOS, conversion, prospect, tech charts)
+    automatically uses canonical names without touching each call site.
+    The original spellings stay available as *_raw columns.
+    """
+    if df is None or len(df) == 0:
+        return df
+    out = df.copy()
+    if "company_canon" in out.columns and "company_name" in out.columns:
+        if "company_name_raw" not in out.columns:
+            out["company_name_raw"] = out["company_name"]
+        out["company_name"] = out["company_canon"]
+    if "tech_canon" in out.columns and "candidate_technology" in out.columns:
+        if "candidate_technology_raw" not in out.columns:
+            out["candidate_technology_raw"] = out["candidate_technology"]
+        out["candidate_technology"] = out["tech_canon"]
+    return out
 
 
 def add_canonical_columns(df):
@@ -900,6 +922,7 @@ def _build_clash_groups(minutes_list):
     return groups
 
 
+@st.cache_data(ttl=600, show_spinner=False, max_entries=64)
 def detect_expert_clashes(df):
     """Detect scheduling clash GROUPS for experts.
 
@@ -1315,6 +1338,7 @@ def _get_active_experts_for_day(df, target_day, lookback_working_days=7):
     return recent_experts | target_experts
 
 
+@st.cache_data(ttl=600, show_spinner=False, max_entries=64)
 def detect_blockages(df, active_expert_count=None, all_experts_df=None):
     """Detect blockage events across all days in df.
 
@@ -2115,78 +2139,63 @@ def render_oos_compact(df, title_suffix=""):
 #    # ── Add start_time columns ONCE for Interview Support ──────── TEXT UTILITIES
 # ═══════════════════════════════════════════════════════════════════
 
-def render_wordcloud_section(texts, section_title="Word Cloud"):
-    if not texts:
-        st.info("No text available for word cloud.")
-        return
-
-    st.subheader(section_title)
-
+@st.cache_data(ttl=600, show_spinner=False, max_entries=48)
+def _wc_payload(texts):
+    """Tokenise + render the word cloud once per distinct text set."""
     stop_words = set(stopwords.words("english")) | DOMAIN_STOPWORDS
     lemmatizer = WordNetLemmatizer()
-
     all_tokens = []
     for text in texts:
-        text = text.lower()
+        text = str(text).lower()
         text = re.sub(r'[^a-zA-Z\s]', '', text)
         tokens = word_tokenize(text)
         tagged = pos_tag(tokens)
         for word, tag in tagged:
             if word in stop_words or len(word) < 3:
                 continue
-            if tag.startswith("NN"):
-                pos_wn = "n"
-            elif tag.startswith("VB"):
-                pos_wn = "v"
-            elif tag.startswith("JJ"):
-                pos_wn = "a"
-            elif tag.startswith("RB"):
-                pos_wn = "r"
-            else:
-                pos_wn = "n"
+            pos_wn = ("n" if tag.startswith("NN") else "v" if tag.startswith("VB")
+                      else "a" if tag.startswith("JJ") else "r" if tag.startswith("RB") else "n")
             lemma = lemmatizer.lemmatize(word, pos=pos_wn)
             if lemma not in stop_words and len(lemma) >= 3:
                 all_tokens.append(lemma)
-
     if not all_tokens:
-        st.info("No meaningful words extracted from the feedback.")
-        return
-
+        return [], None
     freq = Counter(all_tokens)
-    top_n = 30
-    top_words = freq.most_common(top_n)
-
-    fig_top = go.Figure(go.Bar(
-        x=[c for _, c in top_words],
-        y=[w for w, _ in top_words],
-        orientation="h",
-        marker_color="#3498db",
-        text=[c for _, c in top_words],
-        textposition="outside",
-    ))
-    fig_top.update_layout(
-        title=f"Top {top_n} Words",
-        height=max(400, top_n * 28),
-        yaxis=dict(autorange="reversed"),
-        xaxis_title="Frequency",
-    )
-
+    top_words = freq.most_common(30)
     wc = WordCloud(width=1200, height=600, background_color="white",
-                   max_words=200, colormap="viridis",
-                   prefer_horizontal=0.7)
+                   max_words=200, colormap="viridis", prefer_horizontal=0.7)
     wc.generate_from_frequencies(freq)
-
     fig_wc, ax = plt.subplots(figsize=(12, 6))
     ax.imshow(wc, interpolation="bilinear")
     ax.axis("off")
     plt.tight_layout(pad=0)
+    buf = io.BytesIO()
+    fig_wc.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    plt.close(fig_wc)
+    buf.seek(0)
+    return top_words, buf.getvalue()
 
+
+def render_wordcloud_section(texts, section_title="Word Cloud"):
+    if not texts:
+        st.info("No text available for word cloud.")
+        return
+    st.subheader(section_title)
+    top_words, png = _wc_payload(tuple(str(t) for t in texts))
+    if not top_words or png is None:
+        st.info("No meaningful words extracted from the feedback.")
+        return
+    fig_top = go.Figure(go.Bar(
+        x=[c for _, c in top_words], y=[w for w, _ in top_words],
+        orientation="h", marker_color="#3498db",
+        text=[c for _, c in top_words], textposition="outside"))
+    fig_top.update_layout(title="Top 30 Words", height=max(400, 30 * 28),
+                          yaxis=dict(autorange="reversed"), xaxis_title="Frequency")
     col_bar, col_wc = st.columns([1, 2])
     with col_bar:
         st.plotly_chart(fig_top, use_container_width=True)
     with col_wc:
-        st.pyplot(fig_wc)
-    plt.close(fig_wc)
+        st.image(png, use_container_width=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -6710,7 +6719,7 @@ def lazy_tab_selector(tab_names, key, label="Section"):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v25.6 — TECH COUNTS (deep-dive) + TECHNOLOGY MONTHLY FILTER (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v25.7 — LAZY TABS (faster) + GLOBAL CANONICAL + EXPERT FILTERS (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -6832,6 +6841,16 @@ def main():
     show_canon = (_name_mode == "Canonical names")
     st.sidebar.caption("Showing " + ("canonical categories" if show_canon
                                      else "original source names"))
+
+    # keep the untouched frames for audit views / Excel, then swap in the
+    # canonical view ONCE so every downstream insight inherits it
+    _raw_support_df = support_df
+    _raw_all_case_df = all_case_df
+    if show_canon:
+        support_df = canonical_view(support_df)
+        all_case_df = canonical_view(all_case_df)
+        active_expert_df = canonical_view(active_expert_df)
+        all_interview_support_df = canonical_view(all_interview_support_df)
 
     # ======= TODAY =======
     if view == "Todays Snapshot":
@@ -7559,7 +7578,7 @@ def main():
             _mdf["_year"] = _mdf["date"].dt.year
 
             _yrs = sorted([int(y) for y in _mdf["_year"].unique()])
-            _fy1, _fy2, _fy3 = st.columns([1, 1, 3])
+            _fy1, _fy2, _fy3, _fy4 = st.columns([1, 1, 2, 2])
             _sel_years = _fy1.multiselect("Year", _yrs, default=_yrs, key="m_tech_year")
             _status_pick = _fy2.multiselect("Status", TASK_ORDER,
                                             default=TASK_ORDER, key="m_tech_status",
@@ -7568,6 +7587,10 @@ def main():
             _pick = _fy3.multiselect("Tech filter (leave empty = all)", _alltech,
                                      default=[], key="m_tech_filter",
                                      placeholder="All technologies")
+            _mexp_opts = (sorted([str(x) for x in _mdf["expert_name"].dropna().unique()])
+                          if "expert_name" in _mdf.columns else [])
+            _mexp = _fy4.multiselect("Expert filter", _mexp_opts, default=[],
+                                     key="m_tech_expert", placeholder="All experts")
 
             _mv = _mdf.copy()
             if _sel_years:
@@ -7576,6 +7599,8 @@ def main():
                 _mv = _mv[_mv["task_status"].isin(_status_pick)]
             if _pick:
                 _mv = _mv[_mv["_tech"].isin(_pick)]
+            if _mexp:
+                _mv = _mv[_mv["expert_name"].astype(str).isin(_mexp)]
 
             if _mv.empty:
                 st.info("No interviews match the current filters.")
@@ -7979,9 +8004,9 @@ def main():
         if selected_support == "Interview Support" and "out_of_shift" in support_df.columns:
             tab_names.append("Out of Shift")
 
-        tabs = st.tabs(tab_names)
+        _sel = lazy_tab_selector(tab_names, key="deepdive_section", label="Section")
 
-        with tabs[0]:
+        if _sel == tab_names[0]:
             fig = expert_stack(support_df)
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
@@ -7999,21 +8024,17 @@ def main():
                 ea["Completion_Pct"] = (ea["Completed"] / ea["Total"] * 100).round(1)
                 st.dataframe(ea.sort_values("Total", ascending=False), use_container_width=True)
 
-        with tabs[1]:
-            # Companies honour the sidebar Name Display toggle
-            cdf = support_df.copy()
-            if show_canon and "company_canon" in cdf.columns:
-                cdf["company_name"] = cdf["company_canon"]
-                st.caption("Canonical view: " + str(cdf["company_name"].nunique()) +
-                           " end-clients after merging (raw spellings: " +
-                           str(support_df["company_name"].nunique()) + ").")
-            elif "company_canon" in cdf.columns:
-                st.caption("Original view: " + str(cdf["company_name"].nunique()) +
-                           " distinct spellings as stored. Switch to Canonical in the "
-                           "sidebar to group brand variants.")
-            if show_canon and "company_canon" in support_df.columns:
+        if _sel == tab_names[1]:
+            cdf = support_df
+            st.caption(("Canonical view: " + str(cdf["company_name"].nunique()) +
+                        " end-clients after merging (raw spellings: " +
+                        str(_raw_support_df["company_name"].nunique()) + ").")
+                       if show_canon else
+                       ("Original view: " + str(cdf["company_name"].nunique()) +
+                        " distinct spellings as stored."))
+            if show_canon and "company_canon" in _raw_support_df.columns:
                 with st.expander("What merged? (original spelling -> canonical name)"):
-                    _m = support_df[["company_name", "company_canon"]].copy()
+                    _m = _raw_support_df[["company_name", "company_canon"]].copy()
                     _m["company_name"] = _m["company_name"].astype(str)
                     _g = (_m.groupby("company_canon")["company_name"]
                             .agg(lambda s: sorted(set(s))).reset_index())
@@ -8038,7 +8059,7 @@ def main():
                 fig2.update_layout(height=500)
                 st.plotly_chart(fig2, use_container_width=True)
 
-        with tabs[2]:
+        if _sel == tab_names[2]:
             if "round_name" in support_df.columns:
                 completed_only = support_df[support_df["task_status"] == "completed"] if "task_status" in support_df.columns else support_df
                 rc = completed_only["round_name"].value_counts()
@@ -8056,7 +8077,7 @@ def main():
                 fig2.update_layout(height=400)
                 st.plotly_chart(fig2, use_container_width=True)
 
-        with tabs[3]:
+        if _sel == tab_names[3]:
             fig = day_of_week_chart(support_df)
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
@@ -8070,7 +8091,7 @@ def main():
                 fig2.update_layout(height=400)
                 st.plotly_chart(fig2, use_container_width=True)
 
-        with tabs[4]:
+        if _sel == tab_names[4]:
             if "support_name" in all_case_df.columns:
                 sc = all_case_df["support_name"].value_counts()
                 fig = go.Figure(go.Bar(x=sc.index, y=sc.values, marker_color="#1abc9c",
@@ -8084,7 +8105,7 @@ def main():
                 fig2.update_layout(height=350)
                 st.plotly_chart(fig2, use_container_width=True)
 
-        with tabs[5]:
+        if _sel == tab_names[5]:
             _nav_cand = [("dd-table", "Table")]
             if selected_support == "Interview Support":
                 _nav_cand.append(("dd-active", "Active Candidates"))
@@ -8148,23 +8169,18 @@ def main():
                                                   min_interviews=5)
     
 
-        with tabs[6]:
+        if _sel == tab_names[6]:
             if "candidate_technology" in support_df.columns:
-                # Technology honours the sidebar Name Display toggle
-                tdf = support_df.copy()
-                if show_canon and "tech_canon" in tdf.columns:
-                    tdf["candidate_technology"] = tdf["tech_canon"]
-                    st.caption("Canonical view: " +
-                               str(tdf["candidate_technology"].nunique()) + " job families "
-                               "(raw labels: " + str(support_df["candidate_technology"].nunique()) + ").")
-                elif "tech_canon" in tdf.columns:
-                    st.caption("Original view: " +
-                               str(tdf["candidate_technology"].nunique()) +
-                               " distinct labels as stored. Switch to Canonical in the "
-                               "sidebar to group equivalent titles.")
-                if show_canon and "tech_canon" in support_df.columns:
+                tdf = support_df
+                st.caption(("Canonical view: " + str(tdf["candidate_technology"].nunique()) +
+                            " job families (raw labels: " +
+                            str(_raw_support_df["candidate_technology"].nunique()) + ").")
+                           if show_canon else
+                           ("Original view: " + str(tdf["candidate_technology"].nunique()) +
+                            " distinct labels as stored."))
+                if show_canon and "tech_canon" in _raw_support_df.columns:
                     with st.expander("Which labels map to each job family?"):
-                        _t = support_df[["candidate_technology", "tech_canon"]].copy()
+                        _t = _raw_support_df[["candidate_technology", "tech_canon"]].copy()
                         _t["candidate_technology"] = _t["candidate_technology"].astype(str)
                         _tg = (_t.groupby("tech_canon")["candidate_technology"]
                                  .agg(lambda s: sorted(set(s))).reset_index())
@@ -8187,6 +8203,15 @@ def main():
                 # ── CANDIDATES PER TECHNOLOGY ────────────────────
                 st.markdown("---")
                 st.subheader("Candidates per Technology")
+                _exp_opts = (sorted([str(x) for x in tdf["expert_name"].dropna().unique()])
+                             if "expert_name" in tdf.columns else [])
+                _exp_pick = st.multiselect("Filter by expert (blank = all experts)",
+                                           _exp_opts, default=[], key="dd_tech_expert",
+                                           placeholder="All experts")
+                if _exp_pick:
+                    tdf = tdf[tdf["expert_name"].astype(str).isin(_exp_pick)]
+                    st.caption("Filtered to " + str(len(_exp_pick)) + " expert(s): " +
+                               ", ".join(_exp_pick))
                 _tc = (tdf.groupby("candidate_technology")
                           .agg(Interviews=("task_status", "size"),
                                Candidates=("candidate_name", "nunique"),
@@ -8252,26 +8277,26 @@ def main():
         
 
         if selected_support == "Interview Support" and "start_hour" in support_df.columns and "Start Time" in tab_names:
-            with tabs[tab_names.index("Start Time")]:
+            if _sel == "Start Time":
                 render_start_time_insights(support_df, title_suffix=" - All Data")
                 st.markdown("---")
                 render_monthly_start_time_trend(support_df, title_suffix="")
 
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns and "Clash Detection" in tab_names:
-            with tabs[tab_names.index("Clash Detection")]:
+            if _sel == "Clash Detection":
                 render_clash_summary(support_df, title_suffix=" - All Data")
 
         if selected_support == "Interview Support" and "_parsed_start" in support_df.columns and "Blockage" in tab_names:
-            with tabs[tab_names.index("Blockage")]:
+            if _sel == "Blockage":
                 render_blockage_summary(support_df, title_suffix=" - All Data", all_experts_df=all_interview_support_df)
 
         if selected_support == "Interview Support" and "out_of_shift" in support_df.columns and "Out of Shift" in tab_names:
-            with tabs[tab_names.index("Out of Shift")]:
+            if _sel == "Out of Shift":
                 render_oos_section(support_df, title_suffix=" - All Data")
 
  
         if selected_support == "Assessment Support" and "Conversion Analytics" in tab_names:
-            with tabs[tab_names.index("Conversion Analytics")]:
+            if _sel == "Conversion Analytics":
                 st.subheader("Assessment to Interview Conversion (All Data)")
                 st.caption("Full-year conversion analysis with fuzzy company matching")
                 conv_df_deep = compute_assessment_conversions(all_case_df)
@@ -8281,7 +8306,7 @@ def main():
                 else:
                     st.info("No assessment data available for conversion analysis.")
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v25.6 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly")
+    st.sidebar.caption("Vizva Dashboard v25.7 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Lazy tabs")
 
 
 # ═══════════════════════════════════════════════════════════════════
