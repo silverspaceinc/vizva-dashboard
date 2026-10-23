@@ -48,7 +48,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v26.1]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v26.2]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -7214,6 +7214,167 @@ def fr_attach_hazard(pp, spec, beta):
     return pp
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  CANDIDATE STANDING — best / weakest, evidence-backed
+#
+#  Measured on this data (4 monthly snapshots, 62 observations):
+#     expert-adjusted sentiment  AUC 0.635   <- strongest single signal
+#     JD / technology match      AUC 0.599
+#     finals conversion rate     AUC 0.543
+#     since-last-final           AUC 0.515
+#     blended composites         AUC 0.567-0.588  (WORSE)
+#
+#  Conclusion baked into this design: rank on ONE validated signal and
+#  show the rest as context + flags. A blended "score out of 100" tested
+#  worse than the single best signal, so it is deliberately not used.
+# ═══════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=8)
+def fr_candidate_standing(df, min_interviews=7):
+    """Ranking table: completed interviews only."""
+    cols = ["cand", "interviews", "finals", "since_final", "tech_since_final",
+            "sent", "sent_adj", "jd", "n_sig", "top_expert", "tech", "comp",
+            "standing", "flags", "evidence"]
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=cols)
+    d = df[df["task_status"] == "completed"].copy()
+    if d.empty or "feedback" not in d.columns:
+        return pd.DataFrame(columns=cols)
+    d["_cand"] = d["candidate_name"].astype(str).str.strip()
+    d["_expert"] = d["expert_name"].astype(str)
+    d["_date"] = pd.to_datetime(d["date"], errors="coerce")
+    d["_is_final"] = d["round_name"].apply(_fr_is_final)
+    d["_is_tech"] = d["round_name"].apply(_fr_is_tech)
+    d["_tech"] = (d["tech_canon"] if "tech_canon" in d.columns
+                  else d["candidate_technology"]).astype(str)
+    d["_comp"] = (d["company_canon"] if "company_canon" in d.columns
+                  else d["company_name"]).astype(str)
+
+    tot = d.groupby("_cand").size()
+    d = d[d["_cand"].isin(tot[tot >= int(min_interviews)].index)]
+    if d.empty:
+        return pd.DataFrame(columns=cols)
+
+    def _s(t):
+        if not isinstance(t, str):
+            return np.nan
+        ss = [x for x in _fr_brief_sentences(t) if not _FR_BRIEF_NOISE.search(x)]
+        if not ss:
+            return np.nan
+        return float(np.mean([_fr_sentiment(x) for x in ss]))
+
+    d["_sent"] = d["feedback"].apply(_s)
+    d["_jd"] = d.apply(lambda r: _fr_jd_match(r.get("job_description"), r.get("_tech")),
+                       axis=1)
+    mu = d.groupby("_expert")["_sent"].transform("mean")
+    sd = d.groupby("_expert")["_sent"].transform("std").replace(0, np.nan)
+    d["_sent_adj"] = (d["_sent"] - mu) / sd.fillna(1.0)
+
+    rows = []
+    for cand, sub in d.groupby("_cand"):
+        sub = sub.sort_values("_date").reset_index(drop=True)
+        pos = [i for i, v in enumerate(sub["_is_final"]) if v]
+        since = (len(sub) - 1 - max(pos)) if pos else len(sub)
+        after = sub.iloc[max(pos) + 1:] if pos else sub
+        ev = []
+        for t in sub["feedback"].tail(2):
+            for s in _fr_brief_evidence(t):
+                if s not in ev:
+                    ev.append(s)
+        rows.append(dict(
+            cand=cand, interviews=int(len(sub)), finals=len(pos),
+            since_final=int(since),
+            tech_since_final=int(after["_is_tech"].sum()),
+            sent=round(float(sub["_sent"].mean()), 3),
+            sent_adj=round(float(sub["_sent_adj"].mean()), 2),
+            jd=(round(float(sub["_jd"].mean()), 2) if sub["_jd"].notna().any() else np.nan),
+            n_sig=int(sub["_sent"].notna().sum()),
+            top_expert=str(sub["_expert"].value_counts().index[0]),
+            tech=str(sub["_tech"].iloc[-1]), comp=str(sub["_comp"].iloc[-1]),
+            evidence=" || ".join(ev[:2])))
+    S = pd.DataFrame(rows)
+    if S.empty:
+        return S
+
+    # standing = expert-adjusted sentiment, ranked. No blending.
+    rank = S["sent_adj"].rank(pct=True)
+    S["standing"] = np.select(
+        [rank >= 0.75, rank <= 0.25],
+        ["Strong", "Weak"], default="Steady")
+
+    def _flags(r):
+        f = []
+        if r["since_final"] >= 20 and r["finals"] == 0:
+            f.append("STUCK")
+        if r["tech_since_final"] >= 3 and r["finals"] == 0:
+            f.append("TECH-WALL")
+        if r["finals"] == 0 and r["interviews"] >= 15:
+            f.append("NO-FINAL")
+        if pd.notna(r["jd"]) and r["jd"] < 0.34:
+            f.append("JD-MISMATCH")
+        return " ".join(f) if f else "-"
+
+    S["flags"] = S.apply(_flags, axis=1)
+    return S.sort_values("sent_adj", ascending=False).reset_index(drop=True)
+
+
+def render_candidate_standing(support_df):
+    """Best / weakest candidates view."""
+    st.subheader("Best & weakest candidates")
+    st.caption("Ranked on **expert-adjusted feedback sentiment** — the strongest "
+               "validated signal in this data (AUC 0.64). A blended score was tested "
+               "and performed worse, so the other columns are context, not arithmetic.")
+
+    S = fr_candidate_standing(support_df, 7)
+    if S.empty:
+        st.info("No candidates with 7+ completed interviews in this view.")
+        return
+
+    n_strong = int((S["standing"] == "Strong").sum())
+    n_weak = int((S["standing"] == "Weak").sum())
+    k = st.columns(4)
+    k[0].metric("Candidates scored", len(S))
+    k[1].metric("Strong", n_strong)
+    k[2].metric("Weak", n_weak)
+    k[3].metric("Flagged", int((S["flags"] != "-").sum()))
+
+    look = st.radio("View", ["Strong", "Weak", "All", "Flagged"],
+                    horizontal=True, key="cs_view", label_visibility="collapsed")
+    if look == "Strong":
+        V = S[S["standing"] == "Strong"]
+    elif look == "Weak":
+        V = S[S["standing"] == "Weak"]
+    elif look == "Flagged":
+        V = S[S["flags"] != "-"]
+    else:
+        V = S
+
+    st.dataframe(pd.DataFrame({
+        "Candidate": V["cand"], "Standing": V["standing"],
+        "Tech-adjusted": V["sent_adj"], "Raw sentiment": V["sent"],
+        "JD match": V["jd"], "Interviews": V["interviews"],
+        "Finals": V["finals"], "Since Final": V["since_final"],
+        "Tech rounds": V["tech_since_final"], "Technology": V["tech"],
+        "Flags": V["flags"],
+    }), use_container_width=True, height=min(600, 40 + 33 * len(V)))
+
+    if look in ("Strong", "Weak") and not V.empty:
+        pick = st.selectbox("Evidence for", V["cand"].tolist(), key="cs_pick")
+        r = V[V["cand"] == pick].iloc[0]
+        st.caption("**" + str(r["standing"]) + "** · " + str(int(r["interviews"])) +
+                   " completed interviews · " + str(int(r["finals"])) + " Final(s) · " +
+                   str(int(r["since_final"])) + " interviews since last Final · top expert " +
+                   str(r["top_expert"]))
+        if isinstance(r["evidence"], str) and len(r["evidence"]) > 10:
+            for s in str(r["evidence"]).split(" || "):
+                if len(s.strip()) > 10:
+                    st.markdown("> " + s.strip())
+
+    st.caption("STUCK 20+ interviews, no Final · TECH-WALL 3+ technical rounds, no Final · "
+               "NO-FINAL 15+ interviews, no Final · JD-MISMATCH under a third of technology "
+               "keywords appear in the job description.")
+
+
 def render_final_round_outlook(support_df, all_case_df):
     """Final Round Outlook tab."""
     st.subheader("Final Round Outlook")
@@ -7245,6 +7406,10 @@ def render_final_round_outlook(support_df, all_case_df):
                 str(round(repeat / max(len(cands), 1) * 100, 1)) + "%")
     k[3].metric("Stuck before first Final",
                 int(((cands["since_final"] >= 20) & (cands["final_count"] == 0)).sum()))
+
+    # ── best / weakest candidates ──────────────────────────────
+    st.markdown("---")
+    render_candidate_standing(support_df)
 
     # ── priority list ──────────────────────────────────────────
     st.markdown("---")
@@ -7397,7 +7562,7 @@ def render_final_round_outlook(support_df, all_case_df):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v26.1 — CANDIDATE BRIEF (completed interviews only) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v26.2 — BEST & WEAKEST CANDIDATES (validated ranking) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -8989,7 +9154,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v26.1 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief")
+    st.sidebar.caption("Vizva Dashboard v26.2 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing")
 
 
 # ═══════════════════════════════════════════════════════════════════
