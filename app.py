@@ -48,7 +48,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v25.8]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v25.9]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -6756,6 +6756,121 @@ def _fr_is_tech(rnd):
     return bool(_FR_TECH_RE.search(str(rnd)))
 
 
+# ── text scoring helpers (feedback sentiment + JD/technology fit) ──
+_FR_URL_RE = re.compile(r"https?://\S+|_x000D_")
+
+_FR_POS = {"strong": 1.5, "excellent": 1.6, "confident": 1.2, "confidently": 1.2,
+           "good": 1.0, "well": 0.8, "smoothly": 1.0, "successfully": 1.2,
+           "cleared": 1.5, "passed": 1.2, "impressive": 1.6, "solid": 1.2,
+           "clear": 0.9, "structured": 1.0, "proficient": 1.2, "accurate": 1.0,
+           "thorough": 1.0, "recommend": 1.4, "selected": 1.5, "shortlisted": 1.5,
+           "exceeded": 1.5, "great": 1.2, "effective": 1.0, "articulate": 1.0,
+           "engaging": 0.9, "positive": 1.0, "depth": 0.9}
+_FR_NEG = {"weak": -1.5, "poor": -1.6, "failed": -1.6, "fail": -1.4, "unable": -1.2,
+           "lacked": -1.3, "lack": -1.1, "unclear": -1.2, "confused": -1.2,
+           "struggled": -1.4, "struggle": -1.2, "limited": -1.0, "shallow": -1.2,
+           "superficial": -1.2, "fragmented": -1.1, "verbose": -0.8,
+           "repetitive": -0.8, "incorrect": -1.4, "wrong": -1.3, "rejected": -1.6,
+           "insufficient": -1.3, "disappointing": -1.4, "nervous": -1.0,
+           "hesitant": -1.1, "incomplete": -1.1, "below": -1.0}
+_FR_NEGATORS = {"not", "no", "never", "hardly", "barely", "without"}
+
+
+def _fr_clean_text(t):
+    if t is None or (isinstance(t, float) and pd.isna(t)):
+        return ""
+    s = _FR_URL_RE.sub(" ", str(t))
+    s = re.sub(r"[^\x00-\x7F]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+@st.cache_resource(show_spinner=False)
+def _fr_vader():
+    """VADER analyser if NLTK is present, else None (domain lexicon still works)."""
+    try:
+        from nltk.sentiment.vader import SentimentIntensityAnalyzer
+        try:
+            return SentimentIntensityAnalyzer()
+        except Exception:
+            import nltk
+            nltk.download("vader_lexicon", quiet=True)
+            return SentimentIntensityAnalyzer()
+    except Exception:
+        return None
+
+
+def _fr_domain_sentiment(text):
+    """Interview-domain lexicon score in -1..+1, negations handled."""
+    t = _fr_clean_text(text).lower()
+    if not t:
+        return 0.0
+    toks = re.findall(r"[a-z']+", t)
+    score, hits = 0.0, 0
+    for i, tok in enumerate(toks):
+        for lex in (_FR_POS, _FR_NEG):
+            if tok in lex:
+                v = lex[tok]
+                hits += 1
+                if i > 0 and toks[i - 1] in _FR_NEGATORS:
+                    v = -v * 0.8
+                score += v
+    if not hits:
+        return 0.0
+    return float(np.tanh((score / max(np.sqrt(hits), 1.0)) / 2.0))
+
+
+def _fr_sentiment(text):
+    """Blended domain + VADER score, -1 (poor) .. +1 (excellent)."""
+    t = _fr_clean_text(text)
+    if not t:
+        return 0.0
+    d = _fr_domain_sentiment(t)
+    an = _fr_vader()
+    if an is None:
+        return float(np.clip(d, -1, 1))
+    try:
+        v = an.polarity_scores(t)["compound"]
+    except Exception:
+        v = 0.0
+    return float(np.clip(0.65 * d + 0.35 * v, -1, 1))
+
+
+def _fr_jd_match(jd, tech):
+    """Fraction of the technology's core words present in the JD text."""
+    j = _fr_clean_text(jd).lower()
+    tl = str(tech).lower()
+    if not j or not tl:
+        return np.nan
+    stop = {"other", "cloud", "platform", "data", "engineering", "analytics",
+            "science", "management", "support", "and", "the"}
+    core = [w for w in re.findall(r"[a-z]+", tl) if len(w) > 3 and w not in stop]
+    if not core:
+        core = re.findall(r"[a-z]+", tl)[:2]
+    if not core:
+        return np.nan
+    return sum(1 for w in core if w in j) / len(core)
+
+
+_FR_IMPROVE_PAT = re.compile(
+    r"[^.]*\b(weak|poor|improve|lacked|limited|unclear|struggl\w*|verbos\w*|repetitiv\w*|"
+    r"shallow|superficial|hesitant|incomplete|filler\w*|didn't|did not)\b[^.]*\.",
+    re.I)
+
+
+def _fr_improvement_notes(text, limit=3):
+    """Pull the sentences that read like 'area of improvement'."""
+    t = _fr_clean_text(text)
+    if not t:
+        return ""
+    hits = [m.group(0).strip() for m in _FR_IMPROVE_PAT.finditer(t)]
+    out = []
+    for h in hits:
+        h = h.strip(" .,;")
+        if len(h) > 20 and h not in out:
+            out.append(h)
+    return " | ".join(out[:limit])
+
+
 def _fr_fit_irls(X, y, l2=1.0, iters=30):
     """Logistic regression via Newton-Raphson / IRLS. Returns beta."""
     n, p = X.shape
@@ -6800,6 +6915,14 @@ def fr_build_dataset(df):
     if comp.empty:
         return pd.DataFrame(), {}, pd.DataFrame()
 
+    # per-interview text signals (cheap: ~1k completed rows)
+    comp["_sent"] = comp["feedback"].apply(_fr_sentiment) if "feedback" in comp.columns else 0.0
+    comp["_jd"] = (comp.apply(lambda r: _fr_jd_match(r.get("job_description"),
+                                                     r.get("_tech")), axis=1)
+                   if "job_description" in comp.columns else np.nan)
+    comp["_improve"] = (comp["feedback"].apply(_fr_improvement_notes)
+                        if "feedback" in comp.columns else "")
+
     pp_rows, cand_rows = [], []
     for cand, sub in comp.groupby("_cand"):
         sub = sub.sort_values("_date")
@@ -6818,6 +6941,10 @@ def fr_build_dataset(df):
                 tech_rounds=int(prior["_is_tech"].sum()),
                 distinct_companies=int(prior["_comp"].nunique()),
                 distinct_experts=int(prior["_expert"].nunique()),
+                sent_mean=(float(prior["_sent"].mean()) if len(prior) else 0.0),
+                sent_last=(float(prior["_sent"].iloc[-1]) if len(prior) else 0.0),
+                jd_match=(float(prior["_jd"].mean())
+                          if len(prior) and prior["_jd"].notna().any() else np.nan),
             ))
         last_final = (int(hits[-1]) + 1) if len(hits) else 0
         after = sub.iloc[last_final:]
@@ -6831,6 +6958,14 @@ def fr_build_dataset(df):
             expert_share=round(float(sub["_expert"].value_counts(normalize=True).iloc[0]), 2),
             top_expert=str(sub["_expert"].value_counts().index[0]),
             last_date=sub["_date"].max(),
+            sent_mean=round(float(sub["_sent"].mean()), 3),
+            sent_last=round(float(sub["_sent"].iloc[-1]), 3),
+            sent_trend=round(float(sub["_sent"].iloc[-3:].mean()
+                                   - sub["_sent"].mean()), 3),
+            jd_match=(round(float(sub["_jd"].mean()), 2)
+                      if sub["_jd"].notna().any() else np.nan),
+            improve=(str(sub["_improve"].iloc[-1]) if "_improve" in sub.columns
+                     and len(sub) else ""),
         ))
 
     pp = pd.DataFrame(pp_rows)
@@ -6856,7 +6991,10 @@ def fr_build_dataset(df):
     num = ["interviews_done_w", "tech_rounds_w", "distinct_companies",
            "distinct_experts", "p_tech", "p_comp", "p_expert"]
     cat = ["tech", "expert", "support"]
-    spec = dict(num=num, cat=cat, base=base, tables=tables,
+    # sentiment / JD match are kept as DIAGNOSTICS: measured on this data they
+    # add no lift to the final-round target, but they explain interview quality
+    spec_num = list(num)
+    spec = dict(num=spec_num, cat=cat, base=base, tables=tables,
                 num_mean={c: float(pp[c].mean()) for c in num},
                 num_std={c: float(pp[c].std() or 1.0) for c in num},
                 cat_levels={c: sorted([x for x in pp[c].astype(str).unique()
@@ -6929,9 +7067,10 @@ def render_final_round_outlook(support_df, all_case_df):
 
     # ── RISK LIST with the three diagnostic columns ─────────────
     st.markdown("---")
-    st.subheader("Priority list — closest to / stuck before a Final")
-    st.caption("Hazard = chance the next completed interview is a Final. "
-               "Diagnostics flag candidates who may need intervention.")
+    st.subheader("Closest to converting — next Final round")
+    st.caption("**P(Final next)** = probability the next completed interview is a "
+               "Final round — higher means closer to converting. The flag column is a "
+               "separate health check and can disagree with it.")
 
     lv = live.copy()
     lv["_flag"] = ""
@@ -6954,7 +7093,9 @@ def render_final_round_outlook(support_df, all_case_df):
         "Tech rounds": show["tech_since_final"].astype(int),
         "Since last Final": show["since_final"].astype(int),
         "Experts used": show["distinct_experts"].astype(int),
-        "Hazard %": (show["hazard"] * 100).round(1),
+        "P(Final next) %": (show["hazard"] * 100).round(1),
+        "Sentiment": show["sent_mean"].round(2),
+        "JD match": show["jd_match"].round(2),
         "Flag": show["_flag"],
     })
     st.dataframe(disp, use_container_width=True, height=min(620, 40 + 35 * len(disp)))
@@ -7043,9 +7184,9 @@ def render_final_round_outlook(support_df, all_case_df):
         hh = fr_attach_hazard(hist, spec, beta)
         hh["Round"] = hh["round_c"]
         hh["Is Final"] = hh["y"].map({1: "YES", 0: ""})
-        hh["Hazard %"] = (hh["hazard"] * 100).round(1)
+        hh["P(Final next) %"] = (hh["hazard"] * 100).round(1)
         st.markdown("**Interview history**")
-        st.dataframe(hh[["t", "Round", "Is Final", "tech", "expert", "Hazard %"]]
+        st.dataframe(hh[["t", "Round", "Is Final", "tech", "expert", "P(Final next) %"]]
                      .rename(columns={"t": "#", "tech": "Technology", "expert": "Expert"}),
                      use_container_width=True, height=min(400, 40 + 30 * len(hh)))
 
@@ -7057,7 +7198,7 @@ def render_final_round_outlook(support_df, all_case_df):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v25.8 — FINAL ROUND OUTLOOK (ML tab) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v25.9 — P(FINAL NEXT) + SENTIMENT + JD MATCH (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -8649,7 +8790,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v25.8 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook")
+    st.sidebar.caption("Vizva Dashboard v25.9 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook")
 
 
 # ═══════════════════════════════════════════════════════════════════
