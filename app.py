@@ -48,7 +48,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v26.0]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v26.1]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -6851,6 +6851,171 @@ def _fr_jd_match(jd, tech):
     return sum(1 for w in core if w in j) / len(core)
 
 
+# ── CANDIDATE BRIEF: compress a candidate's completed-interview feedback ──
+_FR_BRIEF_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+# operational notes + assessment framing carry no performance signal
+_FR_BRIEF_NOISE = re.compile(
+    r"gave the interview himself|given by candidate himself|no support was required|"
+    r"requested preparation material|delivered (him|her)|reschedul|did not join|"
+    r"joined and then left|we waited|interviewer'?s? call|network|technical issue|"
+    r"feedback is expected|this (was|is) an? \w+ (assessment|interview|round)|"
+    r"included .*questions|consisting of|multiple[- ]choice|completed all", re.I)
+
+
+def _fr_brief_sentences(text):
+    return [s.strip() for s in _FR_BRIEF_SPLIT.split(_fr_clean_text(text))
+            if len(s.strip()) > 25]
+
+
+def _fr_brief_evidence(text, limit=2):
+    """Longest informative sentences from a completed-interview feedback."""
+    keep = [s for s in _fr_brief_sentences(text) if not _FR_BRIEF_NOISE.search(s)]
+    keep.sort(key=lambda s: -len(s))
+    return keep[:limit]
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=8)
+def fr_candidate_briefs(df, min_interviews=7):
+    """Per-candidate brief from COMPLETED interviews only.
+
+    Returns one row per candidate with:
+      score        mean sentiment over signal sentences (-1..1)
+      score_adj    expert-normalised score (z within the writing expert)
+      recent       mean of the last 3 interviews
+      trend        late third minus early third
+      consistency  1 - (spread / 2), higher = steadier
+      n_sig        usable signal sentences (evidence volume)
+    """
+    cols = ["cand", "interviews", "score", "score_adj", "recent", "trend",
+            "consistency", "n_sig", "evidence", "path"]
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=cols)
+
+    d = df[df["task_status"] == "completed"].copy()      # completed ONLY
+    if d.empty or "feedback" not in d.columns:
+        return pd.DataFrame(columns=cols)
+
+    d["_cand"] = d["candidate_name"].astype(str).str.strip()
+    d["_expert"] = d["expert_name"].astype(str)
+    d["_date"] = pd.to_datetime(d["date"], errors="coerce")
+    d["_round"] = d["round_name"].where(d["round_name"].notna(), "(blank)").astype(str)
+
+    tot = d.groupby("_cand").size()
+    d = d[d["_cand"].isin(tot[tot >= int(min_interviews)].index)]
+    if d.empty:
+        return pd.DataFrame(columns=cols)
+
+    rows = []
+    for _, r in d.iterrows():
+        sig = [s for s in _fr_brief_sentences(r["feedback"])
+               if not _FR_BRIEF_NOISE.search(s)]
+        if not sig:
+            continue
+        rows.append(dict(cand=r["_cand"], expert=r["_expert"], date=r["_date"],
+                         round_c=r["_round"], n_sig=len(sig),
+                         score=float(np.mean([_fr_sentiment(s) for s in sig])),
+                         evidence=_fr_brief_evidence(r["feedback"])))
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    I = pd.DataFrame(rows)
+    mu = I.groupby("expert")["score"].transform("mean")
+    sd = I.groupby("expert")["score"].transform("std").replace(0, np.nan)
+    I["score_adj"] = (I["score"] - mu) / sd.fillna(1.0)
+
+    out = []
+    for cand, sub in I.groupby("cand"):
+        sub = sub.sort_values("date")
+        k = max(3, len(sub) // 3)
+        early = float(sub["score"].head(k).mean())
+        late = float(sub["score"].tail(k).mean())
+        ev = []
+        for e in sub["evidence"].tail(2):
+            for s in e:
+                if s not in ev:
+                    ev.append(s)
+        out.append(dict(
+            cand=cand, interviews=int(len(sub)),
+            score=round(float(sub["score"].mean()), 3),
+            score_adj=round(float(sub["score_adj"].mean()), 2),
+            recent=round(float(sub["score"].tail(3).mean()), 3),
+            trend=round(late - early, 3),
+            consistency=round(float(1 - sub["score"].std() / 2), 3),
+            n_sig=int(sub["n_sig"].sum()),
+            evidence=" || ".join(ev[:3]),
+            path=",".join(str(round(float(v), 2)) for v in sub["score"].tolist()),
+        ))
+    return pd.DataFrame(out)
+
+
+def _fr_brief_label(row):
+    """Plain-language read of a candidate brief."""
+    tr = float(row["trend"])
+    sc = float(row["score_adj"])
+    if tr > 0.1 and sc >= 0:
+        return "Improving"
+    if tr < -0.1:
+        return "Declining"
+    if sc <= -0.5:
+        return "Below peer average"
+    if sc >= 0.5:
+        return "Above peer average"
+    return "Steady"
+
+
+def render_candidate_brief(brief, cands, pick=None):
+    """Single-candidate brief card (trajectory + evidence + confidence)."""
+    if brief is None or brief.empty:
+        st.info("No completed-interview feedback available for a brief.")
+        return
+    names = sorted(brief["cand"].unique())
+    if pick is None or pick not in names:
+        pick = names[0]
+    b = brief[brief["cand"] == pick].iloc[0]
+
+    n_sig = int(b["n_sig"])
+    conf = ("High" if n_sig >= 20 else "Medium" if n_sig >= 8 else "Low")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Overall feedback score", f"{b['score']:+.2f}",
+              help="Mean sentiment across usable feedback sentences. -1 = poor, +1 = excellent.")
+    m2.metric("vs peer experts", f"{b['score_adj']:+.2f}",
+              help="Standardised against other interviews rated by the same expert, so a "
+                   "lenient or strict writer does not distort the view.")
+    m3.metric("Trajectory", f"{b['trend']:+.2f}",
+              help="Recent third of interviews versus the earliest third. Positive = improving.")
+    m4.metric("Evidence", str(n_sig) + " sentences", conf + " confidence")
+
+    st.caption("Read: **" + _fr_brief_label(b) + "** · " + str(int(b["interviews"])) +
+               " completed interviews · latest score " + f"{b['recent']:+.2f}" +
+               " · consistency " + f"{b['consistency']:.2f}")
+
+    # trajectory sparkline
+    try:
+        vals = [float(x) for x in str(b["path"]).split(",") if x]
+    except Exception:
+        vals = []
+    if len(vals) >= 2:
+        f = go.Figure(go.Scatter(y=vals, mode="lines+markers",
+                                 line=dict(color="#2f6fed", width=2), marker=dict(size=5),
+                                 fill="tozeroy", fillcolor="rgba(47,111,237,0.10)"))
+        f.add_hline(y=0, line_dash="dot", line_color="#9aa3b2")
+        f.update_layout(title="Interview-by-interview feedback score",
+                        height=260, margin=dict(l=10, r=10, t=40, b=10),
+                        yaxis_title="score", xaxis_title="completed interview")
+        st.plotly_chart(f, use_container_width=True)
+
+    if isinstance(b["evidence"], str) and len(b["evidence"]) > 10:
+        st.markdown("**Evidence from recent feedback**")
+        for s in str(b["evidence"]).split(" || "):
+            if len(s.strip()) > 10:
+                st.markdown("> " + s.strip())
+
+    if conf == "Low":
+        st.caption("Low evidence volume — treat this brief as indicative only.")
+
+
 _FR_IMPROVE_PAT = re.compile(
     r"[^.]*\b(weak|poor|improve|lacked|limited|unclear|struggl\w*|verbos\w*|repetitiv\w*|"
     r"shallow|superficial|hesitant|incomplete|filler\w*|didn't|did not)\b[^.]*\.",
@@ -7211,6 +7376,11 @@ def render_final_round_outlook(support_df, all_case_df):
         hh["Is Final"] = hh["y"].map({1: "YES", 0: ""})
         hh["P(Final next) %"] = (hh["hazard"] * 100).round(1)
         hh["Sentiment"] = hh["sent_mean"].round(2)
+        _briefs = fr_candidate_briefs(support_df, MIN_IV)
+        st.markdown("---")
+        st.markdown("**Candidate brief — completed interviews only**")
+        render_candidate_brief(_briefs, cands, pick=pick)
+
         st.markdown("**Interview history**")
         st.dataframe(hh[["t", "Round", "Is Final", "tech", "expert", "Sentiment",
                          "P(Final next) %"]]
@@ -7227,7 +7397,7 @@ def render_final_round_outlook(support_df, all_case_df):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v26.0 — RECURRENT FINALS (7+ interviews, sentiment in model) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v26.1 — CANDIDATE BRIEF (completed interviews only) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -8819,7 +8989,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v26.0 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook")
+    st.sidebar.caption("Vizva Dashboard v26.1 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief")
 
 
 # ═══════════════════════════════════════════════════════════════════
