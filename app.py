@@ -48,7 +48,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v25.9]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v26.0]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -6894,10 +6894,17 @@ def _fr_fit_irls(X, y, l2=1.0, iters=30):
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=8)
-def fr_build_dataset(df):
-    """Candidate-level journey table + training spec (target encodings)."""
+def fr_build_dataset(df, min_interviews=7):
+    """Recurrent-event person-period dataset.
+
+    Every Final round is an event, and the clock RESETS after each one, so a
+    candidate who reached a Final but did not convert is scored again for the
+    next Final (with a different company). Candidates with fewer than
+    ``min_interviews`` completed interviews are excluded.
+    """
+    empty = (pd.DataFrame(), {}, pd.DataFrame())
     if df is None or len(df) == 0:
-        return pd.DataFrame(), {}, pd.DataFrame()
+        return empty
     d = df.copy()
     d["_cand"] = d["candidate_name"].astype(str).str.strip()
     d["_tech"] = (d["tech_canon"] if "tech_canon" in d.columns
@@ -6913,46 +6920,60 @@ def fr_build_dataset(df):
 
     comp = d[d["task_status"] == "completed"].copy()
     if comp.empty:
-        return pd.DataFrame(), {}, pd.DataFrame()
+        return empty
 
-    # per-interview text signals (cheap: ~1k completed rows)
-    comp["_sent"] = comp["feedback"].apply(_fr_sentiment) if "feedback" in comp.columns else 0.0
+    comp["_sent"] = (comp["feedback"].apply(_fr_sentiment)
+                     if "feedback" in comp.columns else 0.0)
     comp["_jd"] = (comp.apply(lambda r: _fr_jd_match(r.get("job_description"),
                                                      r.get("_tech")), axis=1)
                    if "job_description" in comp.columns else np.nan)
     comp["_improve"] = (comp["feedback"].apply(_fr_improvement_notes)
                         if "feedback" in comp.columns else "")
 
+    # ── eligibility filter: enough history to be meaningful ──
+    tot = comp.groupby("_cand").size()
+    keep = set(tot[tot >= int(min_interviews)].index)
+    comp = comp[comp["_cand"].isin(keep)].copy()
+    if comp.empty:
+        return empty
+
     pp_rows, cand_rows = [], []
     for cand, sub in comp.groupby("_cand"):
-        sub = sub.sort_values("_date")
-        sub = sub.reset_index(drop=True)
-        hits = sub.index[sub["_is_final"]]
-        T = int(hits[0]) + 1 if len(hits) else len(sub)
-        for t in range(1, T + 1):
-            row = sub.iloc[t - 1]
+        sub = sub.sort_values("_date").reset_index(drop=True)
+        n = len(sub)
+        n_fin = int(sub["_is_final"].sum())
+        last_fin = -1
+        for t in range(n):
+            row = sub.iloc[t]
             prior = sub.iloc[:t]
+            since_last = (t - last_fin - 1) if last_fin >= 0 else t
+            tech_since = (int(prior.iloc[last_fin + 1:]["_is_tech"].sum())
+                          if last_fin >= 0 else int(prior["_is_tech"].sum()))
             pp_rows.append(dict(
-                cand=cand, t=t, y=int(t == T and len(hits) > 0),
+                cand=cand, t=t + 1, y=int(bool(row["_is_final"])),
                 tech=str(row["_tech"]), comp=str(row["_comp"]),
                 expert=str(row["_expert"]), support=str(row["_support"]),
                 round_c=str(row["_round"]),
-                interviews_done=t - 1,
-                tech_rounds=int(prior["_is_tech"].sum()),
-                distinct_companies=int(prior["_comp"].nunique()),
-                distinct_experts=int(prior["_expert"].nunique()),
+                interviews_done=t,
+                since_final=since_last,
+                prior_finals=int(prior["_is_final"].sum()),
+                tech_since_final=tech_since,
+                tech_rounds_total=int(prior["_is_tech"].sum()),
                 sent_mean=(float(prior["_sent"].mean()) if len(prior) else 0.0),
                 sent_last=(float(prior["_sent"].iloc[-1]) if len(prior) else 0.0),
                 jd_match=(float(prior["_jd"].mean())
                           if len(prior) and prior["_jd"].notna().any() else np.nan),
             ))
-        last_final = (int(hits[-1]) + 1) if len(hits) else 0
-        after = sub.iloc[last_final:]
+            if bool(row["_is_final"]):
+                last_fin = t
+
+        tail_start = last_fin + 1
+        since_final = int(n - tail_start)
+        after = sub.iloc[tail_start:]
         cand_rows.append(dict(
             cand=cand, tech=str(sub["_tech"].iloc[-1]),
             comp=str(sub["_comp"].iloc[-1]), expert=str(sub["_expert"].iloc[-1]),
-            interviews=int(len(sub)), final_count=int(len(hits)),
-            since_final=int(len(after)),
+            interviews=int(n), final_count=n_fin, since_final=since_final,
             tech_since_final=int(after["_is_tech"].sum()),
             distinct_experts=int(sub["_expert"].nunique()),
             expert_share=round(float(sub["_expert"].value_counts(normalize=True).iloc[0]), 2),
@@ -6960,43 +6981,35 @@ def fr_build_dataset(df):
             last_date=sub["_date"].max(),
             sent_mean=round(float(sub["_sent"].mean()), 3),
             sent_last=round(float(sub["_sent"].iloc[-1]), 3),
-            sent_trend=round(float(sub["_sent"].iloc[-3:].mean()
-                                   - sub["_sent"].mean()), 3),
             jd_match=(round(float(sub["_jd"].mean()), 2)
                       if sub["_jd"].notna().any() else np.nan),
-            improve=(str(sub["_improve"].iloc[-1]) if "_improve" in sub.columns
-                     and len(sub) else ""),
+            improve=(str(after["_improve"].iloc[-1]) if len(after)
+                     else str(sub["_improve"].iloc[-1])),
         ))
 
     pp = pd.DataFrame(pp_rows)
     if pp.empty:
-        return pd.DataFrame(), {}, pd.DataFrame()
+        return empty
 
-    for col in ("interviews_done", "tech_rounds"):
+    for col in ("since_final", "interviews_done", "tech_since_final"):
         cap = float(pp[col].quantile(0.95))
         pp[col + "_w"] = pp[col].clip(upper=cap)
 
     base = float(pp["y"].mean())
     tables = {}
     for key, col, w in (("p_tech", "tech", 10), ("p_comp", "comp", 10), ("p_expert", "expert", 10)):
-        g = pp.groupby(col)["y"].agg(["sum", "count"])
-        # full-group rate is what NEW candidates get at scoring time
-        tables[col] = ((g["sum"] + base * w) / (g["count"] + w)).to_dict()
-        # training rows use LEAVE-ONE-OUT so a candidate's own outcome
-        # never leaks into their own feature
-        gs = pp[col].map(g["sum"]).values.astype(float)
-        gc = pp[col].map(g["count"]).values.astype(float)
+        gb = pp.groupby(col)["y"].agg(["sum", "count"])
+        tables[col] = ((gb["sum"] + base * w) / (gb["count"] + w)).to_dict()
+        gs = pp[col].map(gb["sum"]).values.astype(float)
+        gc = pp[col].map(gb["count"]).values.astype(float)
         pp[key] = (gs - pp["y"].values + base * w) / (gc - 1.0 + w)
 
-    num = ["interviews_done_w", "tech_rounds_w", "distinct_companies",
-           "distinct_experts", "p_tech", "p_comp", "p_expert"]
+    num = ["since_final_w", "prior_finals", "tech_since_final_w", "interviews_done_w",
+           "sent_mean", "jd_match", "p_tech", "p_comp", "p_expert"]
     cat = ["tech", "expert", "support"]
-    # sentiment / JD match are kept as DIAGNOSTICS: measured on this data they
-    # add no lift to the final-round target, but they explain interview quality
-    spec_num = list(num)
-    spec = dict(num=spec_num, cat=cat, base=base, tables=tables,
-                num_mean={c: float(pp[c].mean()) for c in num},
-                num_std={c: float(pp[c].std() or 1.0) for c in num},
+    spec = dict(num=num, cat=cat, base=base, tables=tables,
+                num_mean={c: float(pd.to_numeric(pp[c], errors="coerce").mean()) for c in num},
+                num_std={c: float(pd.to_numeric(pp[c], errors="coerce").std() or 1.0) for c in num},
                 cat_levels={c: sorted([x for x in pp[c].astype(str).unique()
                                        if (pp[c].astype(str) == x).sum() >= 10]) for c in cat})
     return pp, spec, pd.DataFrame(cand_rows)
@@ -7039,38 +7052,42 @@ def fr_attach_hazard(pp, spec, beta):
 def render_final_round_outlook(support_df, all_case_df):
     """Final Round Outlook tab."""
     st.subheader("Final Round Outlook")
-    st.caption("Probability that a candidate's NEXT completed interview is a Final. "
-               "Final = 'Final' or 'On Site' (any expert, including Self).")
+    st.caption("Probability that a candidate's NEXT completed interview is a Final round. "
+               "Every Final is counted — a candidate who already reached Finals but did not "
+               "convert is scored again for the next one. Final = 'Final' or 'On Site'.")
 
-    pp, spec, cands = fr_build_dataset(support_df)
+    MIN_IV = 7
+    pp, spec, cands = fr_build_dataset(support_df, MIN_IV)
     if pp.empty or cands.empty:
-        st.info("Not enough completed interview history to model final-round progression.")
+        st.info("No candidates with " + str(MIN_IV) + "+ completed interviews in this view.")
         return
-    if pp["y"].sum() < 10:
-        st.warning("Only " + str(int(pp["y"].sum())) + " final-round events in this view — "
+    if pp["y"].sum() < 15:
+        st.warning("Only " + str(int(pp["y"].sum())) + " Final-round events in this view — "
                    "treat all probabilities as indicative.")
-    beta, names = fr_fit(pp, spec)
 
-    # current state = each candidate's latest completed interview
+    beta, names = fr_fit(pp, spec)
     live = pp.sort_values(["cand", "t"]).groupby("cand").tail(1).copy()
     live = fr_attach_hazard(live, spec, beta)
     live = live.merge(cands, on="cand", how="left", suffixes=("", "_c"))
 
     reached = int((cands["final_count"] > 0).sum())
+    repeat = int((cands["final_count"] >= 2).sum())
     k = st.columns(4)
-    k[0].metric("Candidates tracked", len(cands))
+    k[0].metric("Candidates (" + str(MIN_IV) + "+ interviews)", len(cands))
     k[1].metric("Reached a Final", reached,
                 str(round(reached / max(len(cands), 1) * 100, 1)) + "%")
-    k[2].metric("Median interviews", int(cands["interviews"].median()))
-    k[3].metric("Stuck (20+ since Final)",
+    k[2].metric("At 2+ Finals", repeat,
+                str(round(repeat / max(len(cands), 1) * 100, 1)) + "%")
+    k[3].metric("Stuck before first Final",
                 int(((cands["since_final"] >= 20) & (cands["final_count"] == 0)).sum()))
 
-    # ── RISK LIST with the three diagnostic columns ─────────────
+    # ── priority list ──────────────────────────────────────────
     st.markdown("---")
     st.subheader("Closest to converting — next Final round")
-    st.caption("**P(Final next)** = probability the next completed interview is a "
-               "Final round — higher means closer to converting. The flag column is a "
-               "separate health check and can disagree with it.")
+    st.caption("**P(Final next)** = probability the next completed interview is a Final — "
+               "higher means closer to converting. The flag column is a separate health "
+               "check and can disagree with it. Only candidates with " + str(MIN_IV) +
+               "+ completed interviews are scored.")
 
     lv = live.copy()
     lv["_flag"] = ""
@@ -7080,38 +7097,47 @@ def render_final_round_outlook(support_df, all_case_df):
     lv["_flag"] = lv["_flag"].str.strip().replace("", "—")
 
     _n = st.slider("Rows to show", 5, 40, 15, key="fr_rows")
-    _open = lv[lv["final_count"] == 0].copy()
-    if _open.empty:
-        st.info("Every candidate in this view has already reached a Final round.")
-        _open = lv.copy()
-    show = _open.nlargest(_n, "hazard")
+    show = lv.nlargest(_n, "hazard")
     disp = pd.DataFrame({
         "Candidate": show["cand"],
         "Technology": show["tech"],
         "Expert": show["expert"],
         "Interviews": show["interviews"].astype(int),
-        "Tech rounds": show["tech_since_final"].astype(int),
+        "Finals so far": show["final_count"].astype(int),
         "Since last Final": show["since_final"].astype(int),
-        "Experts used": show["distinct_experts"].astype(int),
-        "P(Final next) %": (show["hazard"] * 100).round(1),
+        "Tech rounds since": show["tech_since_final"].astype(int),
         "Sentiment": show["sent_mean"].round(2),
         "JD match": show["jd_match"].round(2),
+        "P(Final next) %": (show["hazard"] * 100).round(1),
         "Flag": show["_flag"],
     })
     st.dataframe(disp, use_container_width=True, height=min(620, 40 + 35 * len(disp)))
 
-    st.caption("Ranked among candidates who have **not yet reached a Final**. In this data "
-               "finalists typically had many interviews before their Final, so a longer "
-               "history raises the estimate — read the ranking as *closest to converting*, "
-               "not as *most likely to fail*.")
-
     fl = lv[lv["_flag"] != "—"]
     if not fl.empty:
-        st.caption("**STUCK** 20+ interviews with no Final  ·  **TECH-WALL** 3+ technical "
-                   "rounds and no Final  ·  **SINGLE-EXPERT** every interview with one expert. "
+        st.caption("**STUCK** 20+ interviews with no Final · **TECH-WALL** 3+ technical "
+                   "rounds and no Final · **SINGLE-EXPERT** every interview with one expert. "
                    "(" + str(len(fl)) + " candidate(s) flagged)")
 
-    # ── EXPERT BREAKDOWN ───────────────────────────────────────
+    # ── repeat-final cohort ────────────────────────────────────
+    rp = lv[lv["final_count"] >= 1].copy()
+    if not rp.empty:
+        st.markdown("---")
+        st.subheader("Repeat candidates — already reached a Final, seeking the next")
+        st.caption("Candidates whose earlier Final did not convert. Scored for their NEXT "
+                   "Final, usually with a different company.")
+        rp = rp.nlargest(min(15, len(rp)), "hazard")
+        st.dataframe(pd.DataFrame({
+            "Candidate": rp["cand"],
+            "Technology": rp["tech"],
+            "Finals so far": rp["final_count"].astype(int),
+            "Interviews since last": rp["since_final"].astype(int),
+            "Total interviews": rp["interviews"].astype(int),
+            "Sentiment": rp["sent_mean"].round(2),
+            "P(Final next) %": (rp["hazard"] * 100).round(1),
+        }), use_container_width=True, height=min(500, 40 + 32 * len(rp)))
+
+    # ── expert / technology ────────────────────────────────────
     st.markdown("---")
     st.subheader("Expert-wise outlook")
     eb = (cands.groupby("expert")
@@ -7120,24 +7146,22 @@ def render_final_round_outlook(support_df, all_case_df):
                      Median_Interviews=("interviews", "median"))
                 .reset_index())
     eb["Reach_%"] = (eb["Reached_Final"] / eb["Candidates"] * 100).round(1)
-    hav = live.groupby("expert")["hazard"].mean().reset_index().rename(
-        columns={"hazard": "Avg_Hazard"})
+    hav = live.groupby("expert")["hazard"].mean().reset_index().rename(columns={"hazard": "Avg_P"})
     eb = eb.merge(hav, on="expert", how="left")
-    eb["Avg_Hazard"] = (eb["Avg_Hazard"] * 100).round(1)
+    eb["Avg_P"] = (eb["Avg_P"] * 100).round(1)
     eb = eb.sort_values("Reach_%", ascending=False)
     c1, c2 = st.columns([3, 2])
     with c1:
         f = go.Figure(go.Bar(x=eb["expert"], y=eb["Reach_%"], marker_color="#2f6fed",
                              text=eb["Reach_%"].astype(str) + "%", textposition="outside"))
-        f.update_layout(title="% of candidates who reached a Final (by expert)",
-                        height=400, yaxis_title="%", xaxis_title="", showlegend=False,
+        f.update_layout(title="% of candidates who reached a Final (by expert)", height=400,
+                        yaxis_title="%", xaxis_title="", showlegend=False,
                         yaxis_range=[0, max(100, eb["Reach_%"].max() * 1.25)])
         st.plotly_chart(f, use_container_width=True)
     with c2:
         st.dataframe(eb.rename(columns={"expert": "Expert", "Candidates": "Cands"}),
                      use_container_width=True, height=400)
 
-    # ── TECHNOLOGY BREAKDOWN ───────────────────────────────────
     st.markdown("---")
     st.subheader("Technology-wise outlook")
     tb = (cands.groupby("tech")
@@ -7146,9 +7170,9 @@ def render_final_round_outlook(support_df, all_case_df):
                      Median_Interviews=("interviews", "median"))
                 .reset_index())
     tb["Reach_%"] = (tb["Reached_Final"] / tb["Candidates"] * 100).round(1)
-    thv = live.groupby("tech")["hazard"].mean().reset_index().rename(columns={"hazard": "Avg_Hazard"})
+    thv = live.groupby("tech")["hazard"].mean().reset_index().rename(columns={"hazard": "Avg_P"})
     tb = tb.merge(thv, on="tech", how="left")
-    tb["Avg_Hazard"] = (tb["Avg_Hazard"] * 100).round(1)
+    tb["Avg_P"] = (tb["Avg_P"] * 100).round(1)
     tb = tb.sort_values("Reach_%", ascending=False)
     f2 = go.Figure(go.Bar(x=tb["Reach_%"], y=tb["tech"], orientation="h",
                           marker_color="#1abc9c",
@@ -7160,45 +7184,50 @@ def render_final_round_outlook(support_df, all_case_df):
     st.dataframe(tb.rename(columns={"tech": "Technology", "Candidates": "Cands"}),
                  use_container_width=True, height=340)
 
-    # ── CANDIDATE DETAIL CARD ──────────────────────────────────
+    # ── candidate detail ───────────────────────────────────────
     st.markdown("---")
     st.subheader("Candidate detail")
     pick = st.selectbox("Candidate", sorted(lv["cand"].unique()), key="fr_cand")
     if pick:
         row = lv[lv["cand"] == pick].iloc[0]
-        a, b, c3 = st.columns(3)
-        a.metric("Hazard — next interview" if int(row["final_count"]) == 0
-                 else "Hazard (already reached Final)",
-                 str(round(float(row["hazard"]) * 100, 1)) + "%")
-        b.metric("Interviews since last Final", int(row["since_final"]))
-        c3.metric("Technical rounds since Final", int(row["tech_since_final"]))
-        st.caption("Technology **" + str(row["tech"]) + "** · Company **" + str(row["comp"]) +
-                   "** · " + str(int(row["interviews"])) + " completed interviews · " +
-                   str(int(row["final_count"])) + " Final round(s) reached · " +
-                   str(int(row["distinct_experts"])) + " expert(s), top expert " +
-                   str(row["top_expert"]) + " (" + str(int(row["expert_share"] * 100)) + "% of work)")
+        a_, b_, c_ = st.columns(3)
+        a_.metric("P(Final next)", str(round(float(row["hazard"]) * 100, 1)) + "%")
+        b_.metric("Interviews since last Final", int(row["since_final"]))
+        c_.metric("Finals so far", int(row["final_count"]))
+        _jd_txt = (str(row["jd_match"]) if pd.notna(row["jd_match"]) else "n/a")
+        st.caption(
+            "Technology **" + str(row["tech"]) +
+            "** \u00b7 Company **" + str(row["comp"]) +
+            "** \u00b7 " + str(int(row["interviews"])) + " completed interviews \u00b7 " +
+            str(int(row["tech_since_final"])) + " technical rounds since last Final \u00b7 " +
+            "feedback sentiment " + str(round(float(row["sent_mean"]), 2)) +
+            " \u00b7 JD match " + _jd_txt)
+        if isinstance(row.get("improve"), str) and len(str(row["improve"])) > 10:
+            st.info("**Area of improvement (from feedback):** " + str(row["improve"])[:600])
 
-        hist = pp[pp["cand"] == pick].sort_values("t")[["t", "round_c", "tech", "expert", "hazard"]] \
-            if "hazard" in pp.columns else None
         hist = pp[pp["cand"] == pick].sort_values("t").copy()
         hh = fr_attach_hazard(hist, spec, beta)
         hh["Round"] = hh["round_c"]
         hh["Is Final"] = hh["y"].map({1: "YES", 0: ""})
         hh["P(Final next) %"] = (hh["hazard"] * 100).round(1)
+        hh["Sentiment"] = hh["sent_mean"].round(2)
         st.markdown("**Interview history**")
-        st.dataframe(hh[["t", "Round", "Is Final", "tech", "expert", "P(Final next) %"]]
+        st.dataframe(hh[["t", "Round", "Is Final", "tech", "expert", "Sentiment",
+                         "P(Final next) %"]]
                      .rename(columns={"t": "#", "tech": "Technology", "expert": "Expert"}),
-                     use_container_width=True, height=min(400, 40 + 30 * len(hh)))
+                     use_container_width=True, height=min(420, 40 + 30 * len(hh)))
 
-    st.caption("Model: L2 logistic regression (IRLS, numpy) on person-period data. "
-               "Single-step hazard only — multi-step forecasts are not shown because "
-               "with this event count the compounding overstates the true rate.")
-
+    st.caption("Model: L2 logistic regression (IRLS, numpy) on recurrent-event person-period "
+               "data, fitted on candidates with " + str(MIN_IV) + "+ completed interviews. "
+               "Features: interviews since last Final, Finals so far, technical rounds since "
+               "last Final, total interviews, feedback sentiment, JD/technology match, and "
+               "shrunk company / technology / expert conversion rates. Single-step hazard "
+               "only — multi-step forecasts are not shown.")
 
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v25.9 — P(FINAL NEXT) + SENTIMENT + JD MATCH (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v26.0 — RECURRENT FINALS (7+ interviews, sentiment in model) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -8790,7 +8819,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v25.9 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook")
+    st.sidebar.caption("Vizva Dashboard v26.0 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook")
 
 
 # ═══════════════════════════════════════════════════════════════════
