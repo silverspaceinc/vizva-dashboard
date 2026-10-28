@@ -12,8 +12,6 @@ import plotly.graph_objects as go
 from datetime import date, datetime, timedelta
 import requests
 import io
-import time
-import random
 import re
 import difflib
 import os
@@ -50,7 +48,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v26.3]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v26.2]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -3379,97 +3377,27 @@ def extract_feedback_texts(df, col="feedback"):
 #  ORIGINAL HELPERS (unchanged)
 # ═══════════════════════════════════════════════════════════════════
 
-# ── API access: bounded timeouts, retries, partial-data fallback ─────
-API_CONNECT_TIMEOUT = 10     # seconds to open the socket
-API_READ_TIMEOUT = 90        # seconds to wait for the first byte
-API_ATTEMPTS = 4             # total tries per page
-API_BACKOFF = 1.6            # exponential backoff base (seconds)
-
-
-class VizvaAPIError(Exception):
-    """Raised when the Vizva API cannot be reached after all retries."""
-
-
-@st.cache_resource(show_spinner=False)
-def _api_session():
-    """One pooled, keep-alive session instead of a new connection per page."""
-    s = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=4, pool_maxsize=8, max_retries=0)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
-
-
-def _api_get(url, headers, params, attempts=API_ATTEMPTS):
-    """GET with timeout + exponential backoff. Returns the Response."""
-    last_exc = None
-    for i in range(attempts):
-        try:
-            resp = _api_session().get(url, headers=headers, params=params,
-                                      timeout=(API_CONNECT_TIMEOUT, API_READ_TIMEOUT))
-            resp.raise_for_status()
-            return resp
-        except requests.exceptions.HTTPError as e:
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            last_exc = e
-            # 4xx (except 429) will not fix themselves - fail fast
-            if status is not None and 400 <= status < 500 and status != 429:
-                raise VizvaAPIError("API returned HTTP " + str(status) +
-                                    " - check API_KEY / BASE_URL in secrets.") from e
-        except (requests.exceptions.ConnectTimeout,
-                requests.exceptions.ReadTimeout,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.ChunkedEncodingError) as e:
-            last_exc = e
-        if i < attempts - 1:
-            time.sleep((API_BACKOFF ** i) + random.uniform(0, 0.4))
-    raise VizvaAPIError("API unreachable after " + str(attempts) + " attempts: " +
-                        type(last_exc).__name__ + ": " + str(last_exc)[:200])
-
-
-@st.cache_data(ttl=CACHE_TTL, show_spinner="Fetching data from the API...")
+@st.cache_data(ttl=600)
 def fetch_all_data():
-    """Page through /api/app-case.
-
-    Returns a DataFrame. If a later page fails after retries, the records
-    already fetched are returned with ``df.attrs['api_warning']`` set, so a
-    transient outage degrades to partial data instead of a blank screen.
-    """
     headers = {"x-api-key": API_KEY}
     all_records = []
     offset = 0
     limit = 500
-    warning = None
-
     while True:
-        try:
-            response = _api_get(BASE_URL + "/api/app-case", headers,
-                                {"limit": limit, "offset": offset})
-            batch = response.json()["data"]
-        except VizvaAPIError as e:
-            if all_records:
-                warning = ("Only " + str(len(all_records)) + " of the expected rows "
-                           "could be loaded (stopped at offset " + str(offset) +
-                           "). " + str(e))
-                break
-            raise
-        except (ValueError, KeyError) as e:
-            if all_records:
-                warning = "Malformed response at offset " + str(offset) + ": " + str(e)[:120]
-                break
-            raise VizvaAPIError("Unexpected API payload: " + str(e)[:150]) from e
-
+        response = requests.get(
+            BASE_URL + "/api/app-case",
+            headers=headers,
+            params={"limit": limit, "offset": offset}
+        )
+        response.raise_for_status()
+        batch = response.json()["data"]
         if not batch:
             break
         all_records.extend(batch)
         if len(batch) < limit:
             break
         offset += limit
-
     df = pd.DataFrame(all_records)
-    if warning:
-        df.attrs["api_warning"] = warning
     return df
 
 
@@ -6680,11 +6608,7 @@ DATA_PIPELINE_VERSION = "v25-active-candidates"
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner="Loading data pipeline...")
 def load_data_pipeline(pipeline_version=DATA_PIPELINE_VERSION):
-    """Fetch -> normalize -> filter -> Self-row fixup -> sentiment, cached.
-
-    Network failure is caught by the caller (main) so the UI can show a
-    retry card rather than a traceback.
-    """
+    """Fetch -> normalize -> filter -> Self-row fixup -> sentiment, cached."""
     raw = fetch_all_data()
     if raw is None or raw.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None
@@ -7638,7 +7562,7 @@ def render_final_round_outlook(support_df, all_case_df):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v26.3 — RESILIENT API (timeouts, retries, partial data) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v26.2 — BEST & WEAKEST CANDIDATES (validated ranking) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -7650,38 +7574,12 @@ def main():
         st.title("Vizva Interview Dashboard")
 
     # ── CACHED: one call instead of the whole eager pipeline ─────
-    try:
-        all_case_df, active_expert_df, all_interview_support_df, _fb_col = \
-            load_data_pipeline()
-    except VizvaAPIError as exc:
-        st.error("**Cannot reach the Vizva API right now.**")
-        st.caption(str(exc))
-        st.info("This is usually a transient network or upstream outage - the data "
-                "itself is not affected. Retrying in a few moments normally fixes it.")
-        if st.button("Retry now", type="primary"):
-            st.cache_data.clear()
-            st.rerun()
-        st.stop()
-    except Exception as exc:                      # noqa: BLE001 - last-resort guard
-        st.error("**Data load failed.**")
-        st.caption(type(exc).__name__ + ": " + str(exc)[:300])
-        if st.button("Retry now", type="primary"):
-            st.cache_data.clear()
-            st.rerun()
-        st.stop()
+    all_case_df, active_expert_df, all_interview_support_df, _fb_col = \
+        load_data_pipeline()
 
     if all_case_df is None or all_case_df.empty:
         st.error("No data returned from the API (or none for the current year).")
-        if st.button("Retry now", type="primary"):
-            st.cache_data.clear()
-            st.rerun()
         st.stop()
-
-    _api_warn = all_case_df.attrs.get("api_warning")
-    if _api_warn:
-        st.warning("**Partial data** - " + str(_api_warn))
-        st.caption("Numbers below are computed on the rows that loaded. "
-                   "Use Refresh Now once the API recovers.")
 
     with dl_col:
         st.write("")
@@ -9256,7 +9154,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v26.3 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Resilient API")
+    st.sidebar.caption("Vizva Dashboard v26.2 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing")
 
 
 # ═══════════════════════════════════════════════════════════════════
