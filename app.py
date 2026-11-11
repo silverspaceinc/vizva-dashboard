@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v26.5]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v26.6]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -6188,9 +6188,16 @@ def compute_assessment_conversions(all_data, window_days=60, similarity_threshol
     if "task_status" in assessments.columns:
         assessments = assessments[assessments["task_status"].astype(str).str.strip().str.lower() == "completed"]
 
-    # Deliberately NO status / expert filter on the interview side:
-    # completed, cancelled, rescheduled and pending rows all count, and
-    # expert_name == "Self" counts the same as any named expert.
+    # Deliberately NO status / expert filter on the interview side.
+    # A null / blank task_status - the "-" shown in the source system - is
+    # coerced to "unknown" and STILL counts as a conversion. The event is
+    # the existence of an interview for that candidate + company; its
+    # outcome (completed / cancelled / rescheduled / blank) is irrelevant.
+    if not interviews.empty and "task_status" in interviews.columns:
+        interviews["task_status"] = (interviews["task_status"]
+                                     .fillna("unknown").astype(str).str.strip()
+                                     .replace("", "unknown"))
+    # expert_name == "Self" counts exactly the same as a named expert.
 
     if assessments.empty:
         return pd.DataFrame()
@@ -6222,6 +6229,8 @@ def compute_assessment_conversions(all_data, window_days=60, similarity_threshol
         expert = assess_row.get("expert_name", "")
 
         converted = 0
+        cand_interviews = pd.DataFrame()
+        comp_interviews = pd.DataFrame()
         matched_interview_date = None
         matched_company = None
         match_score = None
@@ -6273,8 +6282,24 @@ def compute_assessment_conversions(all_data, window_days=60, similarity_threshol
                         interview_expert = first_interview.get("expert_name", "")
                         interview_status = first_interview.get("task_status", "")
 
+        if converted:
+            reason = "matched"
+        elif interviews.empty:
+            reason = "no interview rows loaded"
+        elif not candidate:
+            reason = "assessment has no candidate"
+        elif cand_interviews.empty:
+            reason = "no interview for this candidate"
+        elif not company:
+            reason = "assessment has no company"
+        elif comp_interviews.empty:
+            reason = "no interview for this company"
+        else:
+            reason = "interview outside the " + str(window_days) + "-day window"
+
         row = assess_row.to_dict()
         row.update({
+            "unmatched_reason": reason,
             "converted": converted,
             "matched_interview_date": matched_interview_date,
             "matched_company": matched_company,
@@ -6657,6 +6682,26 @@ def render_assessment_conversion_charts(conv_df, title_suffix=""):
                              use_container_width=True, hide_index=True)
 
     # ── Full Conversion Data ─────────────────────────────────────
+    if "unmatched_reason" in conv_df.columns:
+        with st.expander("Why did an assessment not convert?" + title_suffix,
+                         expanded=False):
+            _un = conv_df[conv_df["converted"] == 0]
+            if _un.empty:
+                st.success("Every assessment converted.")
+            else:
+                st.caption("One row per assessment with the exact reason it was not "
+                           "counted as converted. Any interview status - including a "
+                           "blank task and a Self expert - counts as converted.")
+                _vc = _un["unmatched_reason"].value_counts()
+                _rc = st.columns(min(4, max(1, len(_vc))))
+                for _i, (_rsn, _cnt) in enumerate(_vc.head(4).items()):
+                    _rc[_i].metric(str(_rsn)[:38], int(_cnt))
+                _cols = [c for c in ["date", "candidate_name", "company_name",
+                                     "expert_name", "round_name", "task_status",
+                                     "unmatched_reason"] if c in _un.columns]
+                st.dataframe(_un[_cols].sort_values("date", ascending=False),
+                             use_container_width=True, height=360)
+
     with st.expander("Full Assessment Conversion Data" + title_suffix):
         display_cols = [c for c in ["date", "candidate_name", "expert_name", "company_name",
                                     "task_status", "converted", "matched_interview_date",
@@ -7672,7 +7717,7 @@ def _comp_by_tech(frame):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v26.5 — FIX: CACHE_TTL DEFINED BEFORE USE (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v26.6 — CONVERSION AUDIT (any interview status counts) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -9298,7 +9343,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v26.5 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Scoped tech counts")
+    st.sidebar.caption("Vizva Dashboard v26.6 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Scoped tech counts")
 
 
 # ═══════════════════════════════════════════════════════════════════
