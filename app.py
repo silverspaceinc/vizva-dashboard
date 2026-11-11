@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v26.4]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v26.5]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -63,6 +63,8 @@ CLR = {"completed": "#2ecc71", "rescheduled": "#f39c12",
        "cancelled": "#e74c3c", "pending": "#3498db"}
 
 SUPPORT_TYPES = ["Interview Support", "Assessment Support", "Mock Interview", "Resume Understanding"]
+
+CACHE_TTL = 600  # seconds — documented refresh window; used by every cached call
 
 ILLEGAL_CHARACTERS_RE = re.compile(r'[\000-\010]|[\013-\014]|[\016-\037]')
 
@@ -6683,7 +6685,6 @@ def render_assessment_conversion_charts(conv_df, title_suffix=""):
 #     * the monthly live frame
 # ═══════════════════════════════════════════════════════════════════
 
-CACHE_TTL = 600  # seconds — matches the documented refresh window
 
 # Bump this string whenever the data pipeline changes. It is passed into
 # load_data_pipeline() so it becomes part of the @st.cache_data cache key,
@@ -7671,7 +7672,7 @@ def _comp_by_tech(frame):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v26.4 — CONVERSION RULES + SUPPORT-SCOPED TECH COUNTS (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v26.5 — FIX: CACHE_TTL DEFINED BEFORE USE (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -9297,7 +9298,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v26.4 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Scoped tech counts")
+    st.sidebar.caption("Vizva Dashboard v26.5 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Scoped tech counts")
 
 
 # ═══════════════════════════════════════════════════════════════════
