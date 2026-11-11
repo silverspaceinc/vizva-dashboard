@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v26.8]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v26.9]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -6172,23 +6172,55 @@ def compute_assessment_conversions(all_data, window_days=60, similarity_threshol
     if all_data.empty or "support_name" not in all_data.columns:
         return pd.DataFrame()
 
-    # ── CONVERSION RULES (as specified by the business) ──────────
-    #   SOURCE  (Assessment Support): task_status must be exactly
-    #           "completed". Anything else - blank "-", pending,
-    #           cancelled, rescheduled - is NOT an eligible source.
-    #   TARGET  (Interview Support): ANY task_status, including a blank
-    #           "-" / NULL, and ANY expert including "Self".
-    #           A blank interview status is coerced to "unknown" and still
-    #           counts, because the interview record itself is the event.
+    # ── CONVERSION RULES ─────────────────────────────────────────
+    #   SOURCE  (Assessment Support): task_status == "completed".
+    #
+    #           IMPORTANT: the source system leaves Task blank ("-") on
+    #           assessments that DID take place, and normalize() maps that
+    #           null to "pending", so status alone cannot tell a blank
+    #           from a genuinely pending record. When a blank becomes
+    #           "pending", a record is still treated as completed if it
+    #           carries positive evidence it happened: BOTH start_time and
+    #           end_time are populated and the date is in the past.
+    #           Explicit cancelled / rescheduled is NEVER eligible.
+    #
+    #   TARGET  (Interview Support): ANY task_status - completed,
+    #           cancelled, rescheduled, pending, or blank "-" / NULL -
+    #           and ANY expert including "Self". The interview record
+    #           existing for that candidate + company is the event.
+    #
+    #   ATTRIBUTION: the conversion belongs to the expert who gave the
+    #   ASSESSMENT. It does not matter who took the interview (same
+    #   expert, another expert, or Self).
     assessments = all_data[all_data["support_name"].str.lower() == "assessment support"].copy()
     interviews = all_data[all_data["support_name"].str.lower() == "interview support"].copy()
 
-    _excluded_assessments = 0
+    _n_completed = _n_evidenced = _n_excluded = 0
     if "task_status" in assessments.columns:
         _ast = (assessments["task_status"].fillna("").astype(str)
                 .str.strip().str.lower())
-        _eligible = _ast == "completed"
-        _excluded_assessments = int((~_eligible).sum())
+
+        def _has_time(col):
+            if col not in assessments.columns:
+                return pd.Series(False, index=assessments.index)
+            s = assessments[col].fillna("").astype(str).str.strip().str.lower()
+            return (~s.isin(["", "-", "nan", "none", "nat"]))
+
+        _started = _has_time("start_time") & _has_time("end_time")
+        _past = (assessments["date"] <= pd.Timestamp(datetime.now())
+                 if "date" in assessments.columns
+                 else pd.Series(True, index=assessments.index))
+
+        _is_completed = _ast == "completed"
+        _is_evidenced = (_ast.isin(["pending", "unknown", "", "nan", "-"])
+                         & _started & _past)
+        _is_void = _ast.isin(["cancelled", "canceled", "rescheduled"])
+
+        _eligible = _is_completed | (_is_evidenced & ~_is_void)
+        _n_completed = int(_is_completed.sum())
+        _n_evidenced = int((_is_evidenced & ~_is_completed & ~_is_void).sum())
+        _n_excluded = int((~_eligible).sum())
+
         assessments = assessments[_eligible].copy()
         assessments["task_status"] = "completed"
 
@@ -6204,8 +6236,11 @@ def compute_assessment_conversions(all_data, window_days=60, similarity_threshol
     # expert_name == "Self" counts exactly the same as a named expert.
 
     if assessments.empty:
-        return pd.DataFrame()
-
+        _empty = pd.DataFrame()
+        _empty.attrs["excluded_assessments"] = _n_excluded
+        _empty.attrs["assessments_completed"] = _n_completed
+        _empty.attrs["assessments_evidenced"] = _n_evidenced
+        return _empty
 
     if "date" not in assessments.columns or "candidate_name" not in assessments.columns:
         return pd.DataFrame()
@@ -6318,7 +6353,9 @@ def compute_assessment_conversions(all_data, window_days=60, similarity_threshol
 
     result = pd.DataFrame(result_rows)
     result["assessment_month"] = result["date"].dt.to_period("M").astype(str)
-    result.attrs["excluded_assessments"] = _excluded_assessments
+    result.attrs["excluded_assessments"] = _n_excluded
+    result.attrs["assessments_completed"] = _n_completed
+    result.attrs["assessments_evidenced"] = _n_evidenced
     return result
 
 
@@ -7722,7 +7759,7 @@ def _comp_by_tech(frame):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v26.8 — ASSESSMENT=COMPLETED ONLY, INTERVIEW=ANY STATUS (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v26.9 — BLANK ASSESSMENTS WITH TIMESTAMPS COUNT AS COMPLETED (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -9348,7 +9385,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v26.8 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Scoped tech counts")
+    st.sidebar.caption("Vizva Dashboard v26.9 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Scoped tech counts")
 
 
 # ═══════════════════════════════════════════════════════════════════
