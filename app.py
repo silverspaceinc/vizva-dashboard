@@ -12,6 +12,8 @@ import plotly.graph_objects as go
 from datetime import date, datetime, timedelta
 import requests
 import io
+import time
+import random
 import re
 import difflib
 import os
@@ -48,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v26.2]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v26.4]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -3377,27 +3379,97 @@ def extract_feedback_texts(df, col="feedback"):
 #  ORIGINAL HELPERS (unchanged)
 # ═══════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=600)
+# ── API access: bounded timeouts, retries, partial-data fallback ─────
+API_CONNECT_TIMEOUT = 10     # seconds to open the socket
+API_READ_TIMEOUT = 90        # seconds to wait for the first byte
+API_ATTEMPTS = 4             # total tries per page
+API_BACKOFF = 1.6            # exponential backoff base (seconds)
+
+
+class VizvaAPIError(Exception):
+    """Raised when the Vizva API cannot be reached after all retries."""
+
+
+@st.cache_resource(show_spinner=False)
+def _api_session():
+    """One pooled, keep-alive session instead of a new connection per page."""
+    s = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=4, pool_maxsize=8, max_retries=0)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+def _api_get(url, headers, params, attempts=API_ATTEMPTS):
+    """GET with timeout + exponential backoff. Returns the Response."""
+    last_exc = None
+    for i in range(attempts):
+        try:
+            resp = _api_session().get(url, headers=headers, params=params,
+                                      timeout=(API_CONNECT_TIMEOUT, API_READ_TIMEOUT))
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            last_exc = e
+            # 4xx (except 429) will not fix themselves - fail fast
+            if status is not None and 400 <= status < 500 and status != 429:
+                raise VizvaAPIError("API returned HTTP " + str(status) +
+                                    " - check API_KEY / BASE_URL in secrets.") from e
+        except (requests.exceptions.ConnectTimeout,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as e:
+            last_exc = e
+        if i < attempts - 1:
+            time.sleep((API_BACKOFF ** i) + random.uniform(0, 0.4))
+    raise VizvaAPIError("API unreachable after " + str(attempts) + " attempts: " +
+                        type(last_exc).__name__ + ": " + str(last_exc)[:200])
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner="Fetching data from the API...")
 def fetch_all_data():
+    """Page through /api/app-case.
+
+    Returns a DataFrame. If a later page fails after retries, the records
+    already fetched are returned with ``df.attrs['api_warning']`` set, so a
+    transient outage degrades to partial data instead of a blank screen.
+    """
     headers = {"x-api-key": API_KEY}
     all_records = []
     offset = 0
     limit = 500
+    warning = None
+
     while True:
-        response = requests.get(
-            BASE_URL + "/api/app-case",
-            headers=headers,
-            params={"limit": limit, "offset": offset}
-        )
-        response.raise_for_status()
-        batch = response.json()["data"]
+        try:
+            response = _api_get(BASE_URL + "/api/app-case", headers,
+                                {"limit": limit, "offset": offset})
+            batch = response.json()["data"]
+        except VizvaAPIError as e:
+            if all_records:
+                warning = ("Only " + str(len(all_records)) + " of the expected rows "
+                           "could be loaded (stopped at offset " + str(offset) +
+                           "). " + str(e))
+                break
+            raise
+        except (ValueError, KeyError) as e:
+            if all_records:
+                warning = "Malformed response at offset " + str(offset) + ": " + str(e)[:120]
+                break
+            raise VizvaAPIError("Unexpected API payload: " + str(e)[:150]) from e
+
         if not batch:
             break
         all_records.extend(batch)
         if len(batch) < limit:
             break
         offset += limit
+
     df = pd.DataFrame(all_records)
+    if warning:
+        df.attrs["api_warning"] = warning
     return df
 
 
@@ -6098,12 +6170,25 @@ def compute_assessment_conversions(all_data, window_days=60, similarity_threshol
     if all_data.empty or "support_name" not in all_data.columns:
         return pd.DataFrame()
 
+    # ── CONVERSION RULES (agreed with business) ──────────────────
+    #   SOURCE  : Assessment Support rows with task_status == "completed"
+    #   TARGET  : Interview Support rows with ANY task_status
+    #             (completed / cancelled / rescheduled / pending all count)
+    #             and ANY expert, including "Self" (candidate sat it alone).
+    #   Rationale: once an assessment is completed, the conversion happened
+    #             the moment an interview slot was created for that
+    #             candidate+company - even if it was later cancelled or the
+    #             candidate handled it without expert support.
     assessments = all_data[all_data["support_name"].str.lower() == "assessment support"].copy()
     interviews = all_data[all_data["support_name"].str.lower() == "interview support"].copy()
 
-    # Only consider completed assessments
+    # Only completed assessments are eligible as the source of a conversion
     if "task_status" in assessments.columns:
         assessments = assessments[assessments["task_status"].astype(str).str.strip().str.lower() == "completed"]
+
+    # Deliberately NO status / expert filter on the interview side:
+    # completed, cancelled, rescheduled and pending rows all count, and
+    # expert_name == "Self" counts the same as any named expert.
 
     if assessments.empty:
         return pd.DataFrame()
@@ -6608,7 +6693,11 @@ DATA_PIPELINE_VERSION = "v25-active-candidates"
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner="Loading data pipeline...")
 def load_data_pipeline(pipeline_version=DATA_PIPELINE_VERSION):
-    """Fetch -> normalize -> filter -> Self-row fixup -> sentiment, cached."""
+    """Fetch -> normalize -> filter -> Self-row fixup -> sentiment, cached.
+
+    Network failure is caught by the caller (main) so the UI can show a
+    retry card rather than a traceback.
+    """
     raw = fetch_all_data()
     if raw is None or raw.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None
@@ -7560,9 +7649,29 @@ def render_final_round_outlook(support_df, all_case_df):
                "only — multi-step forecasts are not shown.")
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=64)
+def _tech_month_tables(frame):
+    """Single pass: month x tech pivot, column totals, completed %."""
+    if frame is None or len(frame) == 0:
+        return pd.DataFrame(), pd.Series(dtype=float), 0.0
+    piv = frame.groupby(["_month", "_tech"]).size().unstack(fill_value=0)
+    totals = frame.groupby("_tech").size().sort_values(ascending=False)
+    comp = float((frame["task_status"] == "completed").mean() * 100)
+    return piv, totals.astype(int), round(comp, 1)
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=64)
+def _comp_by_tech(frame):
+    """Completed % per technology in one groupby (no per-row filtering)."""
+    if frame is None or len(frame) == 0:
+        return pd.Series(dtype=float)
+    g = frame.groupby("_tech")["task_status"]
+    return (g.apply(lambda s: (s == "completed").mean() * 100).round(1))
+
+
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v26.2 — BEST & WEAKEST CANDIDATES (validated ranking) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v26.4 — CONVERSION RULES + SUPPORT-SCOPED TECH COUNTS (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -7574,12 +7683,38 @@ def main():
         st.title("Vizva Interview Dashboard")
 
     # ── CACHED: one call instead of the whole eager pipeline ─────
-    all_case_df, active_expert_df, all_interview_support_df, _fb_col = \
-        load_data_pipeline()
+    try:
+        all_case_df, active_expert_df, all_interview_support_df, _fb_col = \
+            load_data_pipeline()
+    except VizvaAPIError as exc:
+        st.error("**Cannot reach the Vizva API right now.**")
+        st.caption(str(exc))
+        st.info("This is usually a transient network or upstream outage - the data "
+                "itself is not affected. Retrying in a few moments normally fixes it.")
+        if st.button("Retry now", type="primary"):
+            st.cache_data.clear()
+            st.rerun()
+        st.stop()
+    except Exception as exc:                      # noqa: BLE001 - last-resort guard
+        st.error("**Data load failed.**")
+        st.caption(type(exc).__name__ + ": " + str(exc)[:300])
+        if st.button("Retry now", type="primary"):
+            st.cache_data.clear()
+            st.rerun()
+        st.stop()
 
     if all_case_df is None or all_case_df.empty:
         st.error("No data returned from the API (or none for the current year).")
+        if st.button("Retry now", type="primary"):
+            st.cache_data.clear()
+            st.rerun()
         st.stop()
+
+    _api_warn = all_case_df.attrs.get("api_warning")
+    if _api_warn:
+        st.warning("**Partial data** - " + str(_api_warn))
+        st.caption("Numbers below are computed on the rows that loaded. "
+                   "Use Refresh Now once the API recovers.")
 
     with dl_col:
         st.write("")
@@ -8398,23 +8533,26 @@ def main():
         # ── CANDIDATE-WISE MONTHLY COUNTS ────────────────────────
         st.markdown("---")
         vz_anchor("m-cand")
-        # ── TECHNOLOGY-WISE MONTHLY INTERVIEW COUNTS ─────────────
+        # ── TECHNOLOGY-WISE MONTHLY COUNTS (scope follows Support Type) ──
         if "candidate_technology" in support_df.columns:
             st.markdown("---")
             vz_anchor("m-tech")
-            st.subheader("Technology-wise Monthly Interview Counts")
+            _is_assess = str(selected_support).strip().lower() == "assessment support"
+            _unit = "Assessment" if _is_assess else "Interview"
+            _units = _unit + "s"
+            st.subheader("Technology-wise Monthly " + _unit + " Counts")
 
             _mdf = support_df.copy()
             _techcol = ("tech_canon" if (show_canon and "tech_canon" in _mdf.columns)
                         else "candidate_technology")
             _mdf["_tech"] = _mdf[_techcol].astype(str)
             if show_canon and _techcol == "tech_canon":
-                st.caption("Canonical job families (" +
+                st.caption("Scope: **" + str(selected_support) + "** · canonical job families (" +
                            str(_mdf["_tech"].nunique()) + "). Switch Name Display in the "
-                           "sidebar to see the 109 raw labels instead.")
+                           "sidebar to see the raw labels instead.")
             else:
-                st.caption("Original technology labels as stored (" +
-                           str(_mdf["_tech"].nunique()) + ").")
+                st.caption("Scope: **" + str(selected_support) + "** · original technology "
+                           "labels as stored (" + str(_mdf["_tech"].nunique()) + ").")
 
             _mdf = _mdf[_mdf["date"].notna()].copy()
             _mdf["_month"] = _mdf["date"].dt.to_period("M").astype(str)
@@ -8446,48 +8584,53 @@ def main():
                 _mv = _mv[_mv["expert_name"].astype(str).isin(_mexp)]
 
             if _mv.empty:
-                st.info("No interviews match the current filters.")
+                st.info("No " + _units.lower() + " match the current filters.")
             else:
-                _piv = _mv.groupby(["_month", "_tech"]).size().unstack(fill_value=0)
+                # one groupby feeds every widget below - no repeated filtering
+                _piv, _totals, _comp = _tech_month_tables(
+                    _mv[["_month", "_tech", "task_status"]])
                 _piv = _piv.reindex(sorted(_piv.index))
+                _totals = _totals.reindex(_piv.columns).fillna(0)
 
                 _mk1, _mk2, _mk3, _mk4 = st.columns(4)
-                _mk1.metric("Interviews in scope", int(_mv.shape[0]))
+                _mk1.metric(_units + " in scope", int(_mv.shape[0]))
                 _mk2.metric("Technologies", int(_mv["_tech"].nunique()))
                 _mk3.metric("Candidates", int(_mv["candidate_name"].nunique()))
-                _mk4.metric("Completed %",
-                            str(round((_mv["task_status"] == "completed").mean() * 100, 1)) + "%")
+                _mk4.metric("Completed %", str(round(float(_comp), 1)) + "%")
+
+                # cap the stacked traces: top 10 by volume + "Other technologies"
+                _top = list(_totals.sort_values(ascending=False).head(10).index)
+                _plot = _piv[_top].copy()
+                _rest = _piv.drop(columns=_top)
+                if _rest.shape[1]:
+                    _plot["Other technologies"] = _rest.sum(axis=1)
 
                 _fig_m = go.Figure()
-                for _c in _piv.columns:
-                    _fig_m.add_trace(go.Bar(x=_piv.index, y=_piv[_c], name=str(_c),
+                for _c in _plot.columns:
+                    _fig_m.add_trace(go.Bar(x=_plot.index, y=_plot[_c], name=str(_c),
                                             hovertemplate="%{x}<br>" + str(_c) +
                                                           ": %{y}<extra></extra>"))
-                _fig_m.update_layout(title="Monthly Interviews by Technology (stacked)",
-                                     barmode="stack", height=480,
-                                     xaxis_title="Month", yaxis_title="Interviews",
+                _fig_m.update_layout(title="Monthly " + _units + " by Technology (stacked)",
+                                     barmode="stack", height=460,
+                                     xaxis_title="Month", yaxis_title=_units,
                                      legend=dict(orientation="h", y=-0.35, font=dict(size=9)))
                 st.plotly_chart(_fig_m, use_container_width=True)
 
-                _pct = _piv.div(_piv.sum(axis=1).replace(0, 1), axis=0) * 100
+                _pct = _plot.div(_plot.sum(axis=1).replace(0, 1), axis=0) * 100
                 _fig_p = go.Figure()
                 for _c in _pct.columns:
                     _fig_p.add_trace(go.Bar(x=_pct.index, y=_pct[_c].round(1), name=str(_c)))
-                _fig_p.update_layout(title="Monthly Technology Mix (share %)",
-                                     barmode="stack", height=440,
-                                     xaxis_title="Month", yaxis_title="% of interviews",
-                                     yaxis_range=[0, 100],
+                _fig_p.update_layout(title="Monthly Technology Mix (share %)", barmode="stack",
+                                     height=420, xaxis_title="Month",
+                                     yaxis_title="% of " + _units.lower(), yaxis_range=[0, 100],
                                      legend=dict(orientation="h", y=-0.35, font=dict(size=9)))
                 st.plotly_chart(_fig_p, use_container_width=True)
 
                 _tbl = _piv.T.copy()
-                _tbl["TOTAL"] = _tbl.sum(axis=1)
+                _tbl.insert(0, "COMPLETED %", _comp_by_tech(_mv[["_tech", "task_status"]]))
+                _tbl["TOTAL"] = _tbl.sum(axis=1, numeric_only=True)
                 _tbl = _tbl.sort_values("TOTAL", ascending=False)
-                _tbl["COMPLETED %"] = [
-                    round((_mv[_mv["_tech"] == _t]["task_status"] == "completed").mean() * 100, 1)
-                    for _t in _tbl.index
-                ]
-                st.markdown("**Monthly interview counts by technology**")
+                st.markdown("**Monthly " + _units.lower() + " by technology**")
                 st.dataframe(_tbl, use_container_width=True, height=420)
                 st.download_button(
                     "Download this table (CSV)",
@@ -9154,7 +9297,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v26.2 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing")
+    st.sidebar.caption("Vizva Dashboard v26.4 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Scoped tech counts")
 
 
 # ═══════════════════════════════════════════════════════════════════
