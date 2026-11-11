@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v26.7]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v26.8]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -6172,25 +6172,25 @@ def compute_assessment_conversions(all_data, window_days=60, similarity_threshol
     if all_data.empty or "support_name" not in all_data.columns:
         return pd.DataFrame()
 
-    # ── CONVERSION RULES (agreed with business) ──────────────────
-    #   SOURCE  : Assessment Support rows that actually took place.
-    #             "completed" qualifies. So does a BLANK / "-" status:
-    #             the record has a round and an expert assigned, the field
-    #             was simply never filled in. Only an explicit
-    #             cancelled / rescheduled assessment is excluded, because
-    #             that is the only unambiguous "did not happen" signal.
-    #   TARGET  : Interview Support rows with ANY task_status
-    #             (completed / cancelled / rescheduled / blank all count)
-    #             and ANY expert, including "Self" (candidate sat it alone).
+    # ── CONVERSION RULES (as specified by the business) ──────────
+    #   SOURCE  (Assessment Support): task_status must be exactly
+    #           "completed". Anything else - blank "-", pending,
+    #           cancelled, rescheduled - is NOT an eligible source.
+    #   TARGET  (Interview Support): ANY task_status, including a blank
+    #           "-" / NULL, and ANY expert including "Self".
+    #           A blank interview status is coerced to "unknown" and still
+    #           counts, because the interview record itself is the event.
     assessments = all_data[all_data["support_name"].str.lower() == "assessment support"].copy()
     interviews = all_data[all_data["support_name"].str.lower() == "interview support"].copy()
 
+    _excluded_assessments = 0
     if "task_status" in assessments.columns:
-        _ast = (assessments["task_status"].fillna("unknown").astype(str)
-                .str.strip().str.lower().replace("", "unknown"))
-        _void = {"cancelled", "canceled", "rescheduled"}
-        assessments = assessments[~_ast.isin(_void)].copy()
-        assessments["task_status"] = _ast[~_ast.isin(_void)]
+        _ast = (assessments["task_status"].fillna("").astype(str)
+                .str.strip().str.lower())
+        _eligible = _ast == "completed"
+        _excluded_assessments = int((~_eligible).sum())
+        assessments = assessments[_eligible].copy()
+        assessments["task_status"] = "completed"
 
     # Deliberately NO status / expert filter on the interview side.
     # A null / blank task_status - the "-" shown in the source system - is
@@ -6318,6 +6318,7 @@ def compute_assessment_conversions(all_data, window_days=60, similarity_threshol
 
     result = pd.DataFrame(result_rows)
     result["assessment_month"] = result["date"].dt.to_period("M").astype(str)
+    result.attrs["excluded_assessments"] = _excluded_assessments
     return result
 
 
@@ -7721,7 +7722,7 @@ def _comp_by_tech(frame):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v26.7 — BLANK ASSESSMENT STATUS COUNTS AS ELIGIBLE (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v26.8 — ASSESSMENT=COMPLETED ONLY, INTERVIEW=ANY STATUS (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -9347,7 +9348,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v26.7 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Scoped tech counts")
+    st.sidebar.caption("Vizva Dashboard v26.8 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Scoped tech counts")
 
 
 # ═══════════════════════════════════════════════════════════════════
