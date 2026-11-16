@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v26.9]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v27.0]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -7757,9 +7757,460 @@ def _comp_by_tech(frame):
     return (g.apply(lambda s: (s == "completed").mean() * 100).round(1))
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  CANDIDATE 360 — dedicated per-candidate analysis page
+#
+#  Everything below is scoped to ONE candidate chosen from the active
+#  candidate listing:
+#     1. round-wise counts (completed interviews)
+#     2. company counts (canonical aware) with first/last seen
+#     3. feedback + sentiment, filterable by company and round
+#     4. first interview received (date)
+#     5. assessment -> interview conversion (same business rules)
+#     6. technical -> final round conversion
+#     7. Self and On Site interview analysis
+#     8. per-company timeline of rounds, feedback, sentiment, assessments
+# ═══════════════════════════════════════════════════════════════════
+
+_CP_ONSITE_RE = re.compile(r"on\s*site|onsite", re.I)
+
+
+def _cp_sentiment(text):
+    """Domain feedback sentiment on the -100..+100 scale used elsewhere."""
+    if not isinstance(text, str) or not text.strip():
+        return np.nan
+    ss = [s for s in _fr_brief_sentences(text) if not _FR_BRIEF_NOISE.search(s)]
+    if not ss:
+        return np.nan
+    return round(float(np.mean([_fr_sentiment(s) for s in ss])) * 100, 1)
+
+
+def _cp_label(score):
+    if pd.isna(score):
+        return "No signal"
+    if score >= 20:
+        return "Positive"
+    if score <= -20:
+        return "Negative"
+    return "Neutral"
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=6)
+def cand_360_dataset(all_case_df):
+    """Per-row enrichment used by every block on the page."""
+    if all_case_df is None or len(all_case_df) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+    d = all_case_df.copy()
+    d["_cand"] = d["candidate_name"].astype(str).str.strip()
+    d["_company"] = (d["company_name"].astype(str).str.strip()
+                     if "company_name" in d.columns else "")
+    d["_company"] = d["_company"].replace({"nan": "(not specified)", "": "(not specified)"})
+    d["_tech"] = (d["candidate_technology"].astype(str)
+                  if "candidate_technology" in d.columns else "")
+    d["_support"] = d["support_name"].astype(str).str.strip()
+    d["_support_l"] = d["_support"].str.lower()
+    d["_expert"] = d["expert_name"].astype(str).str.strip()
+    d["_status"] = d["task_status"].astype(str).str.strip().str.lower()
+    d["_round"] = d["round_name"].where(d["round_name"].notna(), "(blank)").astype(str)
+    d["_date"] = pd.to_datetime(d["date"], errors="coerce")
+    d["_is_final"] = d["round_name"].apply(_fr_is_final)
+    d["_is_tech"] = d["round_name"].apply(_fr_is_tech)
+    d["_is_onsite"] = d["round_name"].astype(str).str.contains(_CP_ONSITE_RE, na=False)
+    d["_is_self"] = d["_expert"].str.lower() == "self"
+    d["_is_completed"] = d["_status"] == "completed"
+    d["_month"] = d["_date"].dt.to_period("M").astype(str)
+    fb = (d["feedback"] if "feedback" in d.columns
+          else pd.Series(index=d.index, dtype=object))
+    d["_fb"] = fb.apply(lambda x: x if isinstance(x, str) and x.strip() else "")
+    d["_sent"] = d["_fb"].apply(_cp_sentiment)
+    d["_sent_label"] = d["_sent"].apply(_cp_label)
+
+    # candidate roster: one row per candidate, newest activity first
+    rows = []
+    for cand, sub in d.groupby("_cand"):
+        iv = sub[sub["_support_l"] == "interview support"]
+        asr = sub[sub["_support_l"] == "assessment support"]
+        res = sub[sub["_support_l"] == "resume understanding"]
+        if len(iv) == 0 and len(asr) == 0:
+            continue
+        rows.append(dict(
+            cand=cand,
+            interviews=int(len(iv)),
+            completed=int((iv["_status"] == "completed").sum()),
+            assessments=int(len(asr)),
+            resume=int(len(res)),
+            companies=int(iv["_company"].nunique()),
+            finals=int(iv["_is_final"].sum()),
+            onsite=int(iv["_is_onsite"].sum()),
+            self_iv=int(iv["_is_self"].sum()),
+            first_date=iv["_date"].min(),
+            last_date=sub["_date"].max(),
+            tech=(sub["_tech"].replace("", np.nan).dropna().iloc[-1]
+                  if sub["_tech"].replace("", np.nan).notna().any() else ""),
+        ))
+    roster = pd.DataFrame(rows)
+    if not roster.empty:
+        roster = roster.sort_values(["last_date", "interviews"], ascending=[False, False])
+    return d, roster
+
+
+def render_candidate_360(all_case_df, show_canon):
+    """The Candidates page."""
+    st.header("Candidate 360")
+    st.caption("Per-candidate counts, feedback, sentiment, conversions and the full "
+               "round timeline. Use the sidebar picker to switch candidate.")
+
+    data, roster = cand_360_dataset(all_case_df)
+    if data.empty or roster.empty:
+        st.info("No candidate activity found in the current data.")
+        return
+
+    # ── candidate picker (from the active listing) ───────────────
+    names = roster["cand"].tolist()
+    pick = st.sidebar.selectbox("Candidate", names, key="c360_cand",
+                                help="Candidates with an interview or assessment in the data.")
+    row = roster[roster["cand"] == pick].iloc[0]
+    d = data[data["_cand"] == pick].copy()
+    iv = d[d["_support_l"] == "interview support"].copy()
+    asr = d[d["_support_l"] == "assessment support"].copy()
+    iv_c = iv[iv["_is_completed"]].copy()
+
+    st.markdown("### " + str(pick))
+    if row["tech"]:
+        st.caption("Technology: **" + str(row["tech"]) + "** · " +
+                   str(int(row["interviews"])) + " interviews · " +
+                   str(int(row["companies"])) + " companies · " +
+                   str(int(row["assessments"])) + " assessments")
+
+    # ── 4. first interview (top of the page) ─────────────────────
+    first_iv = row["first_date"]
+    first_completed = iv_c["_date"].min() if not iv_c.empty else pd.NaT
+    k = st.columns(5)
+    k[0].metric("First interview received",
+                first_iv.strftime("%d %b %Y") if pd.notna(first_iv) else "—",
+                (str((pd.Timestamp.today().normalize() - first_iv).days) + " days ago")
+                if pd.notna(first_iv) else None)
+    k[1].metric("First completed", first_completed.strftime("%d %b %Y")
+                if pd.notna(first_completed) else "—")
+    k[2].metric("Interviews", int(row["interviews"]),
+                str(int(row["completed"])) + " completed")
+    k[3].metric("Companies", int(row["companies"]))
+    k[4].metric("Final rounds", int(row["finals"]))
+
+    st.markdown("---")
+
+    # ── 2. company counts (canonical aware) ──────────────────────
+    st.subheader("Companies")
+    if iv.empty:
+        st.info("No interview records for this candidate.")
+    else:
+        co = (iv.groupby("_company")
+                 .agg(Interviews=("_round", "size"),
+                      Completed=("_is_completed", "sum"),
+                      Rounds=("_round", "nunique"),
+                      Experts=("_expert", "nunique"),
+                      First=("_date", "min"),
+                      Last=("_date", "max"),
+                      Sentiment=("_sent", "mean"),
+                      Finals=("_is_final", "sum"))
+                 .reset_index()
+                 .rename(columns={"_company": "Company"}))
+        co["Completed"] = co["Completed"].astype(int)
+        co["Sentiment"] = co["Sentiment"].round(1)
+        co["Finals"] = co["Finals"].astype(int)
+        co["First"] = co["First"].dt.strftime("%d %b %Y")
+        co["Last"] = co["Last"].dt.strftime("%d %b %Y")
+        co = co.sort_values("Interviews", ascending=False)
+
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            _cs = co.sort_values("Interviews")
+            f = go.Figure(go.Bar(y=_cs["Company"], x=_cs["Interviews"], orientation="h",
+                                 marker_color="#2f6fed",
+                                 text=_cs["Interviews"], textposition="outside"))
+            f.update_layout(title="Interviews per company", height=max(320, 30 * len(_cs)),
+                            xaxis_title="Interviews", yaxis=dict(autorange="reversed"),
+                            showlegend=False)
+            st.plotly_chart(f, use_container_width=True)
+        with c2:
+            st.caption("Canonical grouping is applied: brand variants of the same "
+                       "end-client count as one company." if show_canon else
+                       "Showing company names exactly as stored. Switch **Name Display** "
+                       "in the sidebar to merge brand variants.")
+            st.dataframe(co, use_container_width=True,
+                         height=min(420, 40 + 30 * len(co)))
+
+    st.markdown("---")
+
+    # ── 1. round-wise counts (completed interviews) ──────────────
+    st.subheader("Round-wise counts — completed interviews")
+    if iv_c.empty:
+        st.info("No completed interviews for this candidate.")
+    else:
+        rc = (iv_c.groupby("_round")
+                  .agg(Count=("_round", "size"),
+                       Companies=("_company", "nunique"),
+                       Sentiment=("_sent", "mean"))
+                  .reset_index().rename(columns={"_round": "Round"}))
+        rc["Sentiment"] = rc["Sentiment"].round(1)
+        rc = rc.sort_values("Count", ascending=False)
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            f = go.Figure(go.Bar(x=rc["Round"], y=rc["Count"], marker_color="#e8734a",
+                                 text=rc["Count"], textposition="outside"))
+            f.update_layout(title="Completed interviews per round", height=360,
+                            xaxis_title="", yaxis_title="Count", showlegend=False)
+            st.plotly_chart(f, use_container_width=True)
+        with c2:
+            st.dataframe(rc, use_container_width=True,
+                         height=min(360, 40 + 32 * len(rc)))
+
+    st.markdown("---")
+
+    # ── 6. technical -> final conversion ─────────────────────────
+    st.subheader("Technical to Final round conversion")
+    if iv_c.empty:
+        st.info("No completed interviews to evaluate.")
+    else:
+        combos = []
+        for comp, sub in iv_c.groupby("_company"):
+            combos.append(dict(Company=comp,
+                               Interviews=len(sub),
+                               Technical=int(sub["_is_tech"].sum()),
+                               Final=int(sub["_is_final"].sum()),
+                               Reached_Final="Yes" if sub["_is_final"].any() else "No"))
+        tf = pd.DataFrame(combos)
+        with_tech = tf[tf["Technical"] > 0]
+        n_tech = len(with_tech)
+        n_conv = int((with_tech["Reached_Final"] == "Yes").sum())
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Companies with a technical round", n_tech)
+        t2.metric("Reached a Final", n_conv)
+        t3.metric("Technical → Final rate",
+                  str(round(n_conv / n_tech * 100, 1)) + "%" if n_tech else "—")
+        if n_tech:
+            st.dataframe(with_tech.sort_values("Technical", ascending=False),
+                         use_container_width=True, height=min(360, 40 + 32 * len(with_tech)))
+            st.caption("Computed per candidate + company on completed interviews. "
+                       "A company counts as converted once it has a Final or On Site round.")
+        else:
+            st.info("This candidate has no technical/coding rounds yet.")
+
+    st.markdown("---")
+
+    # ── 5. assessment -> interview conversion ────────────────────
+    st.subheader("Assessment to Interview conversion")
+    if asr.empty:
+        st.info("No assessments recorded for this candidate.")
+    else:
+        conv = compute_assessment_conversions(asr)
+        if conv is None or conv.empty:
+            st.info("No eligible (completed) assessments for this candidate.")
+            if "excluded_assessments" in asr.attrs:
+                st.caption("Eligible: " + str(asr.attrs.get("assessments_completed", 0)) +
+                           " · evidenced: " + str(asr.attrs.get("assessments_evidenced", 0)))
+        else:
+            tot = len(conv)
+            nconv = int(conv["converted"].sum())
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Assessments", tot)
+            a2.metric("Converted", nconv)
+            a3.metric("Conversion rate",
+                      str(round(nconv / tot * 100, 1)) + "%" if tot else "—")
+            cdf = conv[["company_name", "date", "round_name", "expert_name",
+                        "converted", "matched_interview_date", "interview_round",
+                        "interview_expert", "interview_status", "days_to_interview"]].copy()
+            cdf.columns = ["Company", "Assessment date", "Assessment round",
+                           "Assessment expert", "Converted", "Interview date",
+                           "Interview round", "Interview expert", "Interview status",
+                           "Days"]
+            cdf["Converted"] = cdf["Converted"].map({1: "Yes", 0: "No"})
+            st.dataframe(cdf.sort_values("Assessment date", ascending=False),
+                         use_container_width=True, height=min(340, 40 + 32 * len(cdf)))
+            st.caption("Conversion is credited to the **assessment expert**. The interview "
+                       "may be taken by the same expert, another expert, or Self, and any "
+                       "interview status (including a blank task) counts.")
+
+    st.markdown("---")
+
+    # ── 7. Self and On Site analysis ─────────────────────────────
+    st.subheader("Self and On Site interviews")
+    s1, s2, s3 = st.columns(3)
+    n_self = int(iv["_is_self"].sum())
+    n_onsite = int(iv["_is_onsite"].sum())
+    s1.metric("Self interviews", n_self,
+              str(round(n_self / len(iv) * 100, 1)) + "% of all" if len(iv) else None)
+    s2.metric("On Site rounds", n_onsite,
+              str(round(n_onsite / len(iv) * 100, 1)) + "% of all" if len(iv) else None)
+    s3.metric("Standard expert rounds", int(len(iv) - n_self - n_onsite))
+    for label, mask in (("Self-handled interviews", iv["_is_self"]),
+                        ("On Site rounds", iv["_is_onsite"])):
+        sub = iv[mask]
+        if sub.empty:
+            continue
+        with st.expander(label + " (" + str(len(sub)) + ")"):
+            t = sub[["_date", "_company", "_round", "_expert", "_status", "_sent"]].copy()
+            t["_date"] = t["_date"].dt.strftime("%d %b %Y")
+            t.columns = ["Date", "Company", "Round", "Expert", "Status", "Sentiment"]
+            st.dataframe(t.sort_values("Date", ascending=False).reset_index(drop=True),
+                         use_container_width=True, height=min(320, 40 + 30 * len(t)))
+    st.caption("On Site rounds count as Final rounds for progression purposes, even when "
+               "the expert is Self.")
+
+    st.markdown("---")
+
+    # ── 3. feedback + sentiment, filterable ──────────────────────
+    st.subheader("Feedback and sentiment")
+    fb_rows = d[(d["_fb"] != "") | d["_sent"].notna()].copy()
+    if fb_rows.empty:
+        st.info("No feedback recorded for this candidate.")
+    else:
+        f1, f2, f3 = st.columns([2, 2, 1])
+        comp_opts = sorted([c for c in fb_rows["_company"].unique() if c])
+        comp_pick = f1.multiselect("Company", comp_opts, default=[], key="c360_fb_co",
+                                   placeholder="All companies")
+        round_opts = sorted(fb_rows["_round"].unique())
+        round_pick = f2.multiselect("Round", round_opts, default=[], key="c360_fb_round",
+                                    placeholder="All rounds")
+        sup_pick = f3.selectbox("Support", ["All", "Interview Support",
+                                            "Assessment Support", "Mock Interview"],
+                                key="c360_fb_sup")
+
+        fv = fb_rows.copy()
+        if comp_pick:
+            fv = fv[fv["_company"].isin(comp_pick)]
+        if round_pick:
+            fv = fv[fv["_round"].isin(round_pick)]
+        if sup_pick != "All":
+            fv = fv[fv["_support"] == sup_pick]
+
+        q1, q2, q3 = st.columns(3)
+        q1.metric("Feedbacks in view", len(fv))
+        _mean_sent = fv["_sent"].mean()
+        q2.metric("Average sentiment",
+                  (f"{_mean_sent:+.1f}" if pd.notna(_mean_sent) else "—"),
+                  _cp_label(_mean_sent) if pd.notna(_mean_sent) else None)
+        q3.metric("With usable signal", int(fv["_sent"].notna().sum()))
+
+        if fv.empty:
+            st.info("No feedback matches these filters.")
+        else:
+            # company-wise average sentiment
+            cs = (fv.groupby("_company")["_sent"].agg(["mean", "count"])
+                    .reset_index().rename(columns={"_company": "Company",
+                                                   "mean": "Avg sentiment",
+                                                   "count": "Feedbacks"}))
+            cs = cs.dropna(subset=["Avg sentiment"]).sort_values("Avg sentiment")
+            if not cs.empty:
+                cs["Avg sentiment"] = cs["Avg sentiment"].round(1)
+                f = go.Figure(go.Bar(y=cs["Company"], x=cs["Avg sentiment"], orientation="h",
+                                     marker_color=["#e74c3c" if v < 0 else "#2ecc71"
+                                                   for v in cs["Avg sentiment"]],
+                                     text=cs["Avg sentiment"], textposition="outside"))
+                f.add_vline(x=0, line_color="#9aa3b2")
+                f.update_layout(title="Average sentiment by company",
+                                height=max(300, 30 * len(cs)),
+                                xaxis_title="sentiment (-100 to +100)",
+                                yaxis=dict(autorange="reversed"), showlegend=False)
+                st.plotly_chart(f, use_container_width=True)
+
+            # round-wise average sentiment
+            rs = (fv.groupby("_round")["_sent"].agg(["mean", "count"])
+                    .reset_index().rename(columns={"_round": "Round",
+                                                   "mean": "Avg sentiment",
+                                                   "count": "Feedbacks"}))
+            rs = rs.dropna(subset=["Avg sentiment"])
+            if len(rs) > 1:
+                rs["Avg sentiment"] = rs["Avg sentiment"].round(1)
+                st.dataframe(rs.sort_values("Avg sentiment", ascending=False),
+                             use_container_width=True, height=min(300, 40 + 30 * len(rs)))
+
+            st.markdown("**Individual feedback**")
+            show = fv.sort_values("_date", ascending=False)
+            for _, r in show.head(40).iterrows():
+                _sc = r["_sent"]
+                _badge = ("🟢" if pd.notna(_sc) and _sc >= 20 else
+                          "🔴" if pd.notna(_sc) and _sc <= -20 else "🟡")
+                _head = (str(r["_date"].strftime("%d %b %Y")) + " · " + str(r["_company"]) +
+                         " · " + str(r["_round"]) + " · " + str(r["_support"]) +
+                         " · " + str(r["_expert"]) + " · " + _badge + " " +
+                         (f"{_sc:+.1f}" if pd.notna(_sc) else "no signal"))
+                with st.expander(_head):
+                    if r["_fb"]:
+                        st.markdown("> " + _fr_clean_text(r["_fb"])[:1500])
+                    else:
+                        st.caption("No feedback text recorded.")
+                    _imp = _fr_improvement_notes(r["_fb"]) if r["_fb"] else ""
+                    if _imp:
+                        st.info("**Area of improvement:** " + _imp[:600])
+
+    st.markdown("---")
+
+    # ── 8. per-company timeline ──────────────────────────────────
+    st.subheader("Timeline by company")
+    comps = sorted([c for c in d["_company"].unique() if c])
+    if not comps:
+        st.info("No company recorded for this candidate.")
+        return
+    tco = st.selectbox("Company", comps, key="c360_timeline_co")
+    tl = d[d["_company"] == tco].sort_values("_date")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Records", len(tl))
+    m2.metric("Interviews", int((tl["_support_l"] == "interview support").sum()))
+    m3.metric("Assessments", int((tl["_support_l"] == "assessment support").sum()))
+    _ts = tl["_sent"].mean()
+    m4.metric("Avg sentiment", f"{_ts:+.1f}" if pd.notna(_ts) else "—",
+              _cp_label(_ts) if pd.notna(_ts) else None)
+
+    tdisp = pd.DataFrame({
+        "Date": tl["_date"].dt.strftime("%d %b %Y"),
+        "Support": tl["_support"],
+        "Round": tl["_round"],
+        "Expert": tl["_expert"],
+        "Status": tl["_status"],
+        "Sentiment": tl["_sent"].round(1),
+        "Signal": tl["_sent_label"],
+        "Final?": tl["_is_final"].map({True: "YES", False: ""}),
+        "On Site?": tl["_is_onsite"].map({True: "YES", False: ""}),
+        "Self?": tl["_is_self"].map({True: "YES", False: ""}),
+    })
+    st.dataframe(tdisp.reset_index(drop=True), use_container_width=True,
+                 height=min(460, 40 + 32 * len(tdisp)))
+
+    # sentiment trajectory for this company
+    tr = tl.dropna(subset=["_sent"])
+    if len(tr) >= 2:
+        f = go.Figure(go.Scatter(x=tr["_date"], y=tr["_sent"], mode="lines+markers",
+                                 line=dict(color="#2f6fed", width=2), marker=dict(size=7),
+                                 text=tr["_round"],
+                                 hovertemplate="%{x|%d %b %Y}<br>%{text}<br>%{y:+.1f}<extra></extra>"))
+        f.add_hline(y=0, line_dash="dot", line_color="#9aa3b2")
+        f.update_layout(title="Sentiment across rounds — " + str(tco), height=300,
+                        yaxis_title="sentiment", xaxis_title="")
+        st.plotly_chart(f, use_container_width=True)
+
+    with st.expander("Round-by-round feedback for " + str(tco)):
+        for _, r in tl.iterrows():
+            _sc = r["_sent"]
+            _t = (str(r["_date"].strftime("%d %b %Y")) + " · " + str(r["_support"]) +
+                  " · " + str(r["_round"]) + " · " + str(r["_expert"]) +
+                  (" · " + f"{_sc:+.1f}" if pd.notna(_sc) else ""))
+            st.markdown("**" + _t + "**")
+            st.markdown("> " + (_fr_clean_text(r["_fb"])[:1200] if r["_fb"]
+                                else "_no feedback recorded_"))
+            st.markdown("")
+
+    st.download_button("Download this timeline (CSV)",
+                       tdisp.to_csv(index=False).encode("utf-8"),
+                       file_name=("candidate_" + str(pick).replace(" ", "_")[:30] + "_" +
+                                  str(tco).replace(" ", "_")[:20] + ".csv"),
+                       mime="text/csv", key="c360_dl")
+
+
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v26.9 — BLANK ASSESSMENTS WITH TIMESTAMPS COUNT AS COMPLETED (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v27.0 — CANDIDATE 360 PAGE (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -7890,7 +8341,8 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
-                                            "Daily Drill-Down", "Deep-Dive Analytics"],
+                                            "Daily Drill-Down", "Deep-Dive Analytics",
+                                            "Candidates"],
                                             label_visibility="collapsed")
 
     # ── NAME DISPLAY: original source names vs canonicalised categories ──
@@ -9062,6 +9514,9 @@ def main():
             st.info("No " + support_label + " on " + str(single))
 
     # ======= DEEP DIVE =======
+    elif view == "Candidates":
+        render_candidate_360(all_case_df, show_canon)
+
     elif view == "Deep-Dive Analytics":
         st.header("Deep-Dive Analytics - " + support_label)
 
@@ -9385,7 +9840,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v26.9 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Scoped tech counts")
+    st.sidebar.caption("Vizva Dashboard v27.0 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360")
 
 
 # ═══════════════════════════════════════════════════════════════════
