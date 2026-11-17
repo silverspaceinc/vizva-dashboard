@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v27.9]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v28.0]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -7931,6 +7931,31 @@ def overview_conversions(all_case_df):
     return conv
 
 
+_ROUND_BUCKETS = [("1st", "1st Round"), ("2nd", "2nd Round"), ("3rd", "3rd Round"),
+                  ("4th", "4th Round"), ("5th", "5th Round"),
+                  ("scr", "Screening"), ("tech", "Technical/Coding")]
+
+
+def _round_bucket(rnd):
+    """Map a raw round_name to a fixed reporting bucket key."""
+    t = str(rnd).strip().lower()
+    if t in ("1", "1.0"):
+        return "1st"
+    if t in ("2", "2.0"):
+        return "2nd"
+    if t in ("3", "3.0"):
+        return "3rd"
+    if t in ("4", "4.0"):
+        return "4th"
+    if t in ("5", "5.0"):
+        return "5th"
+    if "screen" in t:
+        return "scr"
+    if "technical" in t or "coding" in t or "system design" in t:
+        return "tech"
+    return "other"
+
+
 def render_candidates_overview(all_case_df, show_canon):
     """Month-wise active candidates with counts and sub-category conversions."""
     st.header("Candidates Overview")
@@ -7979,6 +8004,7 @@ def render_candidates_overview(all_case_df, show_canon):
         n_assess = int(len(cac)) if cac is not None else 0
         n_conv = int(cac["converted"].sum()) if cac is not None and len(cac) else 0
         ivc = iv[iv["_status"] == "completed"]
+        _rb = ivc["_round"].apply(_round_bucket).value_counts().to_dict()
         # assessment type split for this candidate (conversion-eligible rows)
         _tcount = {"Technical Assessment": 0, "Behavioural Assessment": 0,
                    "Technical + Behavioural": 0, "Take Home Assessment": 0}
@@ -7995,8 +8021,15 @@ def render_candidates_overview(all_case_df, show_canon):
             Interviews=int(len(iv)),
             Completed=int(len(ivc)),
             Companies=int(ivc["_company"].nunique()),
-            Rounds=int(ivc["_round"].nunique()),
-            Finals=int(ivc["_is_final"].sum()),
+            R1=int(_rb.get("1st", 0)),
+            R2=int(_rb.get("2nd", 0)),
+            R3=int(_rb.get("3rd", 0)),
+            R4=int(_rb.get("4th", 0)),
+            R5=int(_rb.get("5th", 0)),
+            Screening=int(_rb.get("scr", 0)),
+            TechRound=int(_rb.get("tech", 0)),
+            OtherRound=int(_rb.get("other", 0)),
+            Finals=int(iv["_is_final"].sum()),
             Assessments=n_assess,
             Converted=n_conv,
             Conv_pct=(round(n_conv / n_assess * 100, 1) if n_assess else np.nan),
@@ -8032,14 +8065,18 @@ def render_candidates_overview(all_case_df, show_canon):
 
     st.markdown("---")
     st.subheader("Candidates active in " + str(month))
-    st.caption("Companies, Rounds and Completed count **completed interviews only**. "
-               "Finals counts Final / On Site rounds. Assessment columns split by type "
-               "with conversions in brackets.")
+    st.caption("All interview columns count **completed interviews only**. Round columns "
+               "are 1st / 2nd / 3rd / 4th / 5th / Screening / Technical-Coding, with "
+               "**Final** including On Site. Assessment columns split by type.")
     _show_cols = ["Candidate", "Technology", "Interviews", "Completed", "Companies",
-                  "Rounds", "Finals", "Assessments", "Converted", "Conv_pct",
+                  "R1", "R2", "R3", "R4", "R5", "Screening", "TechRound", "OtherRound",
+                  "Finals", "Assessments", "Converted", "Conv_pct",
                   "Tech_Assess", "Tech_Conv", "Behav_Assess", "Behav_Conv",
                   "Both_Assess", "Both_Conv", "TakeHome_Assess", "TakeHome_Conv"]
     _disp = ov[[c for c in _show_cols if c in ov.columns]].rename(columns={
+        "R1": "1st", "R2": "2nd", "R3": "3rd", "R4": "4th", "R5": "5th",
+        "Screening": "Screening", "TechRound": "Tech/Coding",
+        "OtherRound": "Other", "Finals": "Final",
         "Conv_pct": "Conv %",
         "Tech_Assess": "Technical", "Tech_Conv": "Tech conv",
         "Behav_Assess": "Behavioural", "Behav_Conv": "Behav conv",
@@ -8590,7 +8627,7 @@ def monthly_assessment_categories(support_df, completed_only=True):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v27.9 — OVERVIEW: COMPLETED-ONLY + ASSESSMENT SEGREGATION + DOWNLOADS (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v28.0 — ROUND-WISE COLUMNS IN CANDIDATE OVERVIEW (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -10616,7 +10653,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v27.9 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v28.0 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
