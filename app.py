@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v27.1]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v27.3]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -488,12 +488,25 @@ def _get_vader():
     return SentimentIntensityAnalyzer()
 
 
+_SENT_MEMO = {}
+
+
 def compute_sentiment_score(text):
+    """VADER sentiment on -100..+100, memoised per distinct string.
+
+    Feedback text repeats heavily across rows (operational notes, standard
+    phrasings), so the memo turns ~2,200 VADER calls into a few hundred.
+    """
     if not isinstance(text, str) or not text.strip():
         return None
+    cached = _SENT_MEMO.get(text)
+    if cached is not None:
+        return cached
     sia = _get_vader()
-    compound = sia.polarity_scores(text)["compound"]
-    return round(compound * 100, 1)
+    val = round(sia.polarity_scores(text)["compound"] * 100, 1)
+    if len(_SENT_MEMO) < 20000:
+        _SENT_MEMO[text] = val
+    return val
 
 
 def add_sentiment_column(df, feedback_col="feedback"):
@@ -2376,6 +2389,7 @@ _QUALITY_COLS = ["Candidate", "Total Interviews", "Advanced Rounds", "Quality Sc
                  "Final Combos", "Technical Combos", "Companies", "Experts"]
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=8)
 def mark_advanced_rounds(df):
     """Annotate an interview frame with the advanced-round columns.
 
@@ -2430,17 +2444,14 @@ def mark_advanced_rounds(df):
     out["_is_excluded_tech"] = out["_is_tech_row"] & out["_combo_has_final"]
 
     # one representative row per advanced combination: the first Final if the
-    # combination has one, otherwise the first Technical/Coding round
-    out["_adv_repr"] = False
-    for _, idx in out.groupby("_combo_key", sort=False).groups.items():
-        sub = out.loc[idx]
-        finals = sub.index[sub["_is_final_row"].tolist()]
-        if len(finals):
-            out.loc[finals[0], "_adv_repr"] = True
-            continue
-        techs = sub.index[sub["_is_tech_row"].tolist()]
-        if len(techs):
-            out.loc[techs[0], "_adv_repr"] = True
+    # combination has one, otherwise the first Technical/Coding round.
+    # Vectorised: cumsum over the natural row order marks the first hit.
+    grp = out.groupby("_combo_key", sort=False)
+    _fin_cum = grp["_is_final_row"].cumsum()
+    _tech_cum = grp["_is_tech_row"].cumsum()
+    _first_final = (_fin_cum == 1) & out["_is_final_row"]
+    _first_tech = (_tech_cum == 1) & out["_is_tech_row"] & ~out["_combo_has_final"]
+    out["_adv_repr"] = (_first_final | _first_tech).astype(bool)
     return out
 
 
@@ -8439,9 +8450,22 @@ def render_candidate_360(all_case_df, show_canon):
                        mime="text/csv", key="c360_dl")
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=8)
+def monthly_assessment_categories(support_df):
+    """Assessment Support rows -> month + category (Technical / Behavioural / both)."""
+    if support_df is None or len(support_df) == 0:
+        return pd.DataFrame()
+    d = support_df.copy()
+    d["_month"] = pd.to_datetime(d["date"], errors="coerce").dt.to_period("M").astype(str)
+    d["_category"] = d["feedback"].apply(classify_assessment_category) if "feedback" in d.columns else "Unknown"
+    d["_status"] = d["task_status"].astype(str).str.strip().str.lower()
+    return d[["_month", "_category", "_status", "candidate_name", "company_name",
+              "expert_name", "round_name"]].copy()
+
+
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v27.1 — CANDIDATE 360 FIX + CANDIDATES OVERVIEW (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v27.3 — PERFORMANCE (vectorised rounds, memoised sentiment) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -8790,6 +8814,7 @@ def main():
             _nav_monthly.append(("m-experts", "Expert Breakdown"))
             _nav_monthly.append(("m-finals", "Finals & Technical"))
         if selected_support == "Assessment Support":
+            _nav_monthly.append(("m-acat", "Assessment Types"))
             _nav_monthly.append(("m-conv", "Assessment to Interview"))
         _nav_monthly.append(("m-tech", "Technology Mix"))
         _nav_monthly.append(("m-cand", "Candidate Counts"))
@@ -9278,6 +9303,76 @@ def main():
                                                           title_suffix=" — " + sel_cr_month,
                                                           min_interviews=1)
         # ── ASSESSMENT CONVERSION ANALYTICS ──────────────────────
+        if selected_support == "Assessment Support":
+            st.markdown("---")
+            vz_anchor("m-acat")
+            st.subheader("Assessment Types — Monthly Breakdown")
+            st.caption("Assessment category is classified from the assessment feedback text: "
+                       "Technical, Behavioural, or Technical + Behavioural. Unclassified "
+                       "records are grouped as Unknown.")
+
+            _acat = monthly_assessment_categories(support_df)
+            if _acat.empty:
+                st.info("No assessment records in the current scope.")
+            else:
+                _months = sorted([m for m in _acat["_month"].unique() if m and m != "NaT"],
+                                 reverse=True)
+                _mc1, _mc2 = st.columns([1, 3])
+                _sel_m = _mc1.selectbox("Month", _months, key="m_acat_month")
+                _hide_unk = _mc2.checkbox("Hide Unknown category", value=True,
+                                          key="m_acat_hide")
+                _am = _acat[_acat["_month"] == _sel_m]
+                _tbl = (_am.groupby("_category")
+                            .agg(Assessments=("_status", "size"),
+                                 Completed=("_status", lambda s: int((s == "completed").sum())),
+                                 Candidates=("candidate_name", "nunique"),
+                                 Companies=("company_name", "nunique"))
+                            .reset_index())
+                _order = {c: i for i, c in enumerate(_ASSESS_CATS)}
+                _tbl["_o"] = _tbl["_category"].map(_order).fillna(99)
+                _tbl = _tbl.sort_values("_o").drop(columns="_o")
+                _tbl["Completed %"] = (_tbl["Completed"] / _tbl["Assessments"] * 100).round(1)
+                if _hide_unk:
+                    _tbl = _tbl[_tbl["_category"] != "Unknown"]
+
+                if _tbl.empty:
+                    st.info("No categorised assessments in " + str(_sel_m) + ".")
+                else:
+                    _tk = st.columns(4)
+                    _tk[0].metric("Assessments", int(_tbl["Assessments"].sum()))
+                    _tk[1].metric("Candidates", int(_am["candidate_name"].nunique()))
+                    _tk[2].metric("Companies", int(_am["company_name"].nunique()))
+                    _tk[3].metric("Completed %",
+                                  str(round(float((_am["_status"] == "completed").mean() * 100), 1)) + "%")
+                    _ac1, _ac2 = st.columns(2)
+                    with _ac1:
+                        _f = go.Figure(go.Bar(x=_tbl["_category"], y=_tbl["Assessments"],
+                                              marker_color="#2f6fed", text=_tbl["Assessments"],
+                                              textposition="outside"))
+                        _f.update_layout(title="Assessments by type — " + str(_sel_m),
+                                         height=360, xaxis_title="", yaxis_title="Assessments",
+                                         showlegend=False)
+                        st.plotly_chart(_f, use_container_width=True)
+                    with _ac2:
+                        st.dataframe(_tbl.rename(columns={"_category": "Category"}),
+                                     use_container_width=True,
+                                     height=min(360, 40 + 34 * len(_tbl)))
+
+                    # month-over-month trend by category
+                    _trend = (_acat.groupby(["_month", "_category"]).size()
+                                  .unstack(fill_value=0).reindex(sorted(_acat["_month"].unique())))
+                    if _hide_unk and "Unknown" in _trend.columns:
+                        _trend = _trend.drop(columns="Unknown")
+                    if _trend.shape[1]:
+                        _f2 = go.Figure()
+                        for _c in _trend.columns:
+                            _f2.add_trace(go.Bar(x=_trend.index, y=_trend[_c], name=str(_c)))
+                        _f2.update_layout(title="Monthly assessment mix by type", barmode="stack",
+                                          height=420, xaxis_title="Month",
+                                          yaxis_title="Assessments",
+                                          legend=dict(orientation="h", y=-0.3, font=dict(size=9)))
+                        st.plotly_chart(_f2, use_container_width=True)
+
         if selected_support == "Assessment Support":
             st.markdown("---")
             vz_anchor("m-conv")
@@ -10074,7 +10169,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v27.1 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview")
+    st.sidebar.caption("Vizva Dashboard v27.3 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
