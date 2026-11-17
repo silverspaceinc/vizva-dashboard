@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v27.3]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v27.4]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -8465,7 +8465,7 @@ def monthly_assessment_categories(support_df):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v27.3 — PERFORMANCE (vectorised rounds, memoised sentiment) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v27.4 — SEGREGATED ASSESSMENT CONVERSION (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -9373,6 +9373,186 @@ def main():
                                           legend=dict(orientation="h", y=-0.3, font=dict(size=9)))
                         st.plotly_chart(_f2, use_container_width=True)
 
+                    # ═══ SEGREGATED CONVERSION BY ASSESSMENT TYPE ═══
+                    st.markdown("---")
+                    st.subheader("Segregated Assessment to Interview Conversion")
+
+                    _cv_all = overview_conversions(all_case_df)
+                    _cm = (_cv_all[_cv_all["_month"] == _sel_m].copy()
+                           if not _cv_all.empty else pd.DataFrame())
+
+                    if _cm.empty:
+                        st.info("No completed assessments with conversion data in " +
+                                str(_sel_m) + ".")
+                    else:
+                        _cats_vis = [c for c in _ASSESS_CATS if c != "Unknown"
+                                     or not _hide_unk]
+                        _cats_vis = [c for c in _cats_vis
+                                     if c in set(_cm["category"].unique())]
+
+                        # ── conversion by assessment type ──────────
+                        st.markdown("**Conversion by assessment type**")
+                        _by_t = (_cm.groupby("category")
+                                    .agg(Assessments=("converted", "size"),
+                                         Converted=("converted", "sum"),
+                                         Days=("days_to_interview", "mean"))
+                                    .reindex(_cats_vis).dropna(how="all").reset_index())
+                        if not _by_t.empty:
+                            _by_t["Converted"] = _by_t["Converted"].astype(int)
+                            _by_t["Not converted"] = _by_t["Assessments"] - _by_t["Converted"]
+                            _by_t["Conversion %"] = (_by_t["Converted"] /
+                                                     _by_t["Assessments"] * 100).round(1)
+                            _by_t["Avg days"] = _by_t["Days"].round(1)
+                            _by_t = _by_t.drop(columns="Days")
+                            _a, _b = st.columns([3, 2])
+                            with _a:
+                                _ft = go.Figure()
+                                _ft.add_trace(go.Bar(x=_by_t["category"], y=_by_t["Converted"],
+                                                     name="Converted", marker_color="#2ecc71",
+                                                     text=_by_t["Converted"],
+                                                     textposition="inside"))
+                                _ft.add_trace(go.Bar(x=_by_t["category"],
+                                                     y=_by_t["Not converted"],
+                                                     name="Not converted", marker_color="#e74c3c",
+                                                     text=_by_t["Not converted"],
+                                                     textposition="inside"))
+                                _ft.update_layout(barmode="stack", height=380,
+                                                  xaxis_title="", yaxis_title="Assessments",
+                                                  legend=dict(orientation="h", y=-0.25))
+                                st.plotly_chart(_ft, use_container_width=True)
+                            with _b:
+                                st.dataframe(_by_t.rename(columns={"category": "Assessment type"}),
+                                             use_container_width=True,
+                                             height=min(380, 40 + 34 * len(_by_t)))
+
+                        # ── generic segregation helper ─────────────
+                        def _seg_table(dim, label, top=None, min_n=1):
+                            _d = _cm.copy()
+                            _d[dim] = _d[dim].astype(str).str.strip()
+                            _d = _d[_d[dim] != ""]
+                            _piv = (_d.pivot_table(index=dim, columns="category",
+                                                   values="converted",
+                                                   aggfunc=["size", "sum"], fill_value=0))
+                            _rows = []
+                            _idx = _d.groupby(dim)["converted"].size().sort_values(
+                                ascending=False)
+                            if top:
+                                _idx = _idx.head(top)
+                            for _k in _idx.index:
+                                _tot = int(_idx[_k])
+                                if _tot < min_n:
+                                    continue
+                                _rec = {label: _k}
+                                for _c in _cats_vis:
+                                    try:
+                                        _n = int(_piv[("size", _c)].get(_k, 0))
+                                        _y = int(_piv[("sum", _c)].get(_k, 0))
+                                    except KeyError:
+                                        _n = _y = 0
+                                    _rec[_c + " (n)"] = _n
+                                    _rec[_c + " (conv)"] = _y
+                                _cy = int(_d[_d[dim] == _k]["converted"].sum())
+                                _rec["Total"] = _tot
+                                _rec["Converted"] = _cy
+                                _rec["Conversion %"] = (round(_cy / _tot * 100, 1)
+                                                        if _tot else np.nan)
+                                _rows.append(_rec)
+                            return pd.DataFrame(_rows)
+
+                        # ── expert-wise ────────────────────────────
+                        st.markdown("---")
+                        st.markdown("**Expert-wise conversion** — assessment expert")
+                        _ex = _seg_table("expert_name", "Assessment expert")
+                        if _ex.empty:
+                            st.info("No expert data in this month.")
+                        else:
+                            _e1, _e2 = st.columns([1, 3])
+                            _etop = _e1.slider("Show top N experts", 3, 25, 12,
+                                               key="m_acat_etop")
+                            _ev = _ex.sort_values("Conversion %", ascending=False).head(_etop)
+                            _fe = go.Figure()
+                            for _c in _cats_vis:
+                                _fe.add_trace(go.Bar(
+                                    y=_ev["Assessment expert"],
+                                    x=_ev[_c + " (conv)"], orientation="h", name=_c))
+                            _fe.update_layout(barmode="stack",
+                                              title="Converted assessments by expert and type",
+                                              height=max(320, 34 * len(_ev)),
+                                              xaxis_title="Converted",
+                                              yaxis=dict(autorange="reversed"),
+                                              legend=dict(orientation="h", y=-0.22,
+                                                          font=dict(size=9)))
+                            _e2.plotly_chart(_fe, use_container_width=True)
+                            st.dataframe(_ex, use_container_width=True,
+                                         height=min(420, 40 + 34 * len(_ex)))
+
+                        # ── company-wise ───────────────────────────
+                        st.markdown("---")
+                        st.markdown("**Company-wise conversion**")
+                        _co = _seg_table("company_name", "Company")
+                        if _co.empty:
+                            st.info("No company data in this month.")
+                        else:
+                            _c1_, _c2_ = st.columns([1, 3])
+                            _ctop = _c1_.slider("Show top N companies", 3, 30, 12,
+                                                key="m_acat_ctop")
+                            _cw = _co.sort_values("Total", ascending=False).head(_ctop)
+                            _fc = go.Figure()
+                            for _c in _cats_vis:
+                                _fc.add_trace(go.Bar(y=_cw["Company"], x=_cw[_c + " (conv)"],
+                                                     orientation="h", name=_c))
+                            _fc.update_layout(barmode="stack",
+                                              title="Converted assessments by company and type",
+                                              height=max(320, 34 * len(_cw)),
+                                              xaxis_title="Converted",
+                                              yaxis=dict(autorange="reversed"),
+                                              legend=dict(orientation="h", y=-0.22,
+                                                          font=dict(size=9)))
+                            _c2_.plotly_chart(_fc, use_container_width=True)
+                            st.dataframe(_co, use_container_width=True,
+                                         height=min(460, 40 + 34 * min(len(_co), 13)))
+
+                        # ── candidate-wise ─────────────────────────
+                        st.markdown("---")
+                        st.markdown("**Candidate-wise conversion**")
+                        _cd = _seg_table("candidate_name", "Candidate", min_n=1)
+                        if _cd.empty:
+                            st.info("No candidate data in this month.")
+                        else:
+                            st.dataframe(_cd.sort_values("Converted", ascending=False),
+                                         use_container_width=True,
+                                         height=min(460, 40 + 32 * min(len(_cd), 13)))
+
+                        # ── conversion rate heatmap ────────────────
+                        if len(_cats_vis) > 1:
+                            st.markdown("---")
+                            st.markdown("**Conversion rate heatmap — expert × assessment type**")
+                            _hm = _cm.copy()
+                            _hm["expert_name"] = _hm["expert_name"].astype(str).str.strip()
+                            _h = _hm.pivot_table(index="expert_name", columns="category",
+                                                 values="converted", aggfunc="mean") * 100
+                            _hn = _hm.pivot_table(index="expert_name", columns="category",
+                                                  values="converted", aggfunc="size")
+                            _h = _h.round(1)
+                            _h = _h.reindex(columns=_cats_vis)
+                            _f = px.imshow(_h, text_auto=True, aspect="auto",
+                                           color_continuous_scale="RdYlGn",
+                                           zmin=0, zmax=100,
+                                           title="Conversion % by assessment expert and type (n = assessments)")
+                            _f.update_layout(height=max(320, 34 * len(_h)))
+                            st.plotly_chart(_f, use_container_width=True)
+                            st.caption("Cells with small n are noisy — read alongside the "
+                                       "count tables above.")
+
+                        st.download_button(
+                            "Download segregated conversion (CSV)",
+                            _cm[["candidate_name", "company_name", "expert_name", "date",
+                                 "category", "converted", "matched_interview_date",
+                                 "interview_expert", "interview_status",
+                                 "days_to_interview"]].to_csv(index=False).encode("utf-8"),
+                            file_name="assessment_conversion_" + str(_sel_m) + ".csv",
+                            mime="text/csv", key="m_acat_seg_dl")
+
         if selected_support == "Assessment Support":
             st.markdown("---")
             vz_anchor("m-conv")
@@ -10169,7 +10349,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v27.3 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v27.4 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
