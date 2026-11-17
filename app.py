@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v27.7]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v27.8]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -6206,6 +6206,16 @@ def compute_assessment_conversions(all_data, window_days=45, similarity_threshol
     assessments = all_data[all_data["support_name"].str.lower() == "assessment support"].copy()
     interviews = all_data[all_data["support_name"].str.lower() == "interview support"].copy()
 
+    # A Self assessment means the candidate sat it alone - there is no expert
+    # delivery to attribute a conversion to, so it is out of scope here.
+    if not assessments.empty and "expert_name" in assessments.columns:
+        _self_mask = (assessments["expert_name"].astype(str).str.strip().str.lower()
+                      == "self")
+        _n_self = int(_self_mask.sum())
+        assessments = assessments[~_self_mask].copy()
+    else:
+        _n_self = 0
+
     _n_completed = _n_evidenced = _n_excluded = 0
     if "task_status" in assessments.columns:
         _ast = (assessments["task_status"].fillna("").astype(str)
@@ -6365,6 +6375,7 @@ def compute_assessment_conversions(all_data, window_days=45, similarity_threshol
     result = pd.DataFrame(result_rows)
     result["assessment_month"] = result["date"].dt.to_period("M").astype(str)
     result.attrs["excluded_assessments"] = _n_excluded
+    result.attrs["excluded_self_assessments"] = _n_self
     result.attrs["assessments_completed"] = _n_completed
     result.attrs["assessments_evidenced"] = _n_evidenced
     return result
@@ -7876,16 +7887,26 @@ _ASSESS_TECH_RE = re.compile(
 _ASSESS_BEHAV_RE = re.compile(
     r"behaviou?ral|situational|psychometric|personality|culture|competenc|"
     r"\bstar\b|motivational|leadership", re.I)
+_ASSESS_TAKEHOME_RE = re.compile(
+    r"take[\s-]?home|takehome|at[\s-]?home assessment|home\s*assessment", re.I)
 
 _ASSESS_CATS = ["Technical Assessment", "Behavioural Assessment",
-                "Technical + Behavioural", "Unknown"]
+                "Technical + Behavioural", "Take Home Assessment", "Unknown"]
 
 
 def classify_assessment_category(feedback):
-    """Technical / Behavioural / both / Unknown, read from assessment feedback."""
+    """Technical / Behavioural / both / Take Home / Unknown.
+
+    Take-Home is checked first: feedback such as
+    "Assessment Type: Take-Home Assessment" describes the delivery mode, and
+    would otherwise be swallowed by the technical lexicon if the text also
+    mentions coding.
+    """
     t = _fr_clean_text(feedback) if isinstance(feedback, str) else ""
     if not t:
         return "Unknown"
+    if _ASSESS_TAKEHOME_RE.search(t):
+        return "Take Home Assessment"
     has_t = bool(_ASSESS_TECH_RE.search(t))
     has_b = bool(_ASSESS_BEHAV_RE.search(t))
     if has_t and has_b:
@@ -8464,6 +8485,10 @@ def monthly_assessment_categories(support_df, completed_only=True):
     d["_month"] = pd.to_datetime(d["date"], errors="coerce").dt.to_period("M").astype(str)
     d["_category"] = d["feedback"].apply(classify_assessment_category) if "feedback" in d.columns else "Unknown"
     d["_status"] = d["task_status"].astype(str).str.strip().str.lower()
+    # Assessments handled by the candidate themselves carry no expert delivery,
+    # so they are excluded from type counts and conversion alike.
+    if "expert_name" in d.columns:
+        d = d[d["expert_name"].astype(str).str.strip().str.lower() != "self"].copy()
     if completed_only:
         d = d[d["_status"] == "completed"].copy()
     if d.empty:
@@ -8474,7 +8499,7 @@ def monthly_assessment_categories(support_df, completed_only=True):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v27.7 — UNKNOWN = COMPLETED ONLY + FULL DETAIL (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v27.8 — TAKE HOME CATEGORY + SELF ASSESSMENTS EXCLUDED (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -9316,11 +9341,11 @@ def main():
             st.markdown("---")
             vz_anchor("m-acat")
             st.subheader("Assessment Types — Monthly Breakdown")
-            st.caption("**Completed assessments only** — the same population used by every "
-                       "conversion figure. Category is classified from the assessment feedback "
-                       "text: Technical, Behavioural, or Technical + Behavioural. Completed "
-                       "assessments whose feedback cannot be classified are grouped as "
-                       "**Unknown** and listed in full detail below.")
+            st.caption("**Completed assessments handled by an expert** — Self assessments are "
+                       "excluded because no expert delivered them. Category is read from the "
+                       "feedback: Technical, Behavioural, Technical + Behavioural, or "
+                       "**Take Home Assessment**. Completed assessments whose feedback names "
+                       "none of these are grouped as **Unknown** and listed in full detail below.")
 
             _acat = monthly_assessment_categories(support_df)
             if _acat.empty:
@@ -10500,7 +10525,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v27.7 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v27.8 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
