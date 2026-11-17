@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v27.0]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v27.1]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -6157,7 +6157,7 @@ def _build_company_similarity_cache(company_list_a, company_list_b, threshold=0.
     return mapping
 
 
-def compute_assessment_conversions(all_data, window_days=60, similarity_threshold=0.55):
+def compute_assessment_conversions(all_data, window_days=45, similarity_threshold=0.55):
     """Compute assessment-to-interview conversions.
 
     For each assessment record, check if there's an interview with the same
@@ -7854,6 +7854,235 @@ def cand_360_dataset(all_case_df):
     return d, roster
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  CANDIDATES OVERVIEW — month-wise roll-up of every active candidate
+# ═══════════════════════════════════════════════════════════════════
+
+_ASSESS_TECH_RE = re.compile(
+    r"technical|coding|\bcode\b|\bcodes\b|programming|\bsql\b|python|\bjava\b|"
+    r"hackerrank|codility|algorithm|data structure|\bmcq\b|\bmcqs\b|test case|"
+    r"skill[-\s]?based|numerical|aptitude|\bdsa\b|machine learning", re.I)
+_ASSESS_BEHAV_RE = re.compile(
+    r"behaviou?ral|situational|psychometric|personality|culture|competenc|"
+    r"\bstar\b|motivational|leadership", re.I)
+
+_ASSESS_CATS = ["Technical Assessment", "Behavioural Assessment",
+                "Technical + Behavioural", "Unknown"]
+
+
+def classify_assessment_category(feedback):
+    """Technical / Behavioural / both / Unknown, read from assessment feedback."""
+    t = _fr_clean_text(feedback) if isinstance(feedback, str) else ""
+    if not t:
+        return "Unknown"
+    has_t = bool(_ASSESS_TECH_RE.search(t))
+    has_b = bool(_ASSESS_BEHAV_RE.search(t))
+    if has_t and has_b:
+        return "Technical + Behavioural"
+    if has_t:
+        return "Technical Assessment"
+    if has_b:
+        return "Behavioural Assessment"
+    return "Unknown"
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner="Computing monthly candidate overview...",
+               max_entries=4)
+def overview_conversions(all_case_df):
+    """Conversion flags computed ONCE for the whole frame, then sliced by month."""
+    conv = compute_assessment_conversions(all_case_df, window_days=45)
+    if conv is None or conv.empty:
+        return pd.DataFrame()
+    conv = conv.copy()
+    conv["category"] = conv["feedback"].apply(classify_assessment_category)
+    conv["_month"] = conv["date"].dt.to_period("M").astype(str)
+    return conv
+
+
+def render_candidates_overview(all_case_df, show_canon):
+    """Month-wise active candidates with counts and sub-category conversions."""
+    st.header("Candidates Overview")
+    st.caption("Every candidate active in the selected month, with interview volume, "
+               "candidate-company pairs, round mix and assessment-to-interview "
+               "conversion split by assessment type.")
+
+    data, roster = cand_360_dataset(all_case_df)
+    if data.empty:
+        st.info("No candidate activity in the current data.")
+        return
+
+    months = sorted([m for m in data["_month"].dropna().unique() if m and m != "NaT"],
+                    reverse=True)
+    if not months:
+        st.info("No dated records to group by month.")
+        return
+
+    h1, h2, h3 = st.columns([1.2, 1.2, 2])
+    month = h1.selectbox("Month", months, key="ov_month")
+    sup_filter = h2.selectbox("Activity basis", ["All support types", "Interviews only",
+                                                 "Assessments only"], key="ov_sup")
+    only_converted = h3.checkbox("Only candidates with a converted assessment",
+                                 value=False, key="ov_conv_only")
+
+    mv = data[data["_month"] == month].copy()
+    if sup_filter == "Interviews only":
+        mv = mv[mv["_support_l"] == "interview support"]
+    elif sup_filter == "Assessments only":
+        mv = mv[mv["_support_l"] == "assessment support"]
+    if mv.empty:
+        st.info("No activity in " + str(month) + " for this basis.")
+        return
+
+    conv = overview_conversions(all_case_df)
+    cmonth = conv[conv["_month"] == month] if not conv.empty else pd.DataFrame()
+
+    # ── per-candidate roll-up ───────────────────────────────────
+    rows = []
+    for cand, sub in mv.groupby("_cand"):
+        iv = sub[sub["_support_l"] == "interview support"]
+        asr = sub[sub["_support_l"] == "assessment support"]
+        cac = None
+        if not cmonth.empty:
+            cac = cmonth[cmonth["candidate_name"].astype(str).str.strip() == str(cand).strip()]
+        n_assess = int(len(cac)) if cac is not None else 0
+        n_conv = int(cac["converted"].sum()) if cac is not None and len(cac) else 0
+        rows.append(dict(
+            Candidate=cand,
+            Technology=(sub["_tech"].replace("", np.nan).dropna().iloc[-1]
+                        if sub["_tech"].replace("", np.nan).notna().any() else ""),
+            Interviews=int(len(iv)),
+            Completed=int((iv["_status"] == "completed").sum()),
+            Companies=int(iv["_company"].nunique()),
+            Rounds=int(iv["_round"].nunique()),
+            Finals=int(iv["_is_final"].sum()),
+            Assessments=n_assess,
+            Converted=n_conv,
+            Conv_pct=(round(n_conv / n_assess * 100, 1) if n_assess else np.nan),
+        ))
+    ov = pd.DataFrame(rows)
+    if only_converted:
+        ov = ov[ov["Converted"] > 0]
+    ov = ov.sort_values(["Converted", "Interviews"], ascending=[False, False])
+
+    # ── KPIs ────────────────────────────────────────────────────
+    iv_all = mv[mv["_support_l"] == "interview support"]
+    pairs = iv_all[["_cand", "_company"]].drop_duplicates().shape[0]
+    tot_assess = int(len(cmonth)) if not cmonth.empty else 0
+    tot_conv = int(cmonth["converted"].sum()) if not cmonth.empty and len(cmonth) else 0
+    k = st.columns(5)
+    k[0].metric("Active candidates", ov["Candidate"].nunique())
+    k[1].metric("Total interviews", int(ov["Interviews"].sum()))
+    k[2].metric("Candidate-company pairs", pairs)
+    k[3].metric("Assessments", tot_assess)
+    k[4].metric("Converted to interview", tot_conv,
+                str(round(tot_conv / tot_assess * 100, 1)) + "%" if tot_assess else None)
+
+    st.markdown("---")
+    st.subheader("Candidates active in " + str(month))
+    st.dataframe(ov.reset_index(drop=True), use_container_width=True,
+                 height=min(560, 40 + 32 * min(len(ov), 16)))
+
+    # ── round mix for the month ─────────────────────────────────
+    st.markdown("---")
+    c_round, c_comp = st.columns(2)
+    with c_round:
+        st.subheader("Round-wise counts")
+        if iv_all.empty:
+            st.info("No interviews in this month.")
+        else:
+            rd = (iv_all.groupby("_round").size().reset_index(name="Count")
+                        .sort_values("Count", ascending=False))
+            f = go.Figure(go.Bar(x=rd["_round"], y=rd["Count"], marker_color="#e8734a",
+                                 text=rd["Count"], textposition="outside"))
+            f.update_layout(height=380, xaxis_title="", yaxis_title="Interviews",
+                            showlegend=False)
+            st.plotly_chart(f, use_container_width=True)
+            st.dataframe(rd.rename(columns={"_round": "Round"}), use_container_width=True,
+                         height=min(300, 40 + 30 * len(rd)))
+    with c_comp:
+        st.subheader("Candidate-company pairs")
+        if iv_all.empty:
+            st.info("No interviews in this month.")
+        else:
+            pc = (iv_all.groupby("_company")
+                        .agg(Interviews=("_round", "size"),
+                             Candidates=("_cand", "nunique"))
+                        .reset_index().rename(columns={"_company": "Company"})
+                        .sort_values("Interviews", ascending=False))
+            f = go.Figure(go.Bar(y=pc["Company"].head(15), x=pc["Interviews"].head(15),
+                                 orientation="h", marker_color="#2f6fed",
+                                 text=pc["Interviews"].head(15), textposition="outside"))
+            f.update_layout(height=380, xaxis_title="Interviews",
+                            yaxis=dict(autorange="reversed"), showlegend=False)
+            st.plotly_chart(f, use_container_width=True)
+
+    # ── conversion by assessment category ───────────────────────
+    st.markdown("---")
+    st.subheader("Assessment to Interview — by assessment type")
+    if cmonth.empty:
+        st.info("No eligible completed assessments in " + str(month) + ".")
+    else:
+        hide_unknown = st.checkbox("Hide Unknown category", value=True, key="ov_hide_unk")
+        cat = (cmonth.groupby("category")
+                     .agg(Assessments=("converted", "size"),
+                          Converted=("converted", "sum"))
+                     .reset_index())
+        cat["Not converted"] = cat["Assessments"] - cat["Converted"]
+        cat["Conversion %"] = (cat["Converted"] / cat["Assessments"] * 100).round(1)
+        order = {c: i for i, c in enumerate(_ASSESS_CATS)}
+        cat["_o"] = cat["category"].map(order).fillna(99)
+        cat = cat.sort_values(["_o"]).drop(columns="_o")
+        if hide_unknown:
+            cat = cat[cat["category"] != "Unknown"]
+        if cat.empty:
+            st.info("No categorised assessments in this month.")
+        else:
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                f = go.Figure()
+                f.add_trace(go.Bar(x=cat["category"], y=cat["Converted"],
+                                   name="Converted", marker_color="#2ecc71",
+                                   text=cat["Converted"], textposition="inside"))
+                f.add_trace(go.Bar(x=cat["category"], y=cat["Not converted"],
+                                   name="Not converted", marker_color="#e74c3c",
+                                   text=cat["Not converted"], textposition="inside"))
+                f.update_layout(barmode="stack", height=380, xaxis_title="",
+                                yaxis_title="Assessments",
+                                legend=dict(orientation="h", y=-0.25))
+                st.plotly_chart(f, use_container_width=True)
+            with cc2:
+                st.dataframe(cat, use_container_width=True,
+                             height=min(380, 40 + 34 * len(cat)))
+                _c = int(cat["Converted"].sum()); _a = int(cat["Assessments"].sum())
+                st.caption("Overall: " + str(_c) + " of " + str(_a) + " converted (" +
+                           str(round(_c / _a * 100, 1)) + "%). Category is classified "
+                           "from the assessment feedback text.")
+
+        st.markdown("**Converted assessments in " + str(month) + "**")
+        cv = cmonth[cmonth["converted"] == 1]
+        if cv.empty:
+            st.info("No conversions this month.")
+        else:
+            t = pd.DataFrame({
+                "Candidate": cv["candidate_name"],
+                "Company": cv["company_name"],
+                "Assessment date": cv["date"].dt.strftime("%d %b %Y"),
+                "Type": cv["category"],
+                "Assessment expert": cv["expert_name"],
+                "Interview date": cv["matched_interview_date"],
+                "Interview round": cv["interview_round"],
+                "Interview expert": cv["interview_expert"],
+                "Interview status": cv["interview_status"],
+                "Days": cv["days_to_interview"],
+            }).sort_values("Assessment date", ascending=False)
+            st.dataframe(t, use_container_width=True,
+                         height=min(420, 40 + 32 * min(len(t), 12)))
+            st.download_button("Download converted list (CSV)",
+                               t.to_csv(index=False).encode("utf-8"),
+                               file_name="candidates_overview_" + str(month) + ".csv",
+                               mime="text/csv", key="ov_dl")
+
+
 def render_candidate_360(all_case_df, show_canon):
     """The Candidates page."""
     st.header("Candidate 360")
@@ -8003,7 +8232,9 @@ def render_candidate_360(all_case_df, show_canon):
     if asr.empty:
         st.info("No assessments recorded for this candidate.")
     else:
-        conv = compute_assessment_conversions(asr)
+        # pass the candidate's FULL frame: the function needs the interview rows
+        # as well as the assessment rows, otherwise nothing can ever match
+        conv = compute_assessment_conversions(d, window_days=45)
         if conv is None or conv.empty:
             st.info("No eligible (completed) assessments for this candidate.")
             if "excluded_assessments" in asr.attrs:
@@ -8210,7 +8441,7 @@ def render_candidate_360(all_case_df, show_canon):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v27.0 — CANDIDATE 360 PAGE (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v27.1 — CANDIDATE 360 FIX + CANDIDATES OVERVIEW (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -8342,7 +8573,7 @@ def main():
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
                                             "Daily Drill-Down", "Deep-Dive Analytics",
-                                            "Candidates"],
+                                            "Candidates", "Candidates Overview"],
                                             label_visibility="collapsed")
 
     # ── NAME DISPLAY: original source names vs canonicalised categories ──
@@ -9514,6 +9745,9 @@ def main():
             st.info("No " + support_label + " on " + str(single))
 
     # ======= DEEP DIVE =======
+    elif view == "Candidates Overview":
+        render_candidates_overview(all_case_df, show_canon)
+
     elif view == "Candidates":
         render_candidate_360(all_case_df, show_canon)
 
@@ -9840,7 +10074,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v27.0 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360")
+    st.sidebar.caption("Vizva Dashboard v27.1 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview")
 
 
 # ═══════════════════════════════════════════════════════════════════
