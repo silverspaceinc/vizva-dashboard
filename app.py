@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v27.4]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v27.6]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -8465,7 +8465,7 @@ def monthly_assessment_categories(support_df):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v27.4 — SEGREGATED ASSESSMENT CONVERSION (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v27.6 — UNKNOWN EXCLUDED FROM CONVERSION + CLASSIFICATION INSIGHT (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -9319,8 +9319,11 @@ def main():
                                  reverse=True)
                 _mc1, _mc2 = st.columns([1, 3])
                 _sel_m = _mc1.selectbox("Month", _months, key="m_acat_month")
-                _hide_unk = _mc2.checkbox("Hide Unknown category", value=True,
-                                          key="m_acat_hide")
+                _hide_unk = _mc2.checkbox(
+                    "Hide Unknown from the type counts above", value=True,
+                    key="m_acat_hide",
+                    help="Conversion figures never include Unknown - only the "
+                         "count chart is affected by this toggle.")
                 _am = _acat[_acat["_month"] == _sel_m]
                 _tbl = (_am.groupby("_category")
                             .agg(Assessments=("_status", "size"),
@@ -9378,8 +9381,14 @@ def main():
                     st.subheader("Segregated Assessment to Interview Conversion")
 
                     _cv_all = overview_conversions(all_case_df)
-                    _cm = (_cv_all[_cv_all["_month"] == _sel_m].copy()
-                           if not _cv_all.empty else pd.DataFrame())
+                    _cm_full = (_cv_all[_cv_all["_month"] == _sel_m].copy()
+                                if not _cv_all.empty else pd.DataFrame())
+                    # Unknown is excluded from every conversion number; only the
+                    # "needs classification" insight below looks at it.
+                    _cm_unknown = (_cm_full[_cm_full["category"] == "Unknown"].copy()
+                                   if not _cm_full.empty else pd.DataFrame())
+                    _cm = (_cm_full[_cm_full["category"] != "Unknown"].copy()
+                           if not _cm_full.empty else pd.DataFrame())
 
                     if _cm.empty:
                         st.info("No completed assessments with conversion data in " +
@@ -9404,26 +9413,49 @@ def main():
                                                      _by_t["Assessments"] * 100).round(1)
                             _by_t["Avg days"] = _by_t["Days"].round(1)
                             _by_t = _by_t.drop(columns="Days")
+                            # explicit TOTAL so the segregated rows always reconcile
+                            _tot_row = {"category": "TOTAL (shown)",
+                                        "Assessments": int(_by_t["Assessments"].sum()),
+                                        "Converted": int(_by_t["Converted"].sum()),
+                                        "Not converted": int(_by_t["Not converted"].sum())}
+                            _all_n = int(len(_cm))
+                            _all_c = int(_cm["converted"].sum())
+                            _tot_row["Conversion %"] = (round(_tot_row["Converted"] /
+                                                              _tot_row["Assessments"] * 100, 1)
+                                                        if _tot_row["Assessments"] else np.nan)
+                            _tot_row["Avg days"] = (round(float(
+                                _cm.loc[_cm["converted"] == 1, "days_to_interview"].mean()), 1)
+                                if _all_c else np.nan)
+                            _by_show = pd.concat([_by_t, pd.DataFrame([_tot_row])],
+                                                 ignore_index=True)
+
+                            st.caption(
+                                "Conversion covers the three classified assessment types "
+                                "only — **" + str(_tot_row["Assessments"]) + " assessments / " +
+                                str(_tot_row["Converted"]) + " converted**. Unclassifiable "
+                                "assessments are listed separately under *Assessment feedback "
+                                "needing classification* below.")
                             _a, _b = st.columns([3, 2])
                             with _a:
                                 _ft = go.Figure()
-                                _ft.add_trace(go.Bar(x=_by_t["category"], y=_by_t["Converted"],
+                                _ft.add_trace(go.Bar(x=_by_show["category"],
+                                                     y=_by_show["Converted"],
                                                      name="Converted", marker_color="#2ecc71",
-                                                     text=_by_t["Converted"],
+                                                     text=_by_show["Converted"],
                                                      textposition="inside"))
-                                _ft.add_trace(go.Bar(x=_by_t["category"],
-                                                     y=_by_t["Not converted"],
+                                _ft.add_trace(go.Bar(x=_by_show["category"],
+                                                     y=_by_show["Not converted"],
                                                      name="Not converted", marker_color="#e74c3c",
-                                                     text=_by_t["Not converted"],
+                                                     text=_by_show["Not converted"],
                                                      textposition="inside"))
                                 _ft.update_layout(barmode="stack", height=380,
                                                   xaxis_title="", yaxis_title="Assessments",
                                                   legend=dict(orientation="h", y=-0.25))
                                 st.plotly_chart(_ft, use_container_width=True)
                             with _b:
-                                st.dataframe(_by_t.rename(columns={"category": "Assessment type"}),
+                                st.dataframe(_by_show.rename(columns={"category": "Assessment type"}),
                                              use_container_width=True,
-                                             height=min(380, 40 + 34 * len(_by_t)))
+                                             height=min(380, 40 + 34 * len(_by_show)))
 
                         # ── generic segregation helper ─────────────
                         def _seg_table(dim, label, top=None, min_n=1):
@@ -9544,6 +9576,45 @@ def main():
                             st.caption("Cells with small n are noisy — read alongside the "
                                        "count tables above.")
 
+                        # ── Unclassified feedback insight ──────────
+                        if not _cm_unknown.empty:
+                            st.markdown("---")
+                            st.subheader("Assessment feedback needing classification")
+                            st.caption("These assessments have feedback text that matches "
+                                       "neither the technical nor the behavioural lexicon, "
+                                       "so they are excluded from every conversion figure. "
+                                       "Adding a sentence naming the type (e.g. "
+                                       "*\"technical assessment\"*, *\"behavioural "
+                                       "assessment\"*) will bring them into the analysis.")
+                            _un = _cm_unknown.copy()
+                            _un["_fb_len"] = _un["feedback"].fillna("").astype(str).str.len()
+                            _uk = st.columns(3)
+                            _uk[0].metric("Unclassified assessments", len(_un))
+                            _uk[1].metric("Converted anyway",
+                                          int(_un["converted"].sum()))
+                            _uk[2].metric("Candidates affected",
+                                          int(_un["candidate_name"].nunique()))
+                            _ut = pd.DataFrame({
+                                "Date": _un["date"].dt.strftime("%d %b %Y"),
+                                "Candidate": _un["candidate_name"],
+                                "Company": _un["company_name"],
+                                "Expert": _un["expert_name"],
+                                "Round": _un["round_name"],
+                                "Converted": _un["converted"].map({1: "Yes", 0: "No"}),
+                                "Chars": _un["_fb_len"],
+                                "Feedback (start)": _un["feedback"].fillna("").astype(str)
+                                    .str.replace(r"\s+", " ", regex=True).str[:110],
+                            }).sort_values("Date", ascending=False)
+                            st.dataframe(_ut, use_container_width=True,
+                                         height=min(420, 40 + 32 * min(len(_ut), 12)))
+                            st.download_button(
+                                "Download unclassified assessments (CSV)",
+                                _un[["date", "candidate_name", "company_name",
+                                     "expert_name", "round_name", "converted",
+                                     "feedback"]].to_csv(index=False).encode("utf-8"),
+                                file_name="unknown_assessments_" + str(_sel_m) + ".csv",
+                                mime="text/csv", key="m_acat_unk_dl")
+
                         st.download_button(
                             "Download segregated conversion (CSV)",
                             _cm[["candidate_name", "company_name", "expert_name", "date",
@@ -9557,9 +9628,20 @@ def main():
             st.markdown("---")
             vz_anchor("m-conv")
             st.subheader("Assessment to Interview Conversion Analytics")
-            st.caption("Tracks which assessments led to interviews within 60 days using fuzzy company name matching")
+            st.caption("Tracks which assessments led to interviews within **45 days** using "
+                       "fuzzy company name matching. Counts **every** assessment category, "
+                       "including Unknown — the segregated breakdown above may show fewer "
+                       "rows when Unknown is hidden.")
 
             conv_df = compute_assessment_conversions(all_case_df)
+            # Unknown-category assessments are EXCLUDED from conversion figures:
+            # an unclassifiable assessment has no usable type, so counting it in the
+            # headline rate would mix measured and unmeasured work.
+            _conv_all_unknown = pd.DataFrame()
+            if not conv_df.empty:
+                conv_df["category"] = conv_df["feedback"].apply(classify_assessment_category)
+                _conv_all_unknown = conv_df[conv_df["category"] == "Unknown"].copy()
+                conv_df = conv_df[conv_df["category"] != "Unknown"].copy()
             if not conv_df.empty:
                 current_m = date.today().strftime("%Y-%m")
                 conv_months = sorted(conv_df["assessment_month"].unique(), reverse=True)
@@ -9572,6 +9654,9 @@ def main():
                     st.info("No assessments in " + sel_conv_month)
                 else:
                     render_assessment_conversion_kpi(conv_month_data, " - " + sel_conv_month)
+                    st.caption("Classified assessments only — Unknown-rated assessments "
+                               "are excluded here and listed under *Assessment Types → "
+                               "Assessment feedback needing classification*.")
                     render_assessment_conversion_charts(conv_month_data, " - " + sel_conv_month)
             else:
                 st.info("No assessment data available for conversion analysis.")
@@ -10349,7 +10434,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v27.4 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v27.6 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
