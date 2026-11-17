@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v27.6]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v27.7]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -8451,21 +8451,30 @@ def render_candidate_360(all_case_df, show_canon):
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=8)
-def monthly_assessment_categories(support_df):
-    """Assessment Support rows -> month + category (Technical / Behavioural / both)."""
+def monthly_assessment_categories(support_df, completed_only=True):
+    """Assessment Support rows -> month + category + full detail.
+
+    When ``completed_only`` is True (default) only completed assessments are
+    returned, so the type counts, the conversion figures and the Unknown
+    bucket all describe the same population.
+    """
     if support_df is None or len(support_df) == 0:
         return pd.DataFrame()
     d = support_df.copy()
     d["_month"] = pd.to_datetime(d["date"], errors="coerce").dt.to_period("M").astype(str)
     d["_category"] = d["feedback"].apply(classify_assessment_category) if "feedback" in d.columns else "Unknown"
     d["_status"] = d["task_status"].astype(str).str.strip().str.lower()
+    if completed_only:
+        d = d[d["_status"] == "completed"].copy()
+    if d.empty:
+        return pd.DataFrame()
     return d[["_month", "_category", "_status", "candidate_name", "company_name",
-              "expert_name", "round_name"]].copy()
+              "expert_name", "round_name", "date", "feedback"]].copy()
 
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v27.6 — UNKNOWN EXCLUDED FROM CONVERSION + CLASSIFICATION INSIGHT (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v27.7 — UNKNOWN = COMPLETED ONLY + FULL DETAIL (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -9307,9 +9316,11 @@ def main():
             st.markdown("---")
             vz_anchor("m-acat")
             st.subheader("Assessment Types — Monthly Breakdown")
-            st.caption("Assessment category is classified from the assessment feedback text: "
-                       "Technical, Behavioural, or Technical + Behavioural. Unclassified "
-                       "records are grouped as Unknown.")
+            st.caption("**Completed assessments only** — the same population used by every "
+                       "conversion figure. Category is classified from the assessment feedback "
+                       "text: Technical, Behavioural, or Technical + Behavioural. Completed "
+                       "assessments whose feedback cannot be classified are grouped as "
+                       "**Unknown** and listed in full detail below.")
 
             _acat = monthly_assessment_categories(support_df)
             if _acat.empty:
@@ -9375,6 +9386,61 @@ def main():
                                           yaxis_title="Assessments",
                                           legend=dict(orientation="h", y=-0.3, font=dict(size=9)))
                         st.plotly_chart(_f2, use_container_width=True)
+
+                    # ═══ UNKNOWN — COMPLETED BUT UNCLASSIFIABLE ═══
+                    _unk_rows = _am[_am["_category"] == "Unknown"].copy()
+                    if not _unk_rows.empty:
+                        st.markdown("---")
+                        st.subheader("Unknown — completed assessments not yet classified")
+                        st.caption("These are **completed** assessments whose feedback does not "
+                                   "name a technical or behavioural type, so they cannot be "
+                                   "counted in any conversion figure yet. Add a phrase such as "
+                                   "*\"technical assessment\"* or *\"behavioural assessment\"* "
+                                   "to the feedback and the record will classify itself on the "
+                                   "next refresh.")
+                        _uk = st.columns(3)
+                        _uk[0].metric("Unknown (completed)", len(_unk_rows))
+                        _uk[1].metric("Candidates affected",
+                                      int(_unk_rows["candidate_name"].nunique()))
+                        _uk[2].metric("Companies affected",
+                                      int(_unk_rows["company_name"].nunique()))
+
+                        _ut = pd.DataFrame({
+                            "Date": pd.to_datetime(_unk_rows["date"],
+                                                   errors="coerce").dt.strftime("%d %b %Y"),
+                            "Candidate": _unk_rows["candidate_name"],
+                            "Company": _unk_rows["company_name"],
+                            "Expert": _unk_rows["expert_name"],
+                            "Round": _unk_rows["round_name"].fillna("(blank)"),
+                            "Status": _unk_rows["_status"],
+                            "Chars": _unk_rows["feedback"].fillna("").astype(str).str.len(),
+                            "Feedback": _unk_rows["feedback"].fillna("").astype(str)
+                                .str.replace(r"\s+", " ", regex=True).str[:140],
+                        }).sort_values("Date", ascending=False)
+                        st.dataframe(_ut, use_container_width=True,
+                                     height=min(440, 40 + 32 * min(len(_ut), 12)))
+
+                        with st.expander("Read the full feedback for each unknown assessment"):
+                            for _, _r in _unk_rows.sort_values("date",
+                                                               ascending=False).iterrows():
+                                _hd = (str(pd.to_datetime(_r["date"]).strftime("%d %b %Y")) +
+                                       " · " + str(_r["candidate_name"]) + " · " +
+                                       str(_r["company_name"]) + " · " +
+                                       str(_r["expert_name"]))
+                                st.markdown("**" + _hd + "**")
+                                _txt = _fr_clean_text(_r["feedback"]) if isinstance(
+                                    _r["feedback"], str) else ""
+                                st.markdown("> " + (_txt[:1500] if _txt
+                                                    else "_no feedback text recorded_"))
+                                st.markdown("")
+
+                        st.download_button(
+                            "Download these unknown assessments (CSV)",
+                            _unk_rows[["date", "candidate_name", "company_name",
+                                       "expert_name", "round_name", "_status",
+                                       "feedback"]].to_csv(index=False).encode("utf-8"),
+                            file_name="unknown_assessments_" + str(_sel_m) + ".csv",
+                            mime="text/csv", key="m_acat_unk_full")
 
                     # ═══ SEGREGATED CONVERSION BY ASSESSMENT TYPE ═══
                     st.markdown("---")
@@ -10434,7 +10500,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v27.6 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v27.7 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
