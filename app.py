@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v28.1]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v28.2]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -8468,9 +8468,10 @@ def render_candidate_360(all_case_df, show_canon):
 
     # ── 3. feedback + sentiment, filterable ──────────────────────
     st.subheader("Feedback and sentiment — completed interviews")
-    fb_rows = d[(d["_fb"] != "") | d["_sent"].notna()].copy()
+    # completed tasks ONLY — no cancelled / rescheduled / pending feedback
+    fb_rows = d[(d["_is_completed"]) & ((d["_fb"] != "") | d["_sent"].notna())].copy()
     if fb_rows.empty:
-        st.info("No feedback recorded for this candidate.")
+        st.info("No feedback recorded on completed tasks for this candidate.")
     else:
         f1, f2, f3 = st.columns([2, 2, 1])
         comp_opts = sorted([c for c in fb_rows["_company"].unique() if c])
@@ -8479,9 +8480,8 @@ def render_candidate_360(all_case_df, show_canon):
         round_opts = sorted(fb_rows["_round"].unique())
         round_pick = f2.multiselect("Round", round_opts, default=[], key="c360_fb_round",
                                     placeholder="All rounds")
-        sup_pick = f3.selectbox("Support", ["All", "Interview Support",
-                                            "Assessment Support", "Mock Interview"],
-                                key="c360_fb_sup")
+        sup_pick = f3.selectbox("Support", ["All"] + sorted(
+            [s for s in fb_rows["_support"].unique() if s]), key="c360_fb_sup")
 
         fv = fb_rows.copy()
         if comp_pick:
@@ -8491,6 +8491,10 @@ def render_candidate_360(all_case_df, show_canon):
         if sup_pick != "All":
             fv = fv[fv["_support"] == sup_pick]
 
+        st.caption("Completed tasks only — " + str(len(fb_rows)) +
+                   " completed record(s) with feedback. Cancelled, rescheduled and "
+                   "pending records are excluded from both the feedback list and the "
+                   "sentiment averages.")
         q1, q2, q3 = st.columns(3)
         q1.metric("Feedbacks in view", len(fv))
         _mean_sent = fv["_sent"].mean()
@@ -8597,8 +8601,9 @@ def render_candidate_360(all_case_df, show_canon):
                         yaxis_title="sentiment", xaxis_title="")
         st.plotly_chart(f, use_container_width=True)
 
-    with st.expander("Round-by-round feedback for " + str(tco)):
-        for _, r in tl.iterrows():
+    with st.expander("Round-by-round feedback for " + str(tco) + " (completed only)"):
+        _tl_fb = tl[tl["_is_completed"]]
+        for _, r in _tl_fb.iterrows():
             _sc = r["_sent"]
             _t = (str(r["_date"].strftime("%d %b %Y")) + " · " + str(r["_support"]) +
                   " · " + str(r["_round"]) + " · " + str(r["_expert"]) +
@@ -8643,7 +8648,7 @@ def monthly_assessment_categories(support_df, completed_only=True):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v28.1 — CANDIDATE 360: COMPLETED-ONLY + RESUME LINK (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v28.2 — FEEDBACK: COMPLETED TASKS ONLY (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -10669,7 +10674,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v28.1 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v28.2 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
