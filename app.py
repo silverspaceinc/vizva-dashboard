@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v28.0]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v28.1]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -7850,15 +7850,22 @@ def cand_360_dataset(all_case_df):
     # candidate roster: one row per candidate, newest activity first
     rows = []
     for cand, sub in d.groupby("_cand"):
-        iv = sub[sub["_support_l"] == "interview support"]
-        asr = sub[sub["_support_l"] == "assessment support"]
+        # Candidate 360 reports COMPLETED work only, everywhere except the
+        # assessment -> interview conversion block.
+        iv = sub[(sub["_support_l"] == "interview support") & sub["_is_completed"]]
+        asr = sub[(sub["_support_l"] == "assessment support") & sub["_is_completed"]]
         res = sub[sub["_support_l"] == "resume understanding"]
         if len(iv) == 0 and len(asr) == 0:
             continue
+        _resume = ""
+        if "case_candidate_resume" in sub.columns:
+            _rv = sub["case_candidate_resume"].dropna().astype(str).str.strip()
+            if len(_rv):
+                _resume = _rv.iloc[-1]
         rows.append(dict(
             cand=cand,
             interviews=int(len(iv)),
-            completed=int((iv["_status"] == "completed").sum()),
+            completed=int(len(iv)),
             assessments=int(len(asr)),
             resume=int(len(res)),
             companies=int(iv["_company"].nunique()),
@@ -7867,6 +7874,7 @@ def cand_360_dataset(all_case_df):
             self_iv=int(iv["_is_self"].sum()),
             first_date=iv["_date"].min(),
             last_date=sub["_date"].max(),
+            resume_link=_resume,
             tech=(sub["_tech"].replace("", np.nan).dropna().iloc[-1]
                   if sub["_tech"].replace("", np.nan).notna().any() else ""),
         ))
@@ -8246,8 +8254,10 @@ def render_candidates_overview(all_case_df, show_canon):
 def render_candidate_360(all_case_df, show_canon):
     """The Candidates page."""
     st.header("Candidate 360")
-    st.caption("Per-candidate counts, feedback, sentiment, conversions and the full "
-               "round timeline. Use the sidebar picker to switch candidate.")
+    st.caption("Per-candidate counts, feedback, sentiment, conversions and the full round "
+               "timeline. **All figures use completed assessments and completed interviews** "
+               "— except the Assessment to Interview conversion, where the interview side "
+               "accepts any status.")
 
     data, roster = cand_360_dataset(all_case_df)
     if data.empty or roster.empty:
@@ -8260,16 +8270,22 @@ def render_candidate_360(all_case_df, show_canon):
                                 help="Candidates with an interview or assessment in the data.")
     row = roster[roster["cand"] == pick].iloc[0]
     d = data[data["_cand"] == pick].copy()
-    iv = d[d["_support_l"] == "interview support"].copy()
-    asr = d[d["_support_l"] == "assessment support"].copy()
-    iv_c = iv[iv["_is_completed"]].copy()
+    # completed-only everywhere on this page
+    iv = d[(d["_support_l"] == "interview support") & d["_is_completed"]].copy()
+    asr = d[(d["_support_l"] == "assessment support") & d["_is_completed"]].copy()
+    iv_c = iv
 
     st.markdown("### " + str(pick))
+    _rl = row.get("resume_link") if hasattr(row, "get") else ""
+    if isinstance(_rl, str) and _rl.startswith("http"):
+        st.markdown("[\U0001F4C4 Open resume / CV](" + _rl + ")")
+    else:
+        st.caption("\U0001F4C4 No resume link recorded")
     if row["tech"]:
         st.caption("Technology: **" + str(row["tech"]) + "** · " +
-                   str(int(row["interviews"])) + " interviews · " +
+                   str(int(row["interviews"])) + " completed interviews · " +
                    str(int(row["companies"])) + " companies · " +
-                   str(int(row["assessments"])) + " assessments")
+                   str(int(row["assessments"])) + " completed assessments")
 
     # ── 4. first interview (top of the page) ─────────────────────
     first_iv = row["first_date"]
@@ -8281,15 +8297,14 @@ def render_candidate_360(all_case_df, show_canon):
                 if pd.notna(first_iv) else None)
     k[1].metric("First completed", first_completed.strftime("%d %b %Y")
                 if pd.notna(first_completed) else "—")
-    k[2].metric("Interviews", int(row["interviews"]),
-                str(int(row["completed"])) + " completed")
-    k[3].metric("Companies", int(row["companies"]))
+    k[2].metric("Completed interviews", int(row["completed"]))
+    k[3].metric("Companies (completed)", int(row["companies"]))
     k[4].metric("Final rounds", int(row["finals"]))
 
     st.markdown("---")
 
     # ── 2. company counts (canonical aware) ──────────────────────
-    st.subheader("Companies")
+    st.subheader("Companies — completed interviews")
     if iv.empty:
         st.info("No interview records for this candidate.")
     else:
@@ -8389,17 +8404,18 @@ def render_candidate_360(all_case_df, show_canon):
 
     # ── 5. assessment -> interview conversion ────────────────────
     st.subheader("Assessment to Interview conversion")
-    if asr.empty:
-        st.info("No assessments recorded for this candidate.")
+    _asr_all = d[(d["_support_l"] == "assessment support")
+                 & (d["_status"] == "completed")]
+    if _asr_all.empty:
+        st.info("No completed assessments recorded for this candidate.")
     else:
-        # pass the candidate's FULL frame: the function needs the interview rows
-        # as well as the assessment rows, otherwise nothing can ever match
+        # FULL frame on purpose: assessments completed, interviews ANY status
         conv = compute_assessment_conversions(d, window_days=45)
         if conv is None or conv.empty:
             st.info("No eligible (completed) assessments for this candidate.")
-            if "excluded_assessments" in asr.attrs:
-                st.caption("Eligible: " + str(asr.attrs.get("assessments_completed", 0)) +
-                           " · evidenced: " + str(asr.attrs.get("assessments_evidenced", 0)))
+            if "excluded_assessments" in _asr_all.attrs:
+                st.caption("Eligible: " + str(_asr_all.attrs.get("assessments_completed", 0)) +
+                           " · evidenced: " + str(_asr_all.attrs.get("assessments_evidenced", 0)))
         else:
             tot = len(conv)
             nconv = int(conv["converted"].sum())
@@ -8425,7 +8441,7 @@ def render_candidate_360(all_case_df, show_canon):
     st.markdown("---")
 
     # ── 7. Self and On Site analysis ─────────────────────────────
-    st.subheader("Self and On Site interviews")
+    st.subheader("Self and On Site interviews — completed only")
     s1, s2, s3 = st.columns(3)
     n_self = int(iv["_is_self"].sum())
     n_onsite = int(iv["_is_onsite"].sum())
@@ -8445,13 +8461,13 @@ def render_candidate_360(all_case_df, show_canon):
             t.columns = ["Date", "Company", "Round", "Expert", "Status", "Sentiment"]
             st.dataframe(t.sort_values("Date", ascending=False).reset_index(drop=True),
                          use_container_width=True, height=min(320, 40 + 30 * len(t)))
-    st.caption("On Site rounds count as Final rounds for progression purposes, even when "
-               "the expert is Self.")
+    st.caption("Completed rounds only. On Site rounds count as Final rounds for progression "
+               "purposes, even when the expert is Self.")
 
     st.markdown("---")
 
     # ── 3. feedback + sentiment, filterable ──────────────────────
-    st.subheader("Feedback and sentiment")
+    st.subheader("Feedback and sentiment — completed interviews")
     fb_rows = d[(d["_fb"] != "") | d["_sent"].notna()].copy()
     if fb_rows.empty:
         st.info("No feedback recorded for this candidate.")
@@ -8538,7 +8554,7 @@ def render_candidate_360(all_case_df, show_canon):
     st.markdown("---")
 
     # ── 8. per-company timeline ──────────────────────────────────
-    st.subheader("Timeline by company")
+    st.subheader("Timeline by company — completed records")
     comps = sorted([c for c in d["_company"].unique() if c])
     if not comps:
         st.info("No company recorded for this candidate.")
@@ -8627,7 +8643,7 @@ def monthly_assessment_categories(support_df, completed_only=True):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v28.0 — ROUND-WISE COLUMNS IN CANDIDATE OVERVIEW (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v28.1 — CANDIDATE 360: COMPLETED-ONLY + RESUME LINK (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -10653,7 +10669,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v28.0 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v28.1 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
