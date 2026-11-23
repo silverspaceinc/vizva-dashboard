@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v28.2]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v28.3]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -64,7 +64,9 @@ CLR = {"completed": "#2ecc71", "rescheduled": "#f39c12",
 
 SUPPORT_TYPES = ["Interview Support", "Assessment Support", "Mock Interview", "Resume Understanding"]
 
-CACHE_TTL = 600  # seconds — documented refresh window; used by every cached call
+CACHE_TTL = 3600  # seconds — long TTL: data refreshes on the API side, so a
+# shorter window only forces expensive recomputation. Use the sidebar
+# "Refresh now" button to force a reload after an upstream change.
 
 ILLEGAL_CHARACTERS_RE = re.compile(r'[\000-\010]|[\013-\014]|[\016-\037]')
 
@@ -286,11 +288,13 @@ def _display_company(norm_name):
     return " ".join(out)
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=4)
 def build_tech_map(labels):
     """label -> family. 109 unique labels => instant."""
     return {lab: _canon_tech_one(lab) for lab in labels}
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=4)
 def build_company_map(raw_names, fuzzy_threshold=_CANON_FUZZY_THRESHOLD):
     """raw company spelling -> canonical display name.
 
@@ -7857,9 +7861,14 @@ def cand_360_dataset(all_case_df):
         res = sub[sub["_support_l"] == "resume understanding"]
         if len(iv) == 0 and len(asr) == 0:
             continue
+        # Resume comes from the candidate's LATEST record of ANY support type
+        # (interview, assessment, mock, resume understanding) - not just interviews.
         _resume = ""
         if "case_candidate_resume" in sub.columns:
-            _rv = sub["case_candidate_resume"].dropna().astype(str).str.strip()
+            _rs = sub.dropna(subset=["_date"]).sort_values("_date")
+            _rv = (_rs["case_candidate_resume"].dropna().astype(str).str.strip()
+                   if len(_rs) else pd.Series(dtype=object))
+            _rv = _rv[_rv.str.startswith("http")]
             if len(_rv):
                 _resume = _rv.iloc[-1]
         rows.append(dict(
@@ -7965,290 +7974,220 @@ def _round_bucket(rnd):
 
 
 def render_candidates_overview(all_case_df, show_canon):
-    """Month-wise active candidates with counts and sub-category conversions."""
-    st.header("Candidates Overview")
-    st.caption("Every candidate active in the selected month, with interview volume, "
-               "candidate-company pairs, round mix and assessment-to-interview "
-               "conversion split by assessment type.")
+    """Overview page — completed work, sliced by candidate / month / company /
+    expert / technology."""
+    st.header("Overview")
+    st.caption("**Completed tasks only.** Every figure below counts completed interviews and "
+               "completed assessments — cancelled, rescheduled and pending records are "
+               "excluded. Switch perspective to slice the same data five ways.")
 
     data, roster = cand_360_dataset(all_case_df)
     if data.empty:
         st.info("No candidate activity in the current data.")
         return
 
-    months = sorted([m for m in data["_month"].dropna().unique() if m and m != "NaT"],
+    comp = data[data["_is_completed"]].copy()
+    if comp.empty:
+        st.info("No completed records in the current data.")
+        return
+
+    months = sorted([m for m in comp["_month"].dropna().unique() if m and m != "NaT"],
                     reverse=True)
-    if not months:
-        st.info("No dated records to group by month.")
-        return
-
-    h1, h2, h3 = st.columns([1.2, 1.2, 2])
-    month = h1.selectbox("Month", months, key="ov_month")
-    sup_filter = h2.selectbox("Activity basis", ["All support types", "Interviews only",
-                                                 "Assessments only"], key="ov_sup")
-    only_converted = h3.checkbox("Only candidates with a converted assessment",
-                                 value=False, key="ov_conv_only")
-
-    mv = data[data["_month"] == month].copy()
-    if sup_filter == "Interviews only":
-        mv = mv[mv["_support_l"] == "interview support"]
-    elif sup_filter == "Assessments only":
-        mv = mv[mv["_support_l"] == "assessment support"]
-    if mv.empty:
-        st.info("No activity in " + str(month) + " for this basis.")
-        return
+    iv_done = comp[comp["_support_l"] == "interview support"]
+    as_done = comp[comp["_support_l"] == "assessment support"]
 
     conv = overview_conversions(all_case_df)
-    cmonth = conv[conv["_month"] == month] if not conv.empty else pd.DataFrame()
+    if not conv.empty:
+        conv = conv[(conv["category"] != "Unknown")].copy()
 
-    # ── per-candidate roll-up ───────────────────────────────────
-    rows = []
-    for cand, sub in mv.groupby("_cand"):
-        iv = sub[sub["_support_l"] == "interview support"]
-        asr = sub[sub["_support_l"] == "assessment support"]
-        cac = None
-        if not cmonth.empty:
-            cac = cmonth[cmonth["candidate_name"].astype(str).str.strip() == str(cand).strip()]
-        n_assess = int(len(cac)) if cac is not None else 0
-        n_conv = int(cac["converted"].sum()) if cac is not None and len(cac) else 0
-        ivc = iv[iv["_status"] == "completed"]
-        _rb = ivc["_round"].apply(_round_bucket).value_counts().to_dict()
-        # assessment type split for this candidate (conversion-eligible rows)
-        _tcount = {"Technical Assessment": 0, "Behavioural Assessment": 0,
-                   "Technical + Behavioural": 0, "Take Home Assessment": 0}
-        _tconv = dict(_tcount)
-        if cac is not None and len(cac):
-            for _cat, _cv in zip(cac["category"], cac["converted"]):
-                if _cat in _tcount:
-                    _tcount[_cat] += 1
-                    _tconv[_cat] += int(_cv)
-        rows.append(dict(
-            Candidate=cand,
-            Technology=(sub["_tech"].replace("", np.nan).dropna().iloc[-1]
-                        if sub["_tech"].replace("", np.nan).notna().any() else ""),
-            Interviews=int(len(iv)),
-            Completed=int(len(ivc)),
-            Companies=int(ivc["_company"].nunique()),
-            R1=int(_rb.get("1st", 0)),
-            R2=int(_rb.get("2nd", 0)),
-            R3=int(_rb.get("3rd", 0)),
-            R4=int(_rb.get("4th", 0)),
-            R5=int(_rb.get("5th", 0)),
-            Screening=int(_rb.get("scr", 0)),
-            TechRound=int(_rb.get("tech", 0)),
-            OtherRound=int(_rb.get("other", 0)),
-            Finals=int(iv["_is_final"].sum()),
-            Assessments=n_assess,
-            Converted=n_conv,
-            Conv_pct=(round(n_conv / n_assess * 100, 1) if n_assess else np.nan),
-            Tech_Assess=_tcount["Technical Assessment"],
-            Tech_Conv=_tconv["Technical Assessment"],
-            Behav_Assess=_tcount["Behavioural Assessment"],
-            Behav_Conv=_tconv["Behavioural Assessment"],
-            Both_Assess=_tcount["Technical + Behavioural"],
-            Both_Conv=_tconv["Technical + Behavioural"],
-            TakeHome_Assess=_tcount["Take Home Assessment"],
-            TakeHome_Conv=_tconv["Take Home Assessment"],
-        ))
-    ov = pd.DataFrame(rows)
-    if only_converted:
-        ov = ov[ov["Converted"] > 0]
-    ov = ov.sort_values(["Converted", "Interviews"], ascending=[False, False])
+    # ── controls ────────────────────────────────────────────────
+    c1, c2 = st.columns([2, 2])
+    view = c1.radio("Perspective", ["Candidate-wise", "Month-wise", "Company-wise",
+                                    "Expert-wise", "Technology-wise"],
+                    horizontal=True, key="ov_view", label_visibility="collapsed")
+    month_pick = c2.selectbox("Month filter", ["All months"] + months, key="ov_month2")
+    mscope = None if month_pick == "All months" else month_pick
 
-    # ── KPIs ────────────────────────────────────────────────────
-    iv_all = mv[mv["_support_l"] == "interview support"]
-    iv_done = iv_all[iv_all["_status"] == "completed"]
-    pairs = iv_done[["_cand", "_company"]].drop_duplicates().shape[0]
-    tot_assess = int(len(cmonth)) if not cmonth.empty else 0
-    tot_conv = int(cmonth["converted"].sum()) if not cmonth.empty and len(cmonth) else 0
+    ivs = iv_done if mscope is None else iv_done[iv_done["_month"] == mscope]
+    ass = as_done if mscope is None else as_done[as_done["_month"] == mscope]
+    cvs = conv if (mscope is None or conv.empty) else conv[conv["_month"] == mscope]
+
+    ivs = ivs.copy()
+    ivs["_pair"] = ivs["_cand"].astype(str) + " ||| " + ivs["_company"].astype(str)
+    ivs["_rb"] = ivs["_round"].apply(_round_bucket)
+
+    # ── KPI strip ───────────────────────────────────────────────
     k = st.columns(5)
-    k[0].metric("Active candidates", ov["Candidate"].nunique())
-    k[1].metric("Completed interviews", int(ov["Completed"].sum()),
-                str(int(ov["Interviews"].sum())) + " booked")
-    k[2].metric("Candidate-company pairs", pairs,
-                help="Distinct candidate + company pairs with at least one COMPLETED interview.")
-    k[3].metric("Assessments", tot_assess)
-    k[4].metric("Converted to interview", tot_conv,
-                str(round(tot_conv / tot_assess * 100, 1)) + "%" if tot_assess else None)
+    k[0].metric("Candidates", int(ivs["_cand"].nunique()))
+    k[1].metric("Completed interviews", int(len(ivs)))
+    k[2].metric("Unique interviews", int(ivs["_pair"].nunique()),
+                help="Distinct candidate + company pairs — a candidate interviewing "
+                     "twice with one company counts once.")
+    k[3].metric("Completed assessments", int(len(ass)))
+    _cn = int(cvs["converted"].sum()) if not cvs.empty else 0
+    k[4].metric("Assessment conversions", _cn,
+                str(round(_cn / len(cvs) * 100, 1)) + "%" if len(cvs) else None)
 
+    # ── trend: unique interviews by month ───────────────────────
     st.markdown("---")
-    st.subheader("Candidates active in " + str(month))
-    st.caption("All interview columns count **completed interviews only**. Round columns "
-               "are 1st / 2nd / 3rd / 4th / 5th / Screening / Technical-Coding, with "
-               "**Final** including On Site. Assessment columns split by type.")
-    _show_cols = ["Candidate", "Technology", "Interviews", "Completed", "Companies",
-                  "R1", "R2", "R3", "R4", "R5", "Screening", "TechRound", "OtherRound",
-                  "Finals", "Assessments", "Converted", "Conv_pct",
-                  "Tech_Assess", "Tech_Conv", "Behav_Assess", "Behav_Conv",
-                  "Both_Assess", "Both_Conv", "TakeHome_Assess", "TakeHome_Conv"]
-    _disp = ov[[c for c in _show_cols if c in ov.columns]].rename(columns={
-        "R1": "1st", "R2": "2nd", "R3": "3rd", "R4": "4th", "R5": "5th",
-        "Screening": "Screening", "TechRound": "Tech/Coding",
-        "OtherRound": "Other", "Finals": "Final",
-        "Conv_pct": "Conv %",
-        "Tech_Assess": "Technical", "Tech_Conv": "Tech conv",
-        "Behav_Assess": "Behavioural", "Behav_Conv": "Behav conv",
-        "Both_Assess": "Tech + Behav", "Both_Conv": "Both conv",
-        "TakeHome_Assess": "Take Home", "TakeHome_Conv": "TH conv"})
-    st.dataframe(_disp.reset_index(drop=True), use_container_width=True,
-                 height=min(560, 40 + 32 * min(len(_disp), 16)))
+    st.subheader("Unique interviews — monthly trend")
+    _tr = iv_done.copy()
+    _tr["_pair"] = _tr["_cand"].astype(str) + " ||| " + _tr["_company"].astype(str)
+    g = (_tr.groupby("_month")
+            .agg(Unique=("_pair", "nunique"), Interviews=("_round", "size"),
+                 Candidates=("_cand", "nunique"))
+            .reset_index().sort_values("_month"))
+    if not g.empty:
+        f = go.Figure()
+        f.add_trace(go.Bar(x=g["_month"], y=g["Interviews"], name="Completed interviews",
+                           marker_color="#c9d6f0"))
+        f.add_trace(go.Scatter(x=g["_month"], y=g["Unique"], name="Unique interviews",
+                               mode="lines+markers", line=dict(color="#2f6fed", width=3),
+                               marker=dict(size=8)))
+        f.update_layout(height=380, xaxis_title="", yaxis_title="Count",
+                        legend=dict(orientation="h", y=-0.22))
+        st.plotly_chart(f, use_container_width=True)
+        st.caption("Unique interviews (line) counts each candidate + company pair once; "
+                   "completed interviews (bars) counts every session.")
 
-    st.download_button(
-        "Download candidate overview (CSV)",
-        _disp.to_csv(index=False).encode("utf-8"),
-        file_name="candidates_overview_" + str(month) + ".csv",
-        mime="text/csv", key="ov_cand_dl")
-
-    # ── assessment type segregation for the month ──────────────
+    # ── perspective tables ──────────────────────────────────────
     st.markdown("---")
-    st.subheader("Assessment segregation — " + str(month))
-    if cmonth.empty:
-        st.info("No eligible assessments in this month.")
+    st.subheader(view.replace("-wise", "") + "-wise breakdown")
+
+    def _agg(frame, key, label):
+        if frame.empty:
+            return pd.DataFrame()
+        t = (frame.groupby(key)
+                  .agg(Interviews=("_round", "size"),
+                       Unique=("_pair", "nunique"),
+                       Candidates=("_cand", "nunique"),
+                       Companies=("_company", "nunique"),
+                       R1=("_rb", lambda s: int((s == "1st").sum())),
+                       R2=("_rb", lambda s: int((s == "2nd").sum())),
+                       R3=("_rb", lambda s: int((s == "3rd").sum())),
+                       Screening=("_rb", lambda s: int((s == "scr").sum())),
+                       Tech=("_rb", lambda s: int((s == "tech").sum())),
+                       Final=("_is_final", "sum"))
+                  .reset_index().rename(columns={key: label}))
+        t["Final"] = t["Final"].astype(int)
+        return t.sort_values(["Unique", "Interviews"], ascending=False)
+
+    if view == "Candidate-wise":
+        t = _agg(ivs, "_cand", "Candidate")
+        if not t.empty:
+            tech = (ivs.groupby("_cand")["_tech"].agg(lambda s: s.iloc[-1])
+                        .rename("Technology").reset_index().rename(columns={"_cand": "Candidate"}))
+            t = t.merge(tech, on="Candidate", how="left")
+            if not cvs.empty:
+                cv = (cvs.groupby(cvs["candidate_name"].astype(str).str.strip())
+                          .agg(Assessments=("converted", "size"),
+                               Converted=("converted", "sum"))
+                          .reset_index().rename(columns={"candidate_name": "Candidate"}))
+                t = t.merge(cv, on="Candidate", how="left")
+                t[["Assessments", "Converted"]] = t[["Assessments", "Converted"]].fillna(0).astype(int)
+                t["Conv %"] = (t["Converted"] / t["Assessments"].replace(0, np.nan) * 100).round(1)
+    elif view == "Month-wise":
+        t = _agg(ivs, "_month", "Month")
+    elif view == "Company-wise":
+        t = _agg(ivs, "_company", "Company")
+        t = t.head(40) if len(t) > 40 else t
+    elif view == "Expert-wise":
+        t = _agg(ivs, "_expert", "Expert")
     else:
-        _seg = (cmonth.groupby("category")
-                      .agg(Assessments=("converted", "size"),
-                           Converted=("converted", "sum"),
-                           Candidates=("candidate_name", "nunique"),
-                           Companies=("company_name", "nunique"))
-                      .reset_index())
-        _seg["Not converted"] = _seg["Assessments"] - _seg["Converted"]
-        _seg["Conversion %"] = (_seg["Converted"] / _seg["Assessments"] * 100).round(1)
+        t = _agg(ivs, "_tech", "Technology")
+
+    if t.empty:
+        st.info("No completed interviews for this perspective and month.")
+    else:
+        st.dataframe(t.reset_index(drop=True), use_container_width=True,
+                     height=min(560, 40 + 32 * min(len(t), 16)))
+        st.download_button("Download this table (CSV)",
+                           t.to_csv(index=False).encode("utf-8"),
+                           file_name="overview_" + view.lower().replace("-", "_") + ".csv",
+                           mime="text/csv", key="ov_tbl_dl")
+
+        # companion chart: top 15 by unique interviews
+        top = t.head(15).sort_values("Unique")
+        lab = t.columns[0]
+        f2 = go.Figure()
+        f2.add_trace(go.Bar(y=top[lab], x=top["Interviews"], orientation="h",
+                            name="Completed", marker_color="#c9d6f0"))
+        f2.add_trace(go.Bar(y=top[lab], x=top["Unique"], orientation="h",
+                            name="Unique interviews", marker_color="#2f6fed"))
+        f2.update_layout(barmode="group", height=max(340, 26 * len(top)),
+                         title="Top " + str(len(top)) + " by unique interviews",
+                         xaxis_title="Count", yaxis=dict(autorange="reversed"),
+                         legend=dict(orientation="h", y=-0.18))
+        st.plotly_chart(f2, use_container_width=True)
+
+        # round mix for this perspective
+        rd = pd.DataFrame({"Round": ["1st", "2nd", "3rd", "Screening", "Tech/Coding",
+                                     "Final"],
+                           "Count": [int(t["R1"].sum()), int(t["R2"].sum()),
+                                     int(t["R3"].sum()), int(t["Screening"].sum()),
+                                     int(t["Tech"].sum()), int(t["Final"].sum())]})
+        f3 = go.Figure(go.Bar(x=rd["Round"], y=rd["Count"], marker_color="#e8734a",
+                              text=rd["Count"], textposition="outside"))
+        f3.update_layout(height=320, title="Round mix", xaxis_title="",
+                         yaxis_title="Completed interviews", showlegend=False)
+        st.plotly_chart(f3, use_container_width=True)
+
+    # ── assessment segregation ─────────────────────────────────
+    st.markdown("---")
+    st.subheader("Assessment segregation" +
+                 ("" if mscope is None else " — " + mscope))
+    if cvs.empty:
+        st.info("No classified completed assessments in this scope.")
+    else:
+        seg = (cvs.groupby("category")
+                  .agg(Assessments=("converted", "size"),
+                       Converted=("converted", "sum"),
+                       Candidates=("candidate_name", "nunique"),
+                       Companies=("company_name", "nunique"))
+                  .reset_index())
+        seg["Not converted"] = seg["Assessments"] - seg["Converted"]
+        seg["Conversion %"] = (seg["Converted"] / seg["Assessments"] * 100).round(1)
         _ord = {c: i for i, c in enumerate(_ASSESS_CATS)}
-        _seg["_o"] = _seg["category"].map(_ord).fillna(99)
-        _seg = _seg.sort_values("_o").drop(columns="_o")
-        _seg = _seg.rename(columns={"category": "Assessment type"})
-        _sc = st.columns(2)
-        _sc[0].dataframe(_seg, use_container_width=True,
-                         height=min(340, 40 + 34 * len(_seg)))
-        with _sc[1]:
-            _fs = go.Figure()
-            _fs.add_trace(go.Bar(x=_seg["Assessment type"], y=_seg["Converted"],
-                                 name="Converted", marker_color="#2ecc71",
-                                 text=_seg["Converted"], textposition="inside"))
-            _fs.add_trace(go.Bar(x=_seg["Assessment type"], y=_seg["Not converted"],
-                                 name="Not converted", marker_color="#e74c3c",
-                                 text=_seg["Not converted"], textposition="inside"))
-            _fs.update_layout(barmode="stack", height=340, xaxis_title="",
-                              yaxis_title="Assessments",
-                              legend=dict(orientation="h", y=-0.25, font=dict(size=9)))
-            st.plotly_chart(_fs, use_container_width=True)
-        st.download_button(
-            "Download assessment segregation (CSV)",
-            _seg.to_csv(index=False).encode("utf-8"),
-            file_name="assessment_segregation_" + str(month) + ".csv",
-            mime="text/csv", key="ov_seg_dl")
+        seg["_o"] = seg["category"].map(_ord).fillna(99)
+        seg = seg.sort_values("_o").drop(columns="_o").rename(columns={"category": "Assessment type"})
+        sc1, sc2 = st.columns(2)
+        sc1.dataframe(seg, use_container_width=True, height=min(340, 40 + 34 * len(seg)))
+        with sc2:
+            fs = go.Figure()
+            fs.add_trace(go.Bar(x=seg["Assessment type"], y=seg["Converted"],
+                                name="Converted", marker_color="#2ecc71",
+                                text=seg["Converted"], textposition="inside"))
+            fs.add_trace(go.Bar(x=seg["Assessment type"], y=seg["Not converted"],
+                                name="Not converted", marker_color="#e74c3c",
+                                text=seg["Not converted"], textposition="inside"))
+            fs.update_layout(barmode="stack", height=340, xaxis_title="",
+                             yaxis_title="Assessments",
+                             legend=dict(orientation="h", y=-0.25, font=dict(size=9)))
+            st.plotly_chart(fs, use_container_width=True)
+        st.download_button("Download assessment segregation (CSV)",
+                           seg.to_csv(index=False).encode("utf-8"),
+                           file_name="assessment_segregation.csv", mime="text/csv",
+                           key="ov_seg_dl")
 
-    # ── round mix for the month ─────────────────────────────────
-    st.markdown("---")
-    c_round, c_comp = st.columns(2)
-    with c_round:
-        st.subheader("Round-wise counts")
-        if iv_done.empty:
-            st.info("No completed interviews in this month.")
-        else:
-            rd = (iv_done.groupby("_round").size().reset_index(name="Count")
-                        .sort_values("Count", ascending=False))
-            f = go.Figure(go.Bar(x=rd["_round"], y=rd["Count"], marker_color="#e8734a",
-                                 text=rd["Count"], textposition="outside"))
-            f.update_layout(height=380, xaxis_title="", yaxis_title="Interviews",
-                            showlegend=False)
-            st.plotly_chart(f, use_container_width=True)
-            st.dataframe(rd.rename(columns={"_round": "Round"}), use_container_width=True,
-                         height=min(300, 40 + 30 * len(rd)))
-    with c_comp:
-        st.subheader("Candidate-company pairs")
-        if iv_done.empty:
-            st.info("No completed interviews in this month.")
-        else:
-            pc = (iv_done.groupby("_company")
-                        .agg(Interviews=("_round", "size"),
-                             Candidates=("_cand", "nunique"))
-                        .reset_index().rename(columns={"_company": "Company"})
-                        .sort_values("Interviews", ascending=False))
-            f = go.Figure(go.Bar(y=pc["Company"].head(15), x=pc["Interviews"].head(15),
-                                 orientation="h", marker_color="#2f6fed",
-                                 text=pc["Interviews"].head(15), textposition="outside"))
-            f.update_layout(height=380, xaxis_title="Interviews",
-                            yaxis=dict(autorange="reversed"), showlegend=False)
-            st.plotly_chart(f, use_container_width=True)
-
-    # ── conversion by assessment category ───────────────────────
-    st.markdown("---")
-    st.subheader("Assessment to Interview — by assessment type")
-    if cmonth.empty:
-        st.info("No eligible completed assessments in " + str(month) + ".")
-    else:
-        hide_unknown = st.checkbox("Hide Unknown category", value=True, key="ov_hide_unk")
-        cat = (cmonth.groupby("category")
-                     .agg(Assessments=("converted", "size"),
-                          Converted=("converted", "sum"))
-                     .reset_index())
-        cat["Not converted"] = cat["Assessments"] - cat["Converted"]
-        cat["Conversion %"] = (cat["Converted"] / cat["Assessments"] * 100).round(1)
-        order = {c: i for i, c in enumerate(_ASSESS_CATS)}
-        cat["_o"] = cat["category"].map(order).fillna(99)
-        cat = cat.sort_values(["_o"]).drop(columns="_o")
-        if hide_unknown:
-            cat = cat[cat["category"] != "Unknown"]
-        if cat.empty:
-            st.info("No categorised assessments in this month.")
-        else:
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                f = go.Figure()
-                f.add_trace(go.Bar(x=cat["category"], y=cat["Converted"],
-                                   name="Converted", marker_color="#2ecc71",
-                                   text=cat["Converted"], textposition="inside"))
-                f.add_trace(go.Bar(x=cat["category"], y=cat["Not converted"],
-                                   name="Not converted", marker_color="#e74c3c",
-                                   text=cat["Not converted"], textposition="inside"))
-                f.update_layout(barmode="stack", height=380, xaxis_title="",
-                                yaxis_title="Assessments",
-                                legend=dict(orientation="h", y=-0.25))
-                st.plotly_chart(f, use_container_width=True)
-            with cc2:
-                st.dataframe(cat, use_container_width=True,
-                             height=min(380, 40 + 34 * len(cat)))
-                _c = int(cat["Converted"].sum()); _a = int(cat["Assessments"].sum())
-                st.caption("Overall: " + str(_c) + " of " + str(_a) + " converted (" +
-                           str(round(_c / _a * 100, 1)) + "%). Category is classified "
-                           "from the assessment feedback text.")
-
-        st.markdown("**Converted assessments in " + str(month) + "**")
-        cv = cmonth[cmonth["converted"] == 1]
-        if cv.empty:
-            st.info("No conversions this month.")
-        else:
-            t = pd.DataFrame({
-                "Candidate": cv["candidate_name"],
-                "Company": cv["company_name"],
-                "Assessment date": cv["date"].dt.strftime("%d %b %Y"),
-                "Type": cv["category"],
+        cv = cvs[cvs["converted"] == 1]
+        if not cv.empty:
+            st.markdown("**Converted assessments**")
+            full = pd.DataFrame({
+                "Candidate": cv["candidate_name"], "Company": cv["company_name"],
                 "Assessment expert": cv["expert_name"],
+                "Assessment date": cv["date"].dt.strftime("%d %b %Y"),
+                "Assessment type": cv["category"],
                 "Interview date": cv["matched_interview_date"],
                 "Interview round": cv["interview_round"],
                 "Interview expert": cv["interview_expert"],
                 "Interview status": cv["interview_status"],
-                "Days": cv["days_to_interview"],
-            }).sort_values("Assessment date", ascending=False)
-            st.dataframe(t, use_container_width=True,
-                         height=min(420, 40 + 32 * min(len(t), 12)))
-            _full = cv[["candidate_name", "company_name", "expert_name", "date",
-                        "category", "converted", "matched_interview_date",
-                        "interview_round", "interview_expert", "interview_status",
-                        "days_to_interview"]].rename(columns={
-                "candidate_name": "Candidate", "company_name": "Company",
-                "expert_name": "Assessment expert", "date": "Assessment date",
-                "category": "Assessment type", "converted": "Converted",
-                "matched_interview_date": "Interview date",
-                "interview_round": "Interview round",
-                "interview_expert": "Interview expert",
-                "interview_status": "Interview status",
-                "days_to_interview": "Days to interview"})
+                "Days": cv["days_to_interview"]}).sort_values("Assessment date", ascending=False)
+            st.dataframe(full, use_container_width=True,
+                         height=min(420, 40 + 32 * min(len(full), 12)))
             st.download_button("Download converted list (CSV)",
-                               _full.to_csv(index=False).encode("utf-8"),
-                               file_name="converted_assessments_" + str(month) + ".csv",
-                               mime="text/csv", key="ov_dl")
+                               full.to_csv(index=False).encode("utf-8"),
+                               file_name="converted_assessments.csv", mime="text/csv",
+                               key="ov_conv_dl")
 
 
 def render_candidate_360(all_case_df, show_canon):
@@ -8648,7 +8587,7 @@ def monthly_assessment_categories(support_df, completed_only=True):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v28.2 — FEEDBACK: COMPLETED TASKS ONLY (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v28.3 — OVERVIEW 5 PERSPECTIVES + CACHE TUNING (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -8780,7 +8719,7 @@ def main():
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
                                             "Daily Drill-Down", "Deep-Dive Analytics",
-                                            "Candidates", "Candidates Overview"],
+                                            "Candidates", "Overview"],
                                             label_visibility="collapsed")
 
     # ── NAME DISPLAY: original source names vs canonicalised categories ──
@@ -10345,7 +10284,7 @@ def main():
             st.info("No " + support_label + " on " + str(single))
 
     # ======= DEEP DIVE =======
-    elif view == "Candidates Overview":
+    elif view == "Overview":
         render_candidates_overview(all_case_df, show_canon)
 
     elif view == "Candidates":
@@ -10674,7 +10613,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v28.2 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v28.3 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
