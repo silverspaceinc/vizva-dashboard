@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v28.7]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v28.8]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -8623,11 +8623,10 @@ def _month_scope(df, key, label="Months", default_latest=True):
                     reverse=True)
     if not months:
         return d, []
-    sel = st.multiselect(label, months,
-                         default=[months[0]] if default_latest else months,
-                         key=key,
-                         help="Pick one month for a monthly view, or several to "
-                              "aggregate them.")
+    sel = st.multiselect(label, months, default=[], key=key,
+                         placeholder="All months (leave empty for the full view)",
+                         help="Leave empty to see everything, or pick one month for a "
+                              "monthly view, or several to aggregate them.")
     if sel:
         d = d[d["_mm"].isin(sel)]
     return d, sel
@@ -8651,52 +8650,85 @@ def render_schedule_health(all_interview_support_df):
     st.caption("Scope: **" + (", ".join(months) if months else "all months") + "** · " +
                str(len(scoped)) + " interview records")
 
+    _scope = ", ".join(months) if months else "All months"
     vz_nav([("sh-clash", "Clashes"), ("sh-block", "Blockage"),
             ("sh-oos", "Out of Shift")], "schedule")
 
+    # each block is independent: a failure in one must not hide the others
+    st.markdown("---")
+    vz_anchor("sh-clash")
+    st.subheader("Scheduling Clashes")
     if "_parsed_start" in scoped.columns:
-        st.markdown("---")
-        vz_anchor("sh-clash")
-        st.subheader("Scheduling Clashes")
-        render_clash_summary(scoped, title_suffix=" - " +
-                             (", ".join(months) if months else "All"))
-
-        st.markdown("---")
-        vz_anchor("sh-block")
-        st.subheader("Blockage Indicator")
-        render_blockage_summary(scoped,
-                                title_suffix=" - " +
-                                (", ".join(months) if months else "All"),
-                                all_experts_df=all_interview_support_df)
+        try:
+            render_clash_summary(scoped, title_suffix=" - " + _scope)
+        except Exception as _e:
+            st.warning("Clash analysis unavailable: " + type(_e).__name__)
     else:
-        st.info("No parsed start times available for clash or blockage detection.")
+        st.info("No parsed start times available for clash detection.")
 
+    st.markdown("---")
+    vz_anchor("sh-block")
+    st.subheader("Blockage Indicator")
+    if "_parsed_start" in scoped.columns:
+        try:
+            render_blockage_summary(scoped, title_suffix=" - " + _scope,
+                                    all_experts_df=all_interview_support_df)
+        except Exception as _e:
+            st.warning("Blockage analysis unavailable: " + type(_e).__name__)
+    else:
+        st.info("No parsed start times available for blockage detection.")
+
+    st.markdown("---")
+    vz_anchor("sh-oos")
+    st.subheader("Out-of-Shift Interviews")
     if "out_of_shift" in scoped.columns:
-        st.markdown("---")
-        vz_anchor("sh-oos")
-        st.subheader("Out-of-Shift Interviews")
-        render_oos_section(scoped, title_suffix=" - " +
-                           (", ".join(months) if months else "All"))
+        try:
+            render_oos_section(scoped, title_suffix=" - " + _scope)
+        except Exception as _e:
+            st.warning("Out-of-shift analysis unavailable: " + type(_e).__name__)
     else:
-        st.info("No out-of-shift data available for this scope.")
+        st.info("Out-of-shift data is not present for this scope — it requires parsed "
+                "start times on Interview Support records.")
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=6)
+def sentiment_frame(all_case_df):
+    """Completed records with a sentiment score computed locally.
+
+    all_case_df carries no sentiment_score column (only active_expert_df does),
+    so it is computed here once per data version and cached.
+    """
+    if all_case_df is None or len(all_case_df) == 0:
+        return pd.DataFrame()
+    d = all_case_df.copy()
+    d["_mm"] = pd.to_datetime(d["date"], errors="coerce").dt.to_period("M").astype(str)
+    d = d[d["task_status"].astype(str).str.strip().str.lower() == "completed"].copy()
+    if d.empty:
+        return d
+    fb = (d["feedback"] if "feedback" in d.columns
+          else pd.Series(index=d.index, dtype=object))
+    d["sentiment_score"] = fb.apply(compute_sentiment_score)
+    return d[d["sentiment_score"].notna()].copy()
 
 
 def render_sentiment_center(all_case_df):
     st.header("Sentiment")
     st.caption("Feedback sentiment across interviews and assessments. Completed records "
-               "only. Choose one month or several.")
+               "only. Leave the month filter empty for the full view, or pick one or "
+               "several months.")
 
-    if all_case_df is None or all_case_df.empty:
-        st.info("No data available.")
+    base = sentiment_frame(all_case_df)
+    if base is None or base.empty:
+        st.info("No completed feedback with usable text in the data.")
         return
 
-    scoped, months = _month_scope(all_case_df, "sent_months", "Months")
+    scoped, months = _month_scope(base, "sent_months", "Months")
     if scoped.empty:
-        st.info("No records in the selected month(s).")
+        st.info("No scored feedback in the selected month(s).")
         return
 
     scope_txt = ", ".join(months) if months else "All months"
-    st.caption("Scope: **" + scope_txt + "** · " + str(len(scoped)) + " records")
+    st.caption("Scope: **" + scope_txt + "** · " + str(len(scoped)) + " scored records")
 
     vz_nav([("st-kpi", "Overview"), ("st-trend", "Trend"),
             ("st-dist", "Distribution"), ("st-words", "Words")], "sentiment")
@@ -8704,7 +8736,7 @@ def render_sentiment_center(all_case_df):
     st.markdown("---")
     vz_anchor("st-kpi")
     st.subheader("Sentiment overview — " + scope_txt)
-    stats = get_sentiment_stats(scoped) if "sentiment_score" in scoped.columns else None
+    stats = get_sentiment_stats(scoped)
     if stats:
         k = st.columns(5)
         k[0].metric("Average", f"{stats['avg']:+.1f}%")
@@ -8738,9 +8770,65 @@ def render_sentiment_center(all_case_df):
     render_wordcloud_section(texts, section_title="")
 
 
+def render_start_time_center(all_interview_support_df):
+    st.header("Start Time")
+    st.caption("Interview timing analysis — when slots actually start, shift compliance "
+               "and distribution by hour. Completed interviews only. Leave the month "
+               "filter empty for the full view, or pick one or several months.")
+
+    if all_interview_support_df is None or all_interview_support_df.empty:
+        st.info("No interview data available.")
+        return
+
+    if "start_hour" not in all_interview_support_df.columns:
+        st.info("Start times are not available in the data.")
+        return
+
+    scoped, months = _month_scope(all_interview_support_df, "st_months", "Months")
+    if scoped.empty:
+        st.info("No interviews in the selected month(s).")
+        return
+
+    _scope = ", ".join(months) if months else "All months"
+    st.caption("Scope: **" + _scope + "** · " + str(len(scoped)) + " interviews")
+
+    vz_nav([("stt-insights", "Insights"), ("stt-trend", "Monthly trend"),
+            ("stt-dist", "Distribution")], "starttime")
+
+    st.markdown("---")
+    vz_anchor("stt-insights")
+    st.subheader("Start time insights")
+    try:
+        render_start_time_insights(scoped, title_suffix=" - " + _scope)
+    except Exception as _e:
+        st.warning("Start time insights unavailable: " + type(_e).__name__)
+
+    st.markdown("---")
+    vz_anchor("stt-trend")
+    st.subheader("Monthly start time trend")
+    try:
+        render_monthly_start_time_trend(scoped, title_suffix=" - " + _scope)
+    except Exception as _e:
+        st.warning("Monthly trend unavailable: " + type(_e).__name__)
+
+    st.markdown("---")
+    vz_anchor("stt-dist")
+    st.subheader("Start hour distribution")
+    if "start_hour" in scoped.columns:
+        hd = (scoped["start_hour"].dropna().astype(int).value_counts()
+              .sort_index().reset_index())
+        hd.columns = ["Hour", "Interviews"]
+        f = go.Figure(go.Bar(x=hd["Hour"], y=hd["Interviews"], marker_color="#2f6fed",
+                             text=hd["Interviews"], textposition="outside"))
+        f.update_layout(height=340, xaxis_title="Start hour", yaxis_title="Interviews",
+                        showlegend=False)
+        st.plotly_chart(f, use_container_width=True)
+        st.dataframe(hd, use_container_width=True, height=min(320, 40 + 28 * len(hd)))
+
+
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v28.7 — SECTIONED PAGES + FIXED CHIPS + SORT FIX (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v28.8 — SENTIMENT FIX, START TIME + OOS SECTIONS (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -8872,7 +8960,7 @@ def main():
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
                                             "Daily Drill-Down", "Deep-Dive Analytics",
-                                            "Schedule Health", "Sentiment",
+                                            "Start Time", "Schedule Health", "Sentiment",
                                             "Candidates"],
                                             label_visibility="collapsed")
 
@@ -9036,8 +9124,6 @@ def main():
         st.header("Monthly Overview - " + support_label + " " + title_range)
         # ── sticky jump bar ─────────────────────────────────────
         _nav_monthly = [("m-kpi", "KPIs")]
-        if selected_support == "Interview Support" and "start_hour" in support_df.columns:
-            _nav_monthly.append(("m-start", "Start Times"))
         if selected_support == "Interview Support":
             _nav_monthly.append(("m-rounds", "Round Breakdown"))
             _nav_monthly.append(("m-experts", "Expert Breakdown"))
@@ -9102,9 +9188,6 @@ def main():
         vz_anchor("m-start")
         if selected_support == "Interview Support" and "start_hour" in support_df.columns:
             st.markdown("---")
-            render_start_time_insights(support_df, title_suffix=" - All Months")
-            st.markdown("---")
-            render_monthly_start_time_trend(support_df, title_suffix=" - " + support_label)
 
         # ── MONTHLY (Interview Support Only) ─────────────────────
         if selected_support == "Interview Support":
@@ -10353,6 +10436,9 @@ def main():
             st.info("No " + support_label + " on " + str(single))
 
     # ======= DEEP DIVE =======
+    elif view == "Start Time":
+        render_start_time_center(all_interview_support_df)
+
     elif view == "Schedule Health":
         render_schedule_health(all_interview_support_df)
 
@@ -10704,7 +10790,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v28.7 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v28.8 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
