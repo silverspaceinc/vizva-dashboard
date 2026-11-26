@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v28.6]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v28.7]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -8065,10 +8065,8 @@ def bd_table(ivs, cvs, view, count_basis="interviews"):
     rest = [c for c in t.columns if c not in front]
     t = t[front + rest]
 
-    if count_basis == "pairs":
-        t["Count"] = t["Unique"]
-        t = t.rename(columns={"Interviews": "Sessions"})
-    return t.sort_values(["Unique", "Interviews"], ascending=False).reset_index(drop=True)
+    t = t.sort_values(["Unique", "Interviews"], ascending=False).reset_index(drop=True)
+    return t
 
 
 def bd_render(all_case_df, month_sel, container_label="", show_perspective=True,
@@ -8095,27 +8093,21 @@ def bd_render(all_case_df, month_sel, container_label="", show_perspective=True,
         if month_sel:
             cvs = cvs[cvs["_month"].isin(month_sel)]
 
-    c1, c2 = st.columns([2.4, 1.6])
     if show_perspective:
-        view = c1.radio("Perspective", list(_BD_VIEWS.keys()), index=list(
+        view = st.radio("Perspective", list(_BD_VIEWS.keys()), index=list(
             _BD_VIEWS.keys()).index(default_view), horizontal=True,
             key=key_prefix + "_view", label_visibility="collapsed")
     else:
         view = default_view
-    basis = c2.radio("Count basis", ["Interviews", "Candidate + Company"],
-                     horizontal=True, key=key_prefix + "_basis",
-                     label_visibility="collapsed")
-    cbasis = "interviews" if basis == "Interviews" else "pairs"
 
-    t = bd_table(ivs, cvs, view, count_basis=cbasis)
+    t = bd_table(ivs, cvs, view)
     if t.empty:
         st.info("No completed interviews for this perspective.")
         return
-    vz_anchor(key_prefix + "-tbl")
+    vz_anchor(key_prefix.replace("_", "-") + "-tbl")
 
     k = st.columns(4)
-    k[0].metric("Completed interviews", int(t["Interviews"].sum())
-                if "Interviews" in t.columns else int(t["Sessions"].sum()))
+    k[0].metric("Completed interviews", int(t["Interviews"].sum()))
     k[1].metric("Unique interviews", int(t["Unique"].sum()))
     k[2].metric("Candidates", int(ivs["_cand"].nunique()))
     k[3].metric("Assessments", int(t["Assessments"].sum()) if "Assessments" in t.columns else 0,
@@ -8133,9 +8125,7 @@ def bd_render(all_case_df, month_sel, container_label="", show_perspective=True,
                        file_name=("breakdown_" + view.lower() + ".csv"),
                        mime="text/csv", key=key_prefix + "_dl")
 
-    val = "Unique" if cbasis == "pairs" else ("Interviews" if "Interviews" in t.columns
-                                              else "Sessions")
-    ch = t.head(15).sort_values(val)
+    ch = t.head(15).sort_values("Unique")
     f = go.Figure()
     f.add_trace(go.Bar(y=ch[label], x=ch["Unique"], orientation="h",
                        name="Unique interviews", marker_color="#2f6fed"))
@@ -8143,14 +8133,12 @@ def bd_render(all_case_df, month_sel, container_label="", show_perspective=True,
         f.add_trace(go.Bar(y=ch[label], x=ch["Interviews"], orientation="h",
                            name="Completed interviews", marker_color="#c9d6f0"))
     f.update_layout(barmode="group", height=max(340, 26 * len(ch)),
-                    title="Top " + str(len(ch)) + " by " +
-                          ("unique interviews" if cbasis == "pairs"
-                           else "completed interviews"),
+                    title="Top " + str(len(ch)) + " by unique interviews",
                     xaxis_title="Count", yaxis=dict(autorange="reversed"),
                     legend=dict(orientation="h", y=-0.18))
-    vz_anchor(key_prefix + "-chart")
+    vz_anchor(key_prefix.replace("_", "-") + "-chart")
     st.plotly_chart(f, use_container_width=True)
-    vz_anchor(key_prefix + "-assess")
+    vz_anchor(key_prefix.replace("_", "-") + "-assess")
     return t
 
 
@@ -8619,9 +8607,140 @@ def monthly_assessment_categories(support_df, completed_only=True):
               "expert_name", "round_name", "date", "feedback"]].copy()
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  SCHEDULE HEALTH  (Clashes / Blockage / Out-of-Shift)
+#  and SENTIMENT — each with a month multi-select scope.
+# ═══════════════════════════════════════════════════════════════════
+
+def _month_scope(df, key, label="Months", default_latest=True):
+    """Multi-month filter. Returns (frame, selected_months)."""
+    if df is None or len(df) == 0:
+        return df, []
+    d = df.copy()
+    if "_mm" not in d.columns:
+        d["_mm"] = pd.to_datetime(d["date"], errors="coerce").dt.to_period("M").astype(str)
+    months = sorted([m for m in d["_mm"].dropna().unique() if m and m != "NaT"],
+                    reverse=True)
+    if not months:
+        return d, []
+    sel = st.multiselect(label, months,
+                         default=[months[0]] if default_latest else months,
+                         key=key,
+                         help="Pick one month for a monthly view, or several to "
+                              "aggregate them.")
+    if sel:
+        d = d[d["_mm"].isin(sel)]
+    return d, sel
+
+
+def render_schedule_health(all_interview_support_df):
+    st.header("Schedule Health")
+    st.caption("Scheduling clashes, expert blockage and out-of-shift interviews. "
+               "Completed interviews only, excluding Self-handled rounds. "
+               "Choose one month or several.")
+
+    if all_interview_support_df is None or all_interview_support_df.empty:
+        st.info("No interview data available.")
+        return
+
+    scoped, months = _month_scope(all_interview_support_df, "sh_months", "Months")
+    if scoped.empty:
+        st.info("No interviews in the selected month(s).")
+        return
+
+    st.caption("Scope: **" + (", ".join(months) if months else "all months") + "** · " +
+               str(len(scoped)) + " interview records")
+
+    vz_nav([("sh-clash", "Clashes"), ("sh-block", "Blockage"),
+            ("sh-oos", "Out of Shift")], "schedule")
+
+    if "_parsed_start" in scoped.columns:
+        st.markdown("---")
+        vz_anchor("sh-clash")
+        st.subheader("Scheduling Clashes")
+        render_clash_summary(scoped, title_suffix=" - " +
+                             (", ".join(months) if months else "All"))
+
+        st.markdown("---")
+        vz_anchor("sh-block")
+        st.subheader("Blockage Indicator")
+        render_blockage_summary(scoped,
+                                title_suffix=" - " +
+                                (", ".join(months) if months else "All"),
+                                all_experts_df=all_interview_support_df)
+    else:
+        st.info("No parsed start times available for clash or blockage detection.")
+
+    if "out_of_shift" in scoped.columns:
+        st.markdown("---")
+        vz_anchor("sh-oos")
+        st.subheader("Out-of-Shift Interviews")
+        render_oos_section(scoped, title_suffix=" - " +
+                           (", ".join(months) if months else "All"))
+    else:
+        st.info("No out-of-shift data available for this scope.")
+
+
+def render_sentiment_center(all_case_df):
+    st.header("Sentiment")
+    st.caption("Feedback sentiment across interviews and assessments. Completed records "
+               "only. Choose one month or several.")
+
+    if all_case_df is None or all_case_df.empty:
+        st.info("No data available.")
+        return
+
+    scoped, months = _month_scope(all_case_df, "sent_months", "Months")
+    if scoped.empty:
+        st.info("No records in the selected month(s).")
+        return
+
+    scope_txt = ", ".join(months) if months else "All months"
+    st.caption("Scope: **" + scope_txt + "** · " + str(len(scoped)) + " records")
+
+    vz_nav([("st-kpi", "Overview"), ("st-trend", "Trend"),
+            ("st-dist", "Distribution"), ("st-words", "Words")], "sentiment")
+
+    st.markdown("---")
+    vz_anchor("st-kpi")
+    st.subheader("Sentiment overview — " + scope_txt)
+    stats = get_sentiment_stats(scoped) if "sentiment_score" in scoped.columns else None
+    if stats:
+        k = st.columns(5)
+        k[0].metric("Average", f"{stats['avg']:+.1f}%")
+        k[1].metric("Scored records", stats["count"])
+        k[2].metric("Positive", stats["positive"])
+        k[3].metric("Neutral", stats["neutral"])
+        k[4].metric("Negative", stats["negative"])
+    else:
+        st.info("No sentiment scores in this scope.")
+
+    st.markdown("---")
+    vz_anchor("st-trend")
+    st.subheader("Monthly sentiment trend")
+    trend = monthly_sentiment_trend(scoped)
+    if not trend.empty:
+        fig = render_sentiment_trend_chart(trend, "Average sentiment by month")
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Not enough data for a monthly trend.")
+
+    st.markdown("---")
+    vz_anchor("st-dist")
+    st.subheader("Sentiment distribution — " + scope_txt)
+    render_sentiment_section(scoped, section_title="")
+
+    st.markdown("---")
+    vz_anchor("st-words")
+    st.subheader("Feedback word cloud — " + scope_txt)
+    texts = extract_feedback_texts(scoped)
+    render_wordcloud_section(texts, section_title="")
+
+
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v28.6 — NO DUPLICATE COLUMNS + JUMP CHIPS + OVERVIEW REMOVED (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v28.7 — SECTIONED PAGES + FIXED CHIPS + SORT FIX (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -8753,6 +8872,7 @@ def main():
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
                                             "Daily Drill-Down", "Deep-Dive Analytics",
+                                            "Schedule Health", "Sentiment",
                                             "Candidates"],
                                             label_visibility="collapsed")
 
@@ -8794,15 +8914,9 @@ def main():
             _nav_today.append(("t-sent-kpi", "Sentiment KPI"))
         if selected_support == "Interview Support" and not today_df.empty and "start_hour" in today_df.columns:
             _nav_today.append(("t-start", "Start Times"))
-        if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
-            _nav_today.append(("t-clash", "Clashes"))
-            _nav_today.append(("t-block", "Blockage"))
-        if selected_support == "Interview Support" and not today_df.empty and "out_of_shift" in today_df.columns:
-            _nav_today.append(("t-oos", "Out of Shift"))
         if not today_df.empty:
             if selected_support == "Interview Support":
                 _nav_today.append(("t-rounds", "Rounds"))
-            _nav_today.append(("t-sent", "Sentiment & Words"))
         _nav_today.append(("t-market", "To Market"))
         vz_nav(_nav_today, "today")
 
@@ -8831,28 +8945,6 @@ def main():
             st.markdown("---")
             render_start_time_insights(today_df, title_suffix=" - " + str(today))
 
-        # ── TODAY'S CLASH DETECTION ──────────────────────────────
-        if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
-            st.markdown("---")
-            vz_anchor("t-clash")
-            st.subheader("Scheduling Clashes - " + str(today))
-            render_today_clash_summary(today_df)
-
-        # ── TODAY'S BLOCKAGE DETECTION ───────────────────────────
-        if selected_support == "Interview Support" and not today_df.empty and "_parsed_start" in today_df.columns:
-            st.markdown("---")
-            vz_anchor("t-block")
-            st.subheader("Blockage Indicator - " + str(today))
-            render_today_blockage(today_df, all_experts_df=all_interview_support_df)
-            
-        # ── TODAY'S OUT-OF-SHIFT DETECTION ───────────────────────
-        if selected_support == "Interview Support" and not today_df.empty and "out_of_shift" in today_df.columns:
-            st.markdown("---")
-            vz_anchor("t-oos")
-            st.subheader("Out-of-Shift Interviews - " + str(today))
-            render_oos_compact(today_df, " - " + str(today))
-
-
         if not today_df.empty:
             c1, c2 = st.columns(2)
             with c1:
@@ -8877,19 +8969,6 @@ def main():
                 vz_anchor("t-rounds")
                 st.subheader("Round Breakdown - " + str(today))
                 round_charts(today_df, " - " + str(today))
-
-            # ── SENTIMENT DONUT + HISTOGRAM — TODAY ──────────────
-            st.markdown("---")
-            vz_anchor("t-sent")
-            render_sentiment_section(today_df, section_title="Sentiment Analysis - " + str(today))
-
-            # ── FEEDBACK WORD CLOUD — TODAY ──────────────────────
-            st.markdown("---")
-            feedback_texts = extract_feedback_texts(today_df)
-            render_wordcloud_section(
-                feedback_texts,
-                section_title="Feedback Word Cloud - " + str(today),
-            )
 
             with st.expander("Raw Data (includes Sentiment Score)"):
                 st.dataframe(today_df, use_container_width=True, height=400)
@@ -8959,12 +9038,6 @@ def main():
         _nav_monthly = [("m-kpi", "KPIs")]
         if selected_support == "Interview Support" and "start_hour" in support_df.columns:
             _nav_monthly.append(("m-start", "Start Times"))
-        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
-            _nav_monthly.append(("m-clash", "Clashes"))
-            _nav_monthly.append(("m-block", "Blockage"))
-        if selected_support == "Interview Support" and "out_of_shift" in support_df.columns:
-            _nav_monthly.append(("m-oos", "Out of Shift"))
-        _nav_monthly.append(("m-sent", "Sentiment Trend"))
         if selected_support == "Interview Support":
             _nav_monthly.append(("m-rounds", "Round Breakdown"))
             _nav_monthly.append(("m-experts", "Expert Breakdown"))
@@ -9032,69 +9105,6 @@ def main():
             render_start_time_insights(support_df, title_suffix=" - All Months")
             st.markdown("---")
             render_monthly_start_time_trend(support_df, title_suffix=" - " + support_label)
-
-        # ── CLASH DETECTION — OVERALL ────────────────────────────
-        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
-            st.markdown("---")
-            vz_anchor("m-clash")
-            render_clash_summary(support_df, title_suffix=" - All Months")
-
-        # ── BLOCKAGE ANALYSIS — OVERALL ──────────────────────────
-        if selected_support == "Interview Support" and "_parsed_start" in support_df.columns:
-            st.markdown("---")
-            vz_anchor("m-block")
-            render_blockage_summary(support_df, title_suffix=" - All Months", all_experts_df=all_interview_support_df)
-            
-        # ──         # ── OUT-OF-SHIFT ANALYSIS ── SELECTED MONTH ────────────────
-        if selected_support == "Interview Support" and "out_of_shift" in support_df.columns:
-            st.markdown("---")
-            vz_anchor("m-oos")
-            st.subheader("Out-of-Shift Analysis - Monthly")
-
-            support_df_oos = support_df.copy()
-            support_df_oos["_oos_month"] = support_df_oos["date"].dt.to_period("M").astype(str)
-            oos_months_avail = sorted(support_df_oos["_oos_month"].unique(), reverse=True)
-            current_m_oos = date.today().strftime("%Y-%m")
-            default_oos_idx = (oos_months_avail.index(current_m_oos)
-                                if current_m_oos in oos_months_avail else 0)
-            sel_oos_month = st.selectbox(
-                "Select Month for OOS Analysis",
-                oos_months_avail,
-                index=default_oos_idx,
-                key="oos_month_sel",
-            )
-
-            oos_month_data = support_df_oos[support_df_oos["_oos_month"] == sel_oos_month]
-            if not oos_month_data.empty:
-                render_oos_section(oos_month_data,
-                                    title_suffix=" - " + sel_oos_month)
-            else:
-                st.info("No data for " + sel_oos_month)
-
-            with st.expander("All Months OOS Trend"):
-                render_oos_section(support_df, title_suffix=" - All Months")
-
-
-
-        # ── MONTHLY SENTIMENT TRENDS ─────────────────────────────
-        st.markdown("---")
-        vz_anchor("m-sent")
-        st.subheader("Monthly Sentiment Trends")
-        sent_monthly = monthly_sentiment_trend(support_df)
-        if not sent_monthly.empty:
-            col_t, col_s = st.columns(2)
-            with col_t:
-                fig = render_sentiment_trend_chart(sent_monthly, "Monthly Avg Sentiment")
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-            with col_s:
-                fig = render_sentiment_stacked_bar(sent_monthly, "Monthly Sentiment Breakdown")
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-            with st.expander("Sentiment Trend Data"):
-                st.dataframe(sent_monthly, use_container_width=True)
-        else:
-            st.info("No sentiment data available for trend analysis.")
 
         # ── MONTHLY (Interview Support Only) ─────────────────────
         if selected_support == "Interview Support":
@@ -10343,6 +10353,12 @@ def main():
             st.info("No " + support_label + " on " + str(single))
 
     # ======= DEEP DIVE =======
+    elif view == "Schedule Health":
+        render_schedule_health(all_interview_support_df)
+
+    elif view == "Sentiment":
+        render_sentiment_center(all_case_df)
+
     elif view == "Candidates":
         render_candidate_360(all_case_df, show_canon)
 
@@ -10688,7 +10704,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v28.6 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v28.7 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
