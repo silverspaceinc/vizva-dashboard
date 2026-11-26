@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v28.4]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v28.5]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -7964,6 +7964,267 @@ def _round_bucket(rnd):
     return "other"
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  SHARED BREAKDOWN ENGINE
+#  One column set, four perspectives. Completed records only.
+#  Columns are fixed: Interviews, Unique, Candidates, <secondary>,
+#  round buckets, assessment-type splits, totals.
+# ═══════════════════════════════════════════════════════════════════
+
+_BD_VIEWS = {
+    "Candidate":  ("_cand",    "Candidate",  "Companies"),
+    "Expert":     ("_expert",  "Expert",     "Cand + Co"),
+    "Company":    ("_company", "Company",    "Candidates"),
+    "Technology": ("_tech",    "Technology", "Cand + Co"),
+}
+
+_BD_ROUND_COLS = ["1st", "2nd", "3rd", "4th", "5th", "Screening", "Tech/Coding",
+                  "Other", "Final"]
+
+
+def bd_prepare(comp):
+    """Add the pair index and round indicator columns once per frame."""
+    ivs = comp[comp["_support_l"] == "interview support"].copy()
+    if ivs.empty:
+        return ivs
+    ivs["_pair"] = ivs["_cand"].astype(str) + " ||| " + ivs["_company"].astype(str)
+    rb = ivs["_round"].apply(_round_bucket)
+    for name, code in (("1st", "1st"), ("2nd", "2nd"), ("3rd", "3rd"),
+                       ("4th", "4th"), ("5th", "5th"),
+                       ("Screening", "scr"), ("Tech/Coding", "tech"),
+                       ("Other", "other")):
+        ivs["_r_" + name] = (rb == code).astype(int)
+    ivs["_r_Final"] = ivs["_is_final"].astype(int)
+    return ivs
+
+
+def bd_table(ivs, cvs, view, count_basis="interviews"):
+    """Full column table for one perspective."""
+    key, label, secondary = _BD_VIEWS[view]
+    if ivs.empty:
+        return pd.DataFrame()
+    g = ivs.groupby(key)
+    t = g.agg(Interviews=("_round", "size"),
+              Unique=("_pair", "nunique"),
+              Candidates=("_cand", "nunique"),
+              Companies=("_company", "nunique")).reset_index()
+    rc = g[[c for c in ivs.columns if c.startswith("_r_")]].sum().reset_index() \
+        if False else g.agg({c: "sum" for c in ivs.columns
+                             if c.startswith("_r_")}).reset_index()
+    rc = rc.rename(columns={c: c[3:] for c in rc.columns if c.startswith("_r_")})
+    t = t.merge(rc, on=key, how="left")
+
+    # assessment-type split on the same key
+    acc = pd.DataFrame({label: t[key].astype(str)})
+    for c in ("Technical", "Tech conv", "Behavioural", "Behav conv",
+              "Tech + Behav", "Both conv", "Take Home", "TH conv"):
+        acc[c] = 0
+    if cvs is not None and len(cvs):
+        cv = cvs.copy()
+        if key == "_cand":
+            cv["_k"] = cv["candidate_name"].astype(str).str.strip()
+        elif key == "_month":
+            cv["_k"] = cv["_month"].astype(str)
+        elif key == "_company":
+            cv["_k"] = cv["company_name"].astype(str).str.strip()
+        elif key == "_expert":
+            cv["_k"] = cv["expert_name"].astype(str).str.strip()
+        else:
+            _tmap = ivs.groupby("_cand")["_tech"].agg(lambda s: s.iloc[-1])
+            cv["_k"] = (cv["candidate_name"].astype(str).str.strip()
+                        .map(_tmap).astype(str))
+        cv["_k"] = cv["_k"].astype(str)
+        sp = cv.groupby(["_k", "category"])["converted"].agg(["size", "sum"])
+        _map = (("Technical Assessment", "Technical", "Tech conv"),
+                ("Behavioural Assessment", "Behavioural", "Behav conv"),
+                ("Technical + Behavioural", "Tech + Behav", "Both conv"),
+                ("Take Home Assessment", "Take Home", "TH conv"))
+        for i, _id in enumerate(acc[label].astype(str)):
+            for cat, n_col, c_col in _map:
+                try:
+                    acc.at[i, n_col] = int(sp.loc[(_id, cat), "size"])
+                    acc.at[i, c_col] = int(sp.loc[(_id, cat), "sum"])
+                except KeyError:
+                    pass
+    acc["Assessments"] = acc[["Technical", "Behavioural", "Tech + Behav",
+                              "Take Home"]].sum(axis=1)
+    acc["Converted"] = acc[["Tech conv", "Behav conv", "Both conv",
+                            "TH conv"]].sum(axis=1)
+    acc["Conv %"] = (acc["Converted"] / acc["Assessments"].replace(0, np.nan) * 100).round(1)
+
+    t = t.rename(columns={key: label})
+    t[label] = t[label].astype(str)
+    t = t.merge(acc, on=label, how="left")
+
+    # secondary column: substitute per perspective
+    if secondary == "Cand + Co":
+        t["Cand + Co"] = t["Unique"]
+        t = t.drop(columns=["Companies"])
+    elif secondary == "Candidates":
+        t = t.drop(columns=["Companies"])
+
+    front = [label, "Interviews", "Unique", "Candidates"]
+    if secondary != "Candidates":
+        front.append(secondary)
+    rest = [c for c in t.columns if c not in front]
+    t = t[front + rest]
+
+    if count_basis == "pairs":
+        t["Count"] = t["Unique"]
+        t = t.rename(columns={"Interviews": "Sessions"})
+    return t.sort_values(["Unique", "Interviews"], ascending=False).reset_index(drop=True)
+
+
+def bd_render(all_case_df, month_sel, container_label="", show_perspective=True,
+              default_view="Expert", key_prefix="bd"):
+    """Render the breakdown block: perspective, month scope, table, chart, CSV."""
+    data, _roster = cand_360_dataset(all_case_df)
+    if data.empty:
+        st.info("No candidate activity in the current data.")
+        return
+    comp = data[data["_is_completed"]].copy()
+    if comp.empty:
+        st.info("No completed records in the current data.")
+        return
+    if month_sel:
+        comp = comp[comp["_month"].isin(month_sel)]
+    if comp.empty:
+        st.info("No completed records in the selected month(s).")
+        return
+
+    ivs = bd_prepare(comp)
+    cvs = overview_conversions(all_case_df)
+    if not cvs.empty:
+        cvs = cvs[cvs["category"] != "Unknown"].copy()
+        if month_sel:
+            cvs = cvs[cvs["_month"].isin(month_sel)]
+
+    c1, c2 = st.columns([2.4, 1.6])
+    if show_perspective:
+        view = c1.radio("Perspective", list(_BD_VIEWS.keys()), index=list(
+            _BD_VIEWS.keys()).index(default_view), horizontal=True,
+            key=key_prefix + "_view", label_visibility="collapsed")
+    else:
+        view = default_view
+    basis = c2.radio("Count basis", ["Interviews", "Candidate + Company"],
+                     horizontal=True, key=key_prefix + "_basis",
+                     label_visibility="collapsed")
+    cbasis = "interviews" if basis == "Interviews" else "pairs"
+
+    t = bd_table(ivs, cvs, view, count_basis=cbasis)
+    if t.empty:
+        st.info("No completed interviews for this perspective.")
+        return
+
+    k = st.columns(4)
+    k[0].metric("Completed interviews", int(t["Interviews"].sum())
+                if "Interviews" in t.columns else int(t["Sessions"].sum()))
+    k[1].metric("Unique interviews", int(t["Unique"].sum()))
+    k[2].metric("Candidates", int(ivs["_cand"].nunique()))
+    k[3].metric("Assessments", int(t["Assessments"].sum()) if "Assessments" in t.columns else 0,
+                str(int(t["Converted"].sum())) + " converted"
+                if "Converted" in t.columns else None)
+
+    label = _BD_VIEWS[view][1]
+    top_n = st.slider("Rows to show", 5, 60, 20, key=key_prefix + "_rows")
+    show = t.head(top_n)
+
+    st.dataframe(show, use_container_width=True,
+                 height=min(620, 40 + 32 * min(len(show), 18)))
+    st.download_button("Download this table (CSV)",
+                       t.to_csv(index=False).encode("utf-8"),
+                       file_name=("breakdown_" + view.lower() + ".csv"),
+                       mime="text/csv", key=key_prefix + "_dl")
+
+    val = "Unique" if cbasis == "pairs" else ("Interviews" if "Interviews" in t.columns
+                                              else "Sessions")
+    ch = t.head(15).sort_values(val)
+    f = go.Figure()
+    f.add_trace(go.Bar(y=ch[label], x=ch["Unique"], orientation="h",
+                       name="Unique interviews", marker_color="#2f6fed"))
+    if "Interviews" in ch.columns:
+        f.add_trace(go.Bar(y=ch[label], x=ch["Interviews"], orientation="h",
+                           name="Completed interviews", marker_color="#c9d6f0"))
+    f.update_layout(barmode="group", height=max(340, 26 * len(ch)),
+                    title="Top " + str(len(ch)) + " by " +
+                          ("unique interviews" if cbasis == "pairs"
+                           else "completed interviews"),
+                    xaxis_title="Count", yaxis=dict(autorange="reversed"),
+                    legend=dict(orientation="h", y=-0.18))
+    st.plotly_chart(f, use_container_width=True)
+    return t
+
+
+def bd_month_picker(comp, key, label="Months"):
+    """Multi-select month scope shared by every Monthly breakdown block."""
+    months = sorted([m for m in comp["_month"].dropna().unique() if m and m != "NaT"],
+                    reverse=True)
+    if not months:
+        return []
+    return st.multiselect(label, months, default=[months[0]], key=key,
+                          help="Choose one or several months. Leave a single month "
+                               "for a monthly view.")
+
+
+def bd_assessment_segregation(cvs, scope_label=""):
+    """Assessment type split + converted list, reusable in Monthly and Overview."""
+    if cvs is None or len(cvs) == 0:
+        st.info("No classified completed assessments in this scope" + scope_label + ".")
+        return
+    seg = (cvs.groupby("category")
+              .agg(Assessments=("converted", "size"),
+                   Converted=("converted", "sum"),
+                   Candidates=("candidate_name", "nunique"),
+                   Companies=("company_name", "nunique"))
+              .reset_index())
+    seg["Not converted"] = seg["Assessments"] - seg["Converted"]
+    seg["Conversion %"] = (seg["Converted"] / seg["Assessments"] * 100).round(1)
+    _ord = {c: i for i, c in enumerate(_ASSESS_CATS)}
+    seg["_o"] = seg["category"].map(_ord).fillna(99)
+    seg = seg.sort_values("_o").drop(columns="_o")
+    seg = seg.rename(columns={"category": "Assessment type"})
+
+    c1, c2 = st.columns(2)
+    c1.dataframe(seg, use_container_width=True, height=min(340, 40 + 34 * len(seg)))
+    with c2:
+        f = go.Figure()
+        f.add_trace(go.Bar(x=seg["Assessment type"], y=seg["Converted"],
+                           name="Converted", marker_color="#2ecc71",
+                           text=seg["Converted"], textposition="inside"))
+        f.add_trace(go.Bar(x=seg["Assessment type"], y=seg["Not converted"],
+                           name="Not converted", marker_color="#e74c3c",
+                           text=seg["Not converted"], textposition="inside"))
+        f.update_layout(barmode="stack", height=340, xaxis_title="",
+                        yaxis_title="Assessments",
+                        legend=dict(orientation="h", y=-0.25, font=dict(size=9)))
+        st.plotly_chart(f, use_container_width=True)
+    st.download_button("Download assessment segregation (CSV)",
+                       seg.to_csv(index=False).encode("utf-8"),
+                       file_name="assessment_segregation.csv", mime="text/csv",
+                       key="bd_seg_dl")
+
+    cv = cvs[cvs["converted"] == 1]
+    if not cv.empty:
+        st.markdown("**Converted assessments**")
+        full = pd.DataFrame({
+            "Candidate": cv["candidate_name"], "Company": cv["company_name"],
+            "Assessment expert": cv["expert_name"],
+            "Assessment date": cv["date"].dt.strftime("%d %b %Y"),
+            "Assessment type": cv["category"],
+            "Interview date": cv["matched_interview_date"],
+            "Interview round": cv["interview_round"],
+            "Interview expert": cv["interview_expert"],
+            "Interview status": cv["interview_status"],
+            "Days": cv["days_to_interview"]}).sort_values("Assessment date",
+                                                          ascending=False)
+        st.dataframe(full, use_container_width=True,
+                     height=min(420, 40 + 32 * min(len(full), 12)))
+        st.download_button("Download converted list (CSV)",
+                           full.to_csv(index=False).encode("utf-8"),
+                           file_name="converted_assessments.csv", mime="text/csv",
+                           key="bd_conv_dl")
+
+
 def render_candidates_overview(all_case_df, show_canon):
     """Overview page — completed work, five perspectives, original column set."""
     st.header("Overview")
@@ -8608,7 +8869,7 @@ def monthly_assessment_categories(support_df, completed_only=True):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v28.4 — OVERVIEW: 5 PERSPECTIVES, ORIGINAL COLUMNS RESTORED (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v28.5 — SHARED BREAKDOWN (Deep-Dive + Monthly, 4 perspectives) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -8959,6 +9220,7 @@ def main():
         if selected_support == "Assessment Support":
             _nav_monthly.append(("m-acat", "Assessment Types"))
             _nav_monthly.append(("m-conv", "Assessment to Interview"))
+        _nav_monthly.append(("m-break", "Breakdown"))
         _nav_monthly.append(("m-tech", "Technology Mix"))
         _nav_monthly.append(("m-cand", "Candidate Counts"))
         vz_nav(_nav_monthly, "monthly")
@@ -9858,6 +10120,13 @@ def main():
                                "are excluded here and listed under *Assessment Types → "
                                "Assessment feedback needing classification*.")
                     render_assessment_conversion_charts(conv_month_data, " - " + sel_conv_month)
+                    st.markdown("---")
+                    st.subheader("Assessment type segregation — " + sel_conv_month)
+                    _seg = overview_conversions(all_case_df)
+                    if not _seg.empty:
+                        _seg = _seg[(_seg["category"] != "Unknown")
+                                    & (_seg["_month"] == sel_conv_month)]
+                    bd_assessment_segregation(_seg, " - " + sel_conv_month)
             else:
                 st.info("No assessment data available for conversion analysis.")
         
@@ -9969,6 +10238,22 @@ def main():
                     file_name="vizva_tech_monthly_" + date.today().strftime("%Y%m%d") + ".csv",
                     mime="text/csv",
                     key="m_tech_csv")
+
+        # ── MONTHLY BREAKDOWN: Expert / Company / Technology / Candidate ──
+        st.markdown("---")
+        vz_anchor("m-break")
+        st.subheader("Monthly Breakdown — Expert / Company / Technology")
+        st.caption("Completed interviews only. Pick one month for a monthly view or "
+                   "several to aggregate. The secondary column adapts to the "
+                   "perspective: Experts and Technologies show **Candidate + Company "
+                   "combinations**, Companies show **candidate counts**.")
+        _mb_data, _ = cand_360_dataset(all_case_df)
+        _mb_comp = (_mb_data[_mb_data["_is_completed"]]
+                    if not _mb_data.empty else _mb_data)
+        _mb_months = (bd_month_picker(_mb_comp, "m_bd_months", "Months")
+                      if not _mb_comp.empty else [])
+        bd_render(all_case_df, _mb_months, default_view="Expert",
+                  key_prefix="m_bd")
 
         st.subheader("Candidate-wise Monthly Counts (All Support Types)")
         cand_monthly = candidate_monthly_support(active_expert_df)
@@ -10314,7 +10599,7 @@ def main():
     elif view == "Deep-Dive Analytics":
         st.header("Deep-Dive Analytics - " + support_label)
 
-        tab_names = ["Experts", "Companies", "Rounds", "Day of Week", "Cross-Support", "Candidates", "Technology", "Final Round Outlook"]
+        tab_names = ["Experts", "Companies", "Rounds", "Day of Week", "Cross-Support", "Candidates", "Technology", "Final Round Outlook", "Breakdown"]
         if selected_support == "Assessment Support":
             tab_names.append("Conversion Analytics")
 
@@ -10629,12 +10914,27 @@ def main():
                 else:
                     st.info("No assessment data available for conversion analysis.")
 
+        # ── BREAKDOWN: candidate / expert / company / technology ──
+        if _sel == "Breakdown":
+            st.subheader("Breakdown — Candidate / Expert / Company / Technology")
+            st.caption("Completed interviews only. The secondary column adapts to the "
+                       "perspective: **Experts** and **Technologies** show Candidate + "
+                       "Company combinations, **Companies** show candidate counts, "
+                       "**Candidates** show company counts.")
+            _dd_data, _ = cand_360_dataset(all_case_df)
+            _dd_comp = (_dd_data[_dd_data["_is_completed"]]
+                        if not _dd_data.empty else _dd_data)
+            _dd_months = (bd_month_picker(_dd_comp, "dd_bd_months", "Months")
+                          if not _dd_comp.empty else [])
+            bd_render(all_case_df, _dd_months, default_view="Candidate",
+                      key_prefix="dd_bd")
+
         # ── FINAL ROUND OUTLOOK ──────────────────────────────────
         if selected_support == "Interview Support" and _sel == "Final Round Outlook":
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v28.4 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v28.5 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
