@@ -50,7 +50,7 @@ from nltk import pos_tag
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────
-st.set_page_config(page_title="Vizva Interview Dashboard [v28.5]", page_icon="chart_with_upwards_trend",
+st.set_page_config(page_title="Vizva Interview Dashboard [v28.6]", page_icon="chart_with_upwards_trend",
                    layout="wide", initial_sidebar_state="expanded")
 
 API_KEY = st.secrets["API_KEY"]
@@ -8056,16 +8056,12 @@ def bd_table(ivs, cvs, view, count_basis="interviews"):
     t[label] = t[label].astype(str)
     t = t.merge(acc, on=label, how="left")
 
-    # secondary column: substitute per perspective
-    if secondary == "Cand + Co":
-        t["Cand + Co"] = t["Unique"]
-        t = t.drop(columns=["Companies"])
-    elif secondary == "Candidates":
-        t = t.drop(columns=["Companies"])
+    # No secondary people/company column: it is always identical to Unique
+    # (Companies for a candidate, candidate+company combos for an expert or
+    # technology, candidates for a company), so showing both duplicates a metric.
+    t = t.drop(columns=["Companies"], errors="ignore")
 
     front = [label, "Interviews", "Unique", "Candidates"]
-    if secondary != "Candidates":
-        front.append(secondary)
     rest = [c for c in t.columns if c not in front]
     t = t[front + rest]
 
@@ -8115,6 +8111,7 @@ def bd_render(all_case_df, month_sel, container_label="", show_perspective=True,
     if t.empty:
         st.info("No completed interviews for this perspective.")
         return
+    vz_anchor(key_prefix + "-tbl")
 
     k = st.columns(4)
     k[0].metric("Completed interviews", int(t["Interviews"].sum())
@@ -8151,7 +8148,9 @@ def bd_render(all_case_df, month_sel, container_label="", show_perspective=True,
                            else "completed interviews"),
                     xaxis_title="Count", yaxis=dict(autorange="reversed"),
                     legend=dict(orientation="h", y=-0.18))
+    vz_anchor(key_prefix + "-chart")
     st.plotly_chart(f, use_container_width=True)
+    vz_anchor(key_prefix + "-assess")
     return t
 
 
@@ -8223,253 +8222,6 @@ def bd_assessment_segregation(cvs, scope_label=""):
                            full.to_csv(index=False).encode("utf-8"),
                            file_name="converted_assessments.csv", mime="text/csv",
                            key="bd_conv_dl")
-
-
-def render_candidates_overview(all_case_df, show_canon):
-    """Overview page — completed work, five perspectives, original column set."""
-    st.header("Overview")
-    st.caption("**Completed tasks only.** Every figure counts completed interviews and "
-               "completed assessments. Switch perspective to slice the same data five ways.")
-
-    data, roster = cand_360_dataset(all_case_df)
-    if data.empty:
-        st.info("No candidate activity in the current data.")
-        return
-    comp = data[data["_is_completed"]].copy()
-    if comp.empty:
-        st.info("No completed records in the current data.")
-        return
-
-    months = sorted([m for m in comp["_month"].dropna().unique() if m and m != "NaT"],
-                    reverse=True)
-    iv_all = comp[comp["_support_l"] == "interview support"].copy()
-    as_all = comp[comp["_support_l"] == "assessment support"].copy()
-    conv_all = overview_conversions(all_case_df)
-    if not conv_all.empty:
-        conv_all = conv_all[conv_all["category"] != "Unknown"].copy()
-
-    c1, c2 = st.columns([3, 1.6])
-    view = c1.radio("Perspective", ["Candidate-wise", "Month-wise", "Company-wise",
-                                    "Expert-wise", "Technology-wise"],
-                    horizontal=True, key="ov_view", label_visibility="collapsed")
-    month_pick = c2.selectbox("Month", ["All months"] + months, key="ov_month2")
-    mscope = None if month_pick == "All months" else month_pick
-
-    ivs = iv_all if mscope is None else iv_all[iv_all["_month"] == mscope]
-    ass = as_all if mscope is None else as_all[as_all["_month"] == mscope]
-    cvs = conv_all if (mscope is None or conv_all.empty) else conv_all[conv_all["_month"] == mscope]
-    ivs = ivs.copy()
-    ivs["_pair"] = ivs["_cand"].astype(str) + " ||| " + ivs["_company"].astype(str)
-
-    k = st.columns(5)
-    k[0].metric("Candidates", int(ivs["_cand"].nunique()))
-    k[1].metric("Completed interviews", int(len(ivs)))
-    k[2].metric("Unique interviews", int(ivs["_pair"].nunique()),
-                help="Distinct candidate + company pairs.")
-    k[3].metric("Completed assessments", int(len(ass)))
-    _cn = int(cvs["converted"].sum()) if not cvs.empty else 0
-    k[4].metric("Assessment conversions", _cn,
-                str(round(_cn / len(cvs) * 100, 1)) + "%" if len(cvs) else None)
-
-    # ── monthly unique-interview trend ─────────────────────────
-    st.markdown("---")
-    st.subheader("Unique interviews — monthly trend")
-    _tr = iv_all.copy()
-    _tr["_pair"] = _tr["_cand"].astype(str) + " ||| " + _tr["_company"].astype(str)
-    g = (_tr.groupby("_month")
-            .agg(Unique=("_pair", "nunique"), Interviews=("_round", "size"),
-                 Candidates=("_cand", "nunique"))
-            .reset_index().sort_values("_month"))
-    if not g.empty:
-        f = go.Figure()
-        f.add_trace(go.Bar(x=g["_month"], y=g["Interviews"], name="Completed interviews",
-                           marker_color="#c9d6f0"))
-        f.add_trace(go.Scatter(x=g["_month"], y=g["Unique"], name="Unique interviews",
-                               mode="lines+markers", line=dict(color="#2f6fed", width=3),
-                               marker=dict(size=8)))
-        f.update_layout(height=370, xaxis_title="", yaxis_title="Count",
-                        legend=dict(orientation="h", y=-0.22))
-        st.plotly_chart(f, use_container_width=True)
-
-    st.markdown("---")
-    st.subheader(view.replace("-wise", "") + "-wise breakdown")
-    _KEY = {"Candidate-wise": ("_cand", "Candidate"),
-            "Month-wise": ("_month", "Month"),
-            "Company-wise": ("_company", "Company"),
-            "Expert-wise": ("_expert", "Expert"),
-            "Technology-wise": ("_tech", "Technology")}
-    key, label = _KEY[view]
-
-    if ivs.empty:
-        st.info("No completed interviews for this perspective and month.")
-        return
-
-    # round buckets once
-    ivs["_b1"] = (ivs["_round"].apply(_round_bucket) == "1st").astype(int)
-    ivs["_b2"] = (ivs["_round"].apply(_round_bucket) == "2nd").astype(int)
-    ivs["_b3"] = (ivs["_round"].apply(_round_bucket) == "3rd").astype(int)
-    ivs["_b4"] = (ivs["_round"].apply(_round_bucket) == "4th").astype(int)
-    ivs["_b5"] = (ivs["_round"].apply(_round_bucket) == "5th").astype(int)
-    ivs["_bscr"] = (ivs["_round"].apply(_round_bucket) == "scr").astype(int)
-    ivs["_btech"] = (ivs["_round"].apply(_round_bucket) == "tech").astype(int)
-    ivs["_both"] = (ivs["_round"].apply(_round_bucket) == "other").astype(int)
-
-    t = (ivs.groupby(key)
-            .agg(Interviews=("_round", "size"),
-                 Unique=("_pair", "nunique"),
-                 Candidates=("_cand", "nunique"),
-                 Companies=("_company", "nunique"),
-                 Total_Interviews_in_scope=("_round", "size"))
-            .reset_index().rename(columns={key: label}))
-    rb = (ivs.groupby(key)
-             .agg(**{"1st": ("_b1", "sum"), "2nd": ("_b2", "sum"), "3rd": ("_b3", "sum"),
-                     "4th": ("_b4", "sum"), "5th": ("_b5", "sum"),
-                     "Screening": ("_bscr", "sum"), "Tech/Coding": ("_btech", "sum"),
-                     "Other": ("_both", "sum"), "Final": ("_is_final", "sum")})
-             .reset_index().rename(columns={key: label}))
-    t = t.drop(columns="Total_Interviews_in_scope").merge(rb, on=label, how="left")
-
-    # assessment-type split attached on the same key
-    at = pd.DataFrame({label: [], "Technical": [], "Tech conv": [],
-                       "Behavioural": [], "Behav conv": [],
-                       "Tech + Behav": [], "Both conv": [],
-                       "Take Home": [], "TH conv": []})
-    if not cvs.empty:
-        cv = cvs.copy()
-        if key == "_cand":
-            cv["_k"] = cv["candidate_name"].astype(str).str.strip()
-        elif key == "_month":
-            cv["_k"] = cv["_month"].astype(str)
-        elif key == "_company":
-            cv["_k"] = cv["company_name"].astype(str).str.strip()
-        elif key == "_expert":
-            cv["_k"] = cv["expert_name"].astype(str).str.strip()
-        else:
-            _tmap = ivs.groupby("_cand")["_tech"].agg(lambda s: s.iloc[-1])
-            cv["_k"] = cv["candidate_name"].astype(str).str.strip().map(_tmap).astype(str)
-        cv["_k"] = cv["_k"].astype(str)
-        splits = cv.groupby(["_k", "category"])["converted"].agg(["size", "sum"])
-        recs = []
-        for _id in t[label].astype(str):
-            _r = {label: _id}
-            for _cat, _short in (("Technical Assessment", "Technical"),
-                                 ("Behavioural Assessment", "Behavioural"),
-                                 ("Technical + Behavioural", "Tech + Behav"),
-                                 ("Take Home Assessment", "Take Home")):
-                try:
-                    _n, _c = splits.loc[(_id, _cat), "size"], splits.loc[(_id, _cat), "sum"]
-                except KeyError:
-                    _n, _c = 0, 0
-                _r[_short] = int(_n)
-                _r[_short.replace("Technical", "Tech").replace("Behavioural", "Behav")
-                      .replace("Tech + Behav", "Both").replace("Take Home", "TH") + " conv"] = int(_c)
-            recs.append(_r)
-        at = pd.DataFrame(recs)
-    else:
-        at = pd.DataFrame({label: t[label]})
-        for _col in ("Technical", "Tech conv", "Behavioural", "Behav conv",
-                     "Tech + Behav", "Both conv", "Take Home", "TH conv"):
-            at[_col] = 0
-
-    _acols = [c for c in at.columns if c != label and not c.endswith("conv")]
-    _ccols = [c for c in at.columns if c.endswith("conv")]
-    at["Assessments"] = at[_acols].sum(axis=1).astype(int)
-    at["Converted"] = at[_ccols].sum(axis=1).astype(int)
-    at["Conv %"] = (at["Converted"] / at["Assessments"].replace(0, np.nan) * 100).round(1)
-
-    out = t.merge(at, on=label, how="left")
-    out = out.sort_values(["Unique", "Interviews"], ascending=False)
-    out = out[[label] + [c for c in out.columns if c != label]]
-
-    if view == "Technology-wise":
-        out = out[out[label].astype(str).str.strip() != ""]
-    top_n = 40 if view == "Company-wise" else len(out)
-    out = out.head(top_n)
-
-    st.dataframe(out.reset_index(drop=True), use_container_width=True,
-                 height=min(600, 40 + 32 * min(len(out), 17)))
-    st.download_button("Download this table (CSV)",
-                       out.to_csv(index=False).encode("utf-8"),
-                       file_name="overview_" + view.lower().replace("-", "_") + ".csv",
-                       mime="text/csv", key="ov_tbl_dl")
-
-    chart = out.head(15).sort_values("Unique")
-    f2 = go.Figure()
-    f2.add_trace(go.Bar(y=chart[label], x=chart["Interviews"], orientation="h",
-                        name="Completed", marker_color="#c9d6f0"))
-    f2.add_trace(go.Bar(y=chart[label], x=chart["Unique"], orientation="h",
-                        name="Unique interviews", marker_color="#2f6fed"))
-    f2.update_layout(barmode="group", height=max(340, 26 * len(chart)),
-                     xaxis_title="Count", yaxis=dict(autorange="reversed"),
-                     legend=dict(orientation="h", y=-0.18))
-    st.plotly_chart(f2, use_container_width=True)
-
-    rd = pd.DataFrame({"Round": ["1st", "2nd", "3rd", "4th", "5th", "Screening",
-                                 "Tech/Coding", "Final"],
-                       "Count": [int(out["1st"].sum()), int(out["2nd"].sum()),
-                                 int(out["3rd"].sum()), int(out["4th"].sum()),
-                                 int(out["5th"].sum()), int(out["Screening"].sum()),
-                                 int(out["Tech/Coding"].sum()), int(out["Final"].sum())]})
-    f3 = go.Figure(go.Bar(x=rd["Round"], y=rd["Count"], marker_color="#e8734a",
-                          text=rd["Count"], textposition="outside"))
-    f3.update_layout(height=320, title="Round mix", xaxis_title="",
-                     yaxis_title="Completed interviews", showlegend=False)
-    st.plotly_chart(f3, use_container_width=True)
-
-    # ── assessment segregation ─────────────────────────────────
-    st.markdown("---")
-    st.subheader("Assessment segregation" + ("" if mscope is None else " — " + mscope))
-    if cvs.empty:
-        st.info("No classified completed assessments in this scope.")
-        return
-    seg = (cvs.groupby("category")
-              .agg(Assessments=("converted", "size"), Converted=("converted", "sum"),
-                   Candidates=("candidate_name", "nunique"),
-                   Companies=("company_name", "nunique"))
-              .reset_index())
-    seg["Not converted"] = seg["Assessments"] - seg["Converted"]
-    seg["Conversion %"] = (seg["Converted"] / seg["Assessments"] * 100).round(1)
-    _ord = {c: i for i, c in enumerate(_ASSESS_CATS)}
-    seg["_o"] = seg["category"].map(_ord).fillna(99)
-    seg = seg.sort_values("_o").drop(columns="_o").rename(columns={"category": "Assessment type"})
-    sc1, sc2 = st.columns(2)
-    sc1.dataframe(seg, use_container_width=True, height=min(340, 40 + 34 * len(seg)))
-    with sc2:
-        fs = go.Figure()
-        fs.add_trace(go.Bar(x=seg["Assessment type"], y=seg["Converted"],
-                            name="Converted", marker_color="#2ecc71",
-                            text=seg["Converted"], textposition="inside"))
-        fs.add_trace(go.Bar(x=seg["Assessment type"], y=seg["Not converted"],
-                            name="Not converted", marker_color="#e74c3c",
-                            text=seg["Not converted"], textposition="inside"))
-        fs.update_layout(barmode="stack", height=340, xaxis_title="",
-                         yaxis_title="Assessments",
-                         legend=dict(orientation="h", y=-0.25, font=dict(size=9)))
-        st.plotly_chart(fs, use_container_width=True)
-    st.download_button("Download assessment segregation (CSV)",
-                       seg.to_csv(index=False).encode("utf-8"),
-                       file_name="assessment_segregation.csv", mime="text/csv",
-                       key="ov_seg_dl")
-
-    cv = cvs[cvs["converted"] == 1]
-    if not cv.empty:
-        st.markdown("**Converted assessments**")
-        full = pd.DataFrame({
-            "Candidate": cv["candidate_name"], "Company": cv["company_name"],
-            "Assessment expert": cv["expert_name"],
-            "Assessment date": cv["date"].dt.strftime("%d %b %Y"),
-            "Assessment type": cv["category"],
-            "Interview date": cv["matched_interview_date"],
-            "Interview round": cv["interview_round"],
-            "Interview expert": cv["interview_expert"],
-            "Interview status": cv["interview_status"],
-            "Days": cv["days_to_interview"]}).sort_values("Assessment date", ascending=False)
-        st.dataframe(full, use_container_width=True,
-                     height=min(420, 40 + 32 * min(len(full), 12)))
-        st.download_button("Download converted list (CSV)",
-                           full.to_csv(index=False).encode("utf-8"),
-                           file_name="converted_assessments.csv", mime="text/csv",
-                           key="ov_conv_dl")
 
 
 def render_candidate_360(all_case_df, show_canon):
@@ -8869,7 +8621,7 @@ def monthly_assessment_categories(support_df, completed_only=True):
 
 def main():
     vz_nav_css()
-    st.markdown("## 🚀 BUILD v28.5 — SHARED BREAKDOWN (Deep-Dive + Monthly, 4 perspectives) (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
+    st.markdown("## 🚀 BUILD v28.6 — NO DUPLICATE COLUMNS + JUMP CHIPS + OVERVIEW REMOVED (deploy canary — if you do not see the jump bar under each page title, the app is running an OLD file)")
     auto = st.sidebar.checkbox(
         "Auto-refresh every 2 min", value=False,
         help="Off by default: each refresh re-runs the whole script. Data is already "
@@ -9001,7 +8753,7 @@ def main():
     st.sidebar.header("View")
     view = st.sidebar.radio("Navigation", ["Todays Snapshot", "Monthly Overview",
                                             "Daily Drill-Down", "Deep-Dive Analytics",
-                                            "Candidates", "Candidates Overview"],
+                                            "Candidates"],
                                             label_visibility="collapsed")
 
     # ── NAME DISPLAY: original source names vs canonicalised categories ──
@@ -9221,6 +8973,7 @@ def main():
             _nav_monthly.append(("m-acat", "Assessment Types"))
             _nav_monthly.append(("m-conv", "Assessment to Interview"))
         _nav_monthly.append(("m-break", "Breakdown"))
+        _nav_monthly.append(("m-bd-tbl", "Breakdown table"))
         _nav_monthly.append(("m-tech", "Technology Mix"))
         _nav_monthly.append(("m-cand", "Candidate Counts"))
         vz_nav(_nav_monthly, "monthly")
@@ -10590,9 +10343,6 @@ def main():
             st.info("No " + support_label + " on " + str(single))
 
     # ======= DEEP DIVE =======
-    elif view == "Candidates Overview":
-        render_candidates_overview(all_case_df, show_canon)
-
     elif view == "Candidates":
         render_candidate_360(all_case_df, show_canon)
 
@@ -10917,10 +10667,14 @@ def main():
         # ── BREAKDOWN: candidate / expert / company / technology ──
         if _sel == "Breakdown":
             st.subheader("Breakdown — Candidate / Expert / Company / Technology")
-            st.caption("Completed interviews only. The secondary column adapts to the "
-                       "perspective: **Experts** and **Technologies** show Candidate + "
-                       "Company combinations, **Companies** show candidate counts, "
-                       "**Candidates** show company counts.")
+            st.caption("Completed interviews only. **Unique** is the distinct "
+                       "candidate + company pair count, so it equals companies per "
+                       "candidate, pairs per expert or technology, and candidates per "
+                       "company — that is why no second column repeats it.")
+            vz_nav([("dd-bd", "Breakdown"), ("dd-bd-tbl", "Table"),
+                    ("dd-bd-chart", "Chart"), ("dd-bd-assess", "Assessments")],
+                   "deepbreak")
+            vz_anchor("dd-bd")
             _dd_data, _ = cand_360_dataset(all_case_df)
             _dd_comp = (_dd_data[_dd_data["_is_completed"]]
                         if not _dd_data.empty else _dd_data)
@@ -10934,7 +10688,7 @@ def main():
             render_final_round_outlook(support_df, all_case_df)
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Vizva Dashboard v28.5 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
+    st.sidebar.caption("Vizva Dashboard v28.6 — SCHEDULE VIEW MOVED TO SCHEDULER APP | API-powered | Active Experts Only | Start Time Analytics | Clash Detection | Blockage | OOS Detection | Intelligent Clash Resolution | Name toggle | Tech monthly | Final Round Outlook | Candidate Brief | Standing | Conversion rules | Candidate 360 | Overview | Assessment types")
 
 
 # ═══════════════════════════════════════════════════════════════════
